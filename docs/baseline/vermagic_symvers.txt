@@ -1,0 +1,6 @@
+# captured 2026-05-18T04:50:08Z
+uname -r        : 7.0.0-15-generic
+vermagic(r8169) : 7.0.0-15-generic SMP preempt mod_unload modversions 
+Module.symvers  : /lib/modules/7.0.0-15-generic/build/Module.symvers
+  sha256        : afb0b4711fbe304df52d54dfc016f143775ca3e8de8143f5ff097f6b75e06c65
+  size/lines    :   32702 2382480

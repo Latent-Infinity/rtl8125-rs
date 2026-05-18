@@ -1,0 +1,22 @@
+# captured 2026-05-18T04:50:08Z
+## Userspace (NOT the build path — plan §6.1):
+rustc: rustc 1.95.0 (59807616e 2026-04-14)
+cargo: cargo 1.95.0 (f2d3ce0bd 2026-03-21)
+
+## Kernel-authoritative (CONFIG_*):
+CONFIG_RUSTC_LLVM_VERSION=210108
+CONFIG_RUSTC_VERSION_TEXT="rustc 1.93.1 (01f6ddf75 2026-02-11) (built from a source tarball)"
+
+## make -C /lib/modules/7.0.0-15-generic/build rustavailable :
+make: Entering directory '/usr/src/linux-headers-7.0.0-15-generic'
+***
+*** Rust bindings generator 'bindgen' could not be found.
+***
+***
+*** Please see Documentation/rust/quick-start.rst for details
+*** on how to set up the Rust support.
+***
+make[1]: *** [/usr/src/linux-headers-7.0.0-15-generic/Makefile:1901: rustavailable] Error 1
+make: *** [Makefile:248: __sub-make] Error 2
+make: Leaving directory '/usr/src/linux-headers-7.0.0-15-generic'
+exit=2

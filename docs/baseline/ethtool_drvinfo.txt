@@ -1,0 +1,13 @@
+# ethtool -i enp3s0 
+# captured 2026-05-18T04:50:08Z
+
+driver: r8169
+version: 7.0.0-15-generic
+firmware-version: rtl8125b-2_0.0.2 07/13/20
+expansion-rom-version: 
+bus-info: 0000:03:00.0
+supports-statistics: yes
+supports-test: no
+supports-eeprom-access: no
+supports-register-dump: yes
+supports-priv-flags: no

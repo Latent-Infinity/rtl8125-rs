@@ -1,0 +1,9 @@
+# Files permitted to locally `#![allow(unsafe_code)]`.
+# Plan §6.2 / §15: the crate root carries `#![deny(unsafe_code)]`; CI rejects any
+# file NOT listed here that contains `#![allow(unsafe_code)]`. This list must only
+# ever shrink, and any addition requires human reviewer sign-off (plan §9.4).
+#
+# As of M0 this is the ONLY entry. It does not exist yet (M1 deliverable) — the
+# CI check (ci/check_unsafe_allowlist.sh) treats a missing file as compliant
+# until M1 creates it.
+src/unsafe_boundary.rs

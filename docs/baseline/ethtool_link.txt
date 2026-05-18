@@ -1,0 +1,30 @@
+# ethtool enp3s0 
+# captured 2026-05-18T04:50:08Z
+
+netlink error: Operation not permitted
+Settings for enp3s0:
+	Supported ports: [ TP	 MII ]
+	Supported link modes:   10baseT/Half 10baseT/Full
+	                        100baseT/Half 100baseT/Full
+	                        1000baseT/Full
+	                        2500baseT/Full
+	Supported pause frame use: Symmetric Receive-only
+	Supports auto-negotiation: Yes
+	Supported FEC modes: Not reported
+	Advertised link modes:  10baseT/Half 10baseT/Full
+	                        100baseT/Half 100baseT/Full
+	                        1000baseT/Full
+	                        2500baseT/Full
+	Advertised pause frame use: Symmetric Receive-only
+	Advertised auto-negotiation: Yes
+	Advertised FEC modes: Not reported
+	Speed: Unknown!
+	Duplex: Unknown! (255)
+	Auto-negotiation: on
+	master-slave cfg: preferred slave
+	master-slave status: unknown
+	Port: Twisted Pair
+	PHYAD: 0
+	Transceiver: internal
+	MDI-X: Unknown
+	Link detected: no

@@ -1,0 +1,34 @@
+# captured 2026-05-18T04:50:08Z
+KDIR/rust -> <dangling/absent>
+RESULT: BLOCKED — kernel Rust metadata tree absent (linux-lib-rust-7.0.0-15-generic NOT installed).
+        This is the plan §13/§16 High risk. MITIGATION (operator, system change):
+          sudo apt-get install linux-lib-rust-7.0.0-15-generic
+        then re-run this script. NOT auto-installed by this script.
+
+## make -C /lib/modules/7.0.0-15-generic/build M=/tmp/tmp.R9T1IOkBBV (build only):
+make: Entering directory '/usr/src/linux-headers-7.0.0-15-generic'
+make[1]: Entering directory '/tmp/tmp.R9T1IOkBBV'
+warning: the compiler differs from the one used to build the kernel
+  The kernel was built by: x86_64-linux-gnu-gcc (Ubuntu 15.2.0-16ubuntu1) 15.2.0
+  You are using:           
+warning: pahole version differs from the one used to build the kernel
+  The kernel was built with: 131
+  You are using:             0
+  RUSTC [M] hello_rust_oot.o
+error[E0463]: can't find crate for `core`
+  |
+  = note: the `target` target may not be installed
+  = help: consider downloading the target with `rustup target add target`
+  = help: consider building the standard library from source with `cargo build -Zbuild-std`
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0463`.
+make[3]: *** [/usr/src/linux-headers-7.0.0-15-generic/scripts/Makefile.build:358: hello_rust_oot.o] Error 1
+make[2]: *** [/usr/src/linux-headers-7.0.0-15-generic/Makefile:2110: .] Error 2
+make[1]: *** [/usr/src/linux-headers-7.0.0-15-generic/Makefile:248: __sub-make] Error 2
+make[1]: Leaving directory '/tmp/tmp.R9T1IOkBBV'
+make: *** [Makefile:248: __sub-make] Error 2
+make: Leaving directory '/usr/src/linux-headers-7.0.0-15-generic'
+exit=2
+RESULT: build did NOT produce .ko (see above; expected if metadata pkg missing)

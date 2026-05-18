@@ -1,0 +1,1 @@
+  dmidecode: SKIPPED-NEEDS-ROOT (re-run with sudo)

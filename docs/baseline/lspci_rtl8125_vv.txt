@@ -1,0 +1,19 @@
+# bash -c lspci -nnvv -s 0000:03:00.0; echo; echo '# NOTE: some capability fields require root; re-run with sudo for full ASPM/LTR/L1ss dump (plan §3.3)' 
+# captured 2026-05-18T04:50:08Z
+
+03:00.0 Ethernet controller [0200]: Realtek Semiconductor Co., Ltd. RTL8125 2.5GbE Controller [10ec:8125] (rev 05)
+	Subsystem: Realtek Semiconductor Co., Ltd. Device [10ec:0123]
+	Control: I/O+ Mem+ BusMaster+ SpecCycle- MemWINV- VGASnoop- ParErr- Stepping- SERR- FastB2B- DisINTx+
+	Status: Cap+ 66MHz- UDF- FastB2B- ParErr- DEVSEL=fast >TAbort- <TAbort- <MAbort- >SERR- <PERR- INTx-
+	Latency: 0, Cache Line Size: 64 bytes
+	Interrupt: pin A routed to IRQ 46
+	IOMMU group: 18
+	Region 0: I/O ports at e000 [size=256]
+	Region 2: Memory at fce00000 (64-bit, non-prefetchable) [size=64K]
+	Region 4: Memory at fce10000 (64-bit, non-prefetchable) [size=16K]
+	Capabilities: <access denied>
+	Kernel driver in use: r8169
+	Kernel modules: r8169
+
+
+# NOTE: some capability fields require root; re-run with sudo for full ASPM/LTR/L1ss dump (plan §3.3)

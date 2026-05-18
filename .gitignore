@@ -1,0 +1,34 @@
+# External GPL reference sources — fetched, never committed (plan §9.3 provenance hygiene).
+# Populated by tools/fetch_references.sh; treated as read-only references, not copied.
+/references/*
+!/references/.gitkeep
+!/references/PROVENANCE.md
+
+# Kernel out-of-tree build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+*.symvers
+*.order
+.tmp_versions/
+modules.builtin*
+*.rmeta
+*.rlib
+.*.d
+
+# Rust / editor tooling (rust-project.json is GENERATED, not a source of truth — plan §6.1)
+rust-project.json
+target/
+*.rs.bk
+
+# Logs and captured serial output
+*.log
+/var-log-*
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*~
