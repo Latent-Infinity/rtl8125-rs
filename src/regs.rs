@@ -81,6 +81,55 @@ pub(crate) const INT_CFG1: usize = 0x7A;
 pub(crate) const COALESCE_TABLE_8125B_START: usize = 0xA00;
 pub(crate) const COALESCE_TABLE_8125B_END: usize = 0xA80;
 
+// ── Config1 (8-bit at 0x52) ──────────────────────────────────────────────
+/// Various per-board PM / wake / LED config. r8169 clears bit 4 in
+/// rtl_hw_start_8125_common as part of "disable UPS".
+pub(crate) const CONFIG1: usize = 0x52;
+
+// ── MAC OCP — internal MAC register-set access (8125 family) ─────────────
+//
+// r8169's r8168_mac_ocp_read/write (see references/linux-mainline/.../
+// r8169_main.c lines 1144-1180). 32-bit register at MMIO 0xB0:
+//   write: RTL_W32(OCPDR, OCPAR_FLAG | (ocp_addr << 15) | data16)  — no poll
+//   read:  RTL_W32(OCPDR, ocp_addr << 15); val = RTL_R32(OCPDR) & 0xFFFF
+// Used for the 8125-specific MAC init OCP writes in rtl_hw_start_8125_*.
+pub(crate) const OCPDR: usize = 0xB0;
+
+// ── MISC (8125 family — MMIO 0xF0, 32-bit) ───────────────────────────────
+//
+// Bit 19 = RXDV_GATED_EN: when set, the MAC gates the PHY's RX_DV signal,
+// meaning packets received by the PHY don't reach the MAC. r8169
+// `rtl_disable_rxdvgate` clears this bit; without it, RX is dead.
+pub(crate) const MISC: usize = 0xF0;
+pub(crate) const MISC_RXDV_GATED_EN: u32 = 1 << 19;
+
+// ── 8125B (MAC_VER_63) MAC OCP init magic numbers ────────────────────────
+// Subset of rtl_hw_start_8125_common + rtl_hw_start_8125b that's required
+// to get the TX engine accepting our 16-byte legacy descriptors AND the
+// RX engine ungated. Tuning writes (FIFO thresholds, RSS, EEE) are
+// deliberately deferred — M5 will port the rest. See plan §7 M4-traffic.
+//
+// 0xeb58 bit 0: "new tx descriptor format" — if set, the chip expects
+// 40-byte descriptors; we use 16-byte (legacy r8169), so this MUST be 0.
+pub(crate) const MAC_OCP_NEW_TX_DESC: u32 = 0xEB58;
+pub(crate) const MAC_OCP_NEW_TX_DESC_BIT0: u16 = 0x0001;
+
+// ── GPHY_OCP — PHY register access via MAC OCP path (8125 family) ────────
+//
+// r8169's r8168_phy_ocp_read/write (see references/linux-mainline/.../r8169_main.c
+// lines 1110-1133). 32-bit register at MMIO 0xB8:
+//   write: RTL_W32(GPHY_OCP, OCPAR_FLAG | (ocp_addr << 15) | data16)
+//          then poll until (R32(GPHY_OCP) & OCPAR_FLAG) == 0 (flag clears)
+//   read:  RTL_W32(GPHY_OCP, ocp_addr << 15)
+//          then poll until OCPAR_FLAG sets, then read low 16 bits.
+// ocp_addr = OCP_STD_PHY_BASE + mii_reg * 2 (for the standard page).
+pub(crate) const GPHY_OCP: usize = 0xB8;
+pub(crate) const OCPAR_FLAG: u32 = 0x8000_0000;
+/// Standard PHY page base. MII reg `n` lives at `OCP_STD_PHY_BASE + n * 2`.
+pub(crate) const OCP_STD_PHY_BASE: u32 = 0xA400;
+/// MII page-select register (writing this picks an alternate OCP page).
+pub(crate) const MII_PAGE_SELECT: u8 = 0x1F;
+
 // ── TPPoll — 8125 layout (TxPoll_8125 = 0x90, 16-bit, NPQ = BIT(0)) ──────
 pub(crate) const TPPOLL: usize = 0x90;
 /// `NPQ` — Normal Priority Queue kick bit (write to TPPOLL after posting TX).

@@ -16,40 +16,15 @@
  * stays in one file.
  */
 
-#include "netdev_bridge.h"
+#include "netdev_bridge_internal.h"
 
 #include <linux/atomic.h>
 #include <linux/dma-mapping.h>
 #include <linux/etherdevice.h>
-#include <linux/netdevice.h>
-#include <linux/pci.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
 
 #define BRIDGE_NAPI_WEIGHT	64
-
-/*
- * Private state stored in netdev_priv(). Kept opaque to Rust — it only
- * holds the Rust vtable + `priv` cookie + the per-direction counters.
- */
-struct r8125_bridge {
-	struct net_device *ndev;
-	struct pci_dev *pdev;
-	struct napi_struct napi;
-	void *priv;				/* Rust-side cookie */
-	struct r8125_bridge_ops ops;		/* Rust-populated vtable */
-
-	/* §6.3 allocation accounting. Plain u64 + WRITE_ONCE/READ_ONCE
-	 * is enough — counters are incremented from a single context
-	 * each (xmit on tx_*, NAPI poll on rx_* + tx_consumed). The CI
-	 * snapshot reader uses READ_ONCE. */
-	u64 tx_received;
-	u64 tx_consumed;
-	u64 tx_busy_exception;
-	u64 tx_dropped_error;
-	u64 rx_handed_to_stack;
-	u64 rx_dropped_error;
-};
 
 /* ── ndo callbacks — each is a thin delegation to Rust ───────────────── */
 
@@ -171,7 +146,19 @@ void r8125_bridge_unregister_and_free(struct net_device *ndev)
 {
 	struct r8125_bridge *b = netdev_priv(ndev);
 
+	/* Order: unregister_netdev synchronously runs ndo_stop (which calls
+	 * phy_stop + phy_disconnect — severing the phy_device from the
+	 * netdev). Only THEN is it safe to unregister the mdiobus, which
+	 * removes the phy_device from the bus and frees it. mdiobus_free
+	 * must happen before free_netdev because the bridge struct holds
+	 * the mii_bus pointer. */
 	unregister_netdev(ndev);
+	if (b->mii_bus) {
+		mdiobus_unregister(b->mii_bus);
+		mdiobus_free(b->mii_bus);
+		b->mii_bus = NULL;
+		b->phydev = NULL;
+	}
 	netif_napi_del(&b->napi);
 	free_netdev(ndev);
 }

@@ -21,6 +21,7 @@
 use core::ffi::{c_int, c_void};
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+// AtomicU32 also serves the new NetdevState::ocp_base field below.
 
 /// Cache-line padded wrapper. Per `docs/RUST_STANDARDS.md` §15.2, atomics
 /// mutated from independent contexts (here: `tx_head` from xmit, `tx_tail`
@@ -151,6 +152,12 @@ pub(crate) struct NetdevState {
     /// RX consumer index (advanced by the NAPI RX path). Cache-padded so
     /// the RX hot loop's index doesn't ping-pong with TX indices.
     pub(crate) rx_tail: CachePadded<AtomicUsize>,
+
+    /// Current PHY OCP page base (default `OCP_STD_PHY_BASE = 0xA400`).
+    /// MDIO writes to MII reg 0x1F switch pages; subsequent MII reads/writes
+    /// use this base. Single-context (process), but atomic for the &self
+    /// access pattern.
+    pub(crate) ocp_base: AtomicU32,
 }
 
 // Send + Sync for NetdevState — the impls live in `unsafe_boundary` so the
@@ -331,6 +338,19 @@ fn ndo_open(state: &NetdevState) -> Result<()> {
     let cookie_ptr = state as *const NetdevState as *mut c_void;
     ub::request_irq(state.irq_num, raw_irq_handler, cookie_ptr)?;
 
+    // PHY step 1 — connect + soft reset + resume. On the 8125B's
+    // integrated MAC/PHY, genphy_soft_reset writes BMCR_RESET which
+    // ALSO clears MAC-side state (ChipCmd). Running it BEFORE the MAC
+    // OCP init + ChipCmd write is critical, or our ChipCmd RX|TX bits
+    // get wiped out by the PHY reset. Matches r8169 ordering at
+    // rtl8169_up (phy_init_hw → phy_resume → rtl8169_init_phy run before
+    // rtl_reset_work → rtl_hw_start).
+    let ndev = state.ndev.load(Ordering::Acquire);
+    if let Err(e) = ub::bridge_phy_connect_and_reset(ndev) {
+        ub::free_irq(state.irq_num, state as *const NetdevState as *mut c_void);
+        return Err(e);
+    }
+
     // r8169 RTL8125B (MAC_VER_63) baseline: disable interrupt coalescing
     // before enabling IRQ sources. Mirrors `rtl_hw_start_8125` in
     // r8169_main.c. Zeros INT_CFG0, the 0xa00..0xa80 coalescing table,
@@ -343,6 +363,13 @@ fn ndo_open(state: &NetdevState) -> Result<()> {
     // edge into the IO-APIC is lost.
     regs.ack_isr(0xFFFF_FFFF);
 
+    // r8169 `rtl_hw_start_8125_common` for MAC_VER_63. The minimum init
+    // sequence (MAC OCP + MISC ungate) the chip needs before ChipCmd
+    // RX|TX enable, or the engines silently refuse to move packets. Sits
+    // in hw::hw_start_8125b so cross-referencing with the upstream
+    // source-of-truth function stays trivial.
+    crate::hw::hw_start_8125b(&regs)?;
+
     // Enable RX + TX in the chip command register FIRST. Per r8169 the
     // IMR write must come last (after ChipCmd RX|TX enable).
     regs.set_chip_cmd(regs::CMD_RX_ENB | regs::CMD_TX_ENB);
@@ -350,8 +377,19 @@ fn ndo_open(state: &NetdevState) -> Result<()> {
     // Unmask IRQ sources LAST — mirrors r8169 `rtl_irq_enable`.
     regs.set_imr(regs::INTR_M4_BASELINE);
 
-    let ndev = state.ndev.load(Ordering::Acquire);
-    ub::bridge_carrier_on(ndev);
+    // PHY step 2 — kick the state machine LAST. Per r8169 ordering this
+    // runs after ChipCmd RX|TX enable + IMR programming. Carrier flips
+    // on automatically inside `bridge_phylink_handler` when the PHY
+    // reports link-up; the unconditional carrier_on we used at M4-
+    // skeleton is dropped.
+    if let Err(e) = ub::bridge_phy_kick_state_machine(ndev) {
+        // Roll back: disable chip + free IRQ so a follow-up open can retry.
+        regs.set_imr(0);
+        regs.set_chip_cmd(0);
+        ub::bridge_phy_stop(ndev);
+        ub::free_irq(state.irq_num, state as *const NetdevState as *mut c_void);
+        return Err(e);
+    }
     ub::bridge_tx_wake_queue(ndev);
 
     // Read back key registers so we can confirm the writes took effect.
@@ -385,8 +423,10 @@ fn ndo_stop(state: &NetdevState) {
     );
 
     // Stop kernel TX submissions + carrier first so xmit can't race the
-    // teardown.
+    // teardown. PHY stop releases the link-status handler and disconnects
+    // the phy_device from the netdev (next ndo_open re-attaches it).
     ub::bridge_tx_disable(ndev);
+    ub::bridge_phy_stop(ndev);
     ub::bridge_carrier_off(ndev);
 
     // Mask IRQs, disable RX/TX, ack any pending bits.
@@ -519,6 +559,21 @@ impl NetdevHandle {
 
         if let Err(e) = ub::bridge_register(ndev) {
             ub::bridge_free(ndev);
+            ub::kbox_drop_from_raw(cookie);
+            return Err(e);
+        }
+
+        // M4-traffic: register MDIO bus + phy_device so ndo_open can call
+        // bridge_phy_start. Failure here means the discovered PHY has no
+        // driver (realtek.ko missing) or MDIO bus allocation failed —
+        // either way we can't bring traffic up, so unwind the netdev.
+        let mdio_ops = ub::BridgeMdioOps {
+            read: ub::r8125_rust_mdio_read,
+            write: ub::r8125_rust_mdio_write,
+        };
+        if let Err(e) = ub::bridge_phy_register(ndev, &mdio_ops) {
+            dev_err!(pdev, "r8125_rust: bridge_phy_register failed: {:?}\n", e);
+            ub::bridge_unregister_and_free(ndev);
             ub::kbox_drop_from_raw(cookie);
             return Err(e);
         }

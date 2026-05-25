@@ -7,36 +7,49 @@ paused and what to do next.
 
 ---
 
-## TL;DR — M4-full UAF fixed; M4_FULL_OPS active + stable under load (2026-05-25 evening)
+## TL;DR — M4-traffic ✅ (2026-05-25): actual packets flow through the Rust driver
 
-**Standards in force**: operator supplied v2.0 standards earlier
-2026-05-25 — `docs/RUST_STANDARDS.md` is the rubric. Section 15.2
-cache-padding is now applied to NetdevState atomics; sections 6 + 18
-have residual TODOs (tasks 43 + 45).
+**End-to-end working**: ping 5/5 sub-ms, iperf3 TCP guest→host **929-931
+Mbps** at 1Gbps link (0 retransmits, 299,535 IRQs handled cleanly in a
+single 10s window). rmmod clean, no KASAN, no kmemleak.
 
-**M4-full UAF: FIXED.** Root cause = struct-field drop order in
-`R8125Driver`. Rust drops fields in declaration order top→bottom (the
-prior comment said reverse). `_netdev` listed last → it dropped AFTER
-`_bar`, `tx_ring`, `rx_ring` → its synchronous `ndo_stop` read freed
-memory. Fix: reorder fields so `_netdev` drops first. Validated by
-100-cycle insmod/up/down/rmmod regression with `ACTIVE_OPS =
-M4_FULL_OPS` — 100/100, 45s elapsed, 0 KASAN, 0 kmemleak, 0 DMA-API
-warnings.
+Evidence: `docs/baseline/m4_traffic_proof.txt`,
+`docs/baseline/iperf3_rust_tcp_g2h.json`,
+`docs/baseline/m4_full_uaf_fix_proof.txt`.
 
-Same pass: corrected 8125-family register offsets (IMR/ISR 32-bit at
-0x38/0x3C; TxPoll 16-bit at 0x90 with NPQ=BIT(0); INT_CFG0=0x34
-INT_CFG1=0x7A; coalesce table 0xA00..0xA80 zeroed); added §15.2
-`CachePadded<T>` wrapper around `tx_head / tx_tail / rx_tail`;
-reordered ndo_open to ChipCmd-then-IMR per r8169 `rtl_irq_enable`.
+**Caveats** (all M5 polish):
+- 1G not 2.5G — Realtek NBASE-T PHY driver probe returns -EOPNOTSUPP;
+  genphy fallback doesn't advertise 2.5G. Needs port of
+  `rtl8125b_hw_phy_config` from r8169_phy_config.c.
+- `ip -s link` shows 0/0 RX/TX bytes — driver doesn't bump netdev stats
+  yet. iperf3 confirms real traffic flows.
+- rmmod-while-traffic can wedge chip; use `ip link down → sleep → rmmod`
+  sequence.
 
-**M4-traffic gap (task 46)**: PHYStatus readback in ndo_open returns
-0x08 — `_100bps` set, `LinkStatus` bit 0x02 CLEAR. Embedded PHY is
-not initialised. Without it the chip never establishes link, never
-raises an IRQ, ping fails. PHY init requires cshim work — MAC OCP /
-MDIO bus / phy_device attach / phy_start. ~150-200 LOC C, blocks
-tasks 39 + 40.
+**What landed this session (the long arc)**:
 
-Evidence: `docs/baseline/m4_full_uaf_fix_proof.txt`.
+1. M4-full UAF fix — struct field drop order in `R8125Driver` (Rust drops
+   declaration order, not reverse). Moved `_netdev` first. 100-cycle
+   regression clean.
+2. 8125-family register offsets corrected (IMR=0x38 32-bit, ISR=0x3C
+   32-bit, TxPoll=0x90 NPQ=BIT(0), INT_CFG0=0x34, INT_CFG1=0x7A).
+3. §15.2 cache padding applied to `NetdevState::{tx_head, tx_tail,
+   rx_tail}` via `CachePadded<T>` (`#[repr(C, align(64))]`).
+4. **M4-traffic** — the big one:
+   - `src/phy.rs` + extern Rust MDIO callbacks (translate MII → GPHY OCP).
+   - `src/mmio.rs` `gphy_ocp_*`, `mac_ocp_*`, `set_misc`, `config1`.
+   - `src/hw.rs::hw_start_8125b` port of r8169 `rtl_hw_start_8125_common`
+     for MAC_VER_63 (~25 MAC OCP writes + MISC ungate + 0xE098 finalizer
+     + 0xE00E wait).
+   - `src/netdev_bridge.{h,c}` — explicit (not devm) mdiobus_alloc +
+     register; `bridge_phylink_handler` drives carrier; split
+     `phy_connect_and_reset` (early, before MAC init) +
+     `phy_kick_state_machine` (last, after ChipCmd+IMR) — the split is
+     critical because genphy_soft_reset on the 8125B's integrated MAC/PHY
+     clobbers ChipCmd.
+   - `src/netdev.rs::ndo_open` reordered to r8169 sequence.
+
+CI green (unsafe census 47 → 47, justified at `ci/CENSUS_JUSTIFICATIONS.md`).
 
 ## M0b ✅ (2026-05-25) — unchanged
 
@@ -70,9 +83,9 @@ satisfied by construction.
   not RTL8125. Evidence: [`baseline/m0b_proof.txt`](baseline/m0b_proof.txt),
   [`baseline/TOPOLOGY.md`](baseline/TOPOLOGY.md),
   [`baseline/iperf3/`](baseline/iperf3/) (8 JSON + 1 pcap).
-- **M4-skeleton ✅ 2026-05-24** — composite module (Rust + 346-LOC C
+- **M4-skeleton ✅ 2026-05-24** — composite module (Rust + focused C
   shim) registers a `net_device` per probe, RAII-cleans on rmmod;
-  vtable + §6.3 ownership contract in `src/netdev_bridge.{c,h}` with
+  vtable + §6.3 ownership contract in `src/netdev_bridge*.{c,h}` with
   carrier off + queues stopped; 1000-cycle regression passes (177 s,
   1000/1000 probe + DMA-rings + netdev-registered lines, 0
   kmemleak/dma_debug/lockdep/BUG/WARN/KASAN). Evidence:
@@ -144,7 +157,7 @@ satisfied by construction.
   an isolated peer is ready; tasks 22–25 paused; M1 board rows
   7/10/11 stay un-flipped.
 - **M4-skeleton landed** (tasks 26–31): composite module with the
-  C shim (`src/netdev_bridge.{c,h}` — 346 LOC, encoding the full §6.3
+  C shim (`src/netdev_bridge*.{c,h}`, encoding the full §6.3
   sk_buff ownership contract), `src/netdev.rs` (Rust `BridgeOps`
   vtable + `NetdevHandle` RAII), and the cshim FFI bridge in
   `src/unsafe_boundary.rs`. Crate root renamed

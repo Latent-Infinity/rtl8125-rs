@@ -220,6 +220,9 @@ impl pci::Driver for R8125Driver {
                             rx_tail: crate::netdev::CachePadded::new(
                                 core::sync::atomic::AtomicUsize::new(0),
                             ),
+                            ocp_base: core::sync::atomic::AtomicU32::new(
+                                crate::regs::OCP_STD_PHY_BASE,
+                            ),
                         },
                         GFP_KERNEL,
                     )?;

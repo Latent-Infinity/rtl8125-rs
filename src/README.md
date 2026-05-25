@@ -32,7 +32,7 @@
 | `skb.rs` | typed `sk_buff` wrappers + FFI ownership state machine (§6.3) | M4/M5 | ✅ cshim-helper disposition for M4; type-state refactor queued for M5 |
 | `napi.rs` | NAPI poll-path Rust side; calls into C shim | M4/M5 | ✅ M4 first cut |
 | `netdev.rs` | Rust netdev glue: `BridgeOps` vtable, `NetdevHandle` RAII, ndo entry stubs, M4 TX/RX open path | M4 | ✅ M4-full active |
-| `netdev_bridge.h` + `netdev_bridge.c` | C bridge — sk_buff ownership contract from §6.3, net_device + NAPI plumbing (≤400 LOC) | M4 | ✅ |
+| `netdev_bridge.h` + `netdev_bridge*.c` | C bridge — sk_buff ownership contract from §6.3, net_device/NAPI/sk_buff plus split PHY/MDIO plumbing; primary bridge ≤400 LOC | M4 | ✅ |
 | `stats.rs` | counters, ethtool surfaces | M4+ | — |
 | `trace.rs` | tracepoint definitions (experimental/versioned until M6, §16 Q4) | M4+ | — |
 | `unsafe_boundary.rs` | the **only** module permitted `#![allow(unsafe_code)]` | M1 (empty) | ✅ — M3 residents (`set_64bit_dma_mask`, `AsBytes`/`FromBytes` for `ring::Descriptor`) plus M4 residents (cshim FFI extern block, raw pointer conversions, IRQ/DMA/skb/NAPI wrappers, `unsafe impl Send/Sync`). Census baseline: 43 |

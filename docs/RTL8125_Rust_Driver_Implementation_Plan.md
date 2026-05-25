@@ -18,7 +18,7 @@ The plan is deliberately scoped against the **state of Rust-for-Linux as of May 
 The correct response is **not** to wait, and **not** to claim more safety than the kernel currently offers. The correct response is a layered prototype:
 
 - A Rust core that owns everything from PCI probe through descriptor-ring ownership, gated behind `#![deny(unsafe_code)]` at the crate root with a single named `unsafe_boundary` module that locally allows it.
-- A small, audited C shim (`cshim/netdev_bridge.c`) that bridges the Rust core to `net_device`, NAPI, and `sk_buff` until the upstream Rust abstractions stabilize. The shim's value is the documented **`sk_buff` ownership contract** (§6.3) it implements, not its source code.
+- Small, audited C shim files (`src/netdev_bridge*.c`) that bridge the Rust core to `net_device`, NAPI, `sk_buff`, and PHY/MDIO until the upstream Rust abstractions stabilize. The shim's value is the documented **`sk_buff` ownership contract** (§6.3) it implements, not its source code.
 - **Active hostile treatment of two known-historical failure modes** for this silicon family: PCIe ASPM / L1 sub-state stability (§3.3), promoted from "perf tuning" to a tier-1 correctness gate at M5, and `sk_buff` ownership across the FFI boundary (§6.3), enforced by a type-state Rust wrapper with panic-on-Drop leak detection in development builds.
 - A bring-up plan (M0a/M0b → M7) where the **first** successful driver milestone is "PCI probe + chip revision logged + clean unload 1,000×," not "packets moving."
 - A VFIO-isolated test harness so a faulty driver crashes only the guest, never the MS-A2 host.
@@ -202,6 +202,7 @@ r8125_rust/
 │   └── unsafe_boundary.rs       # the ONLY module allowed to contain unsafe
 └── cshim/
     ├── netdev_bridge.c          # net_device, sk_buff, NAPI glue
+    ├── netdev_bridge_phy.c      # PHY / MDIO glue
     ├── netdev_bridge.h          # canonical sk_buff ownership contract (§6.3)
     └── README.md                # explicit rationale + migration plan
 ```
@@ -425,7 +426,7 @@ M3 may run with the RTL8125 RJ45 unplugged. Descriptor-ring allocation and teard
 M4 is the first milestone that requires M0b and a connected physical link partner.
 
 **Deliverables:**
-- `net_device` registration via the C shim (`cshim/netdev_bridge.c`)
+- `net_device` registration via the C shim (`src/netdev_bridge*.c`)
 - `ndo_open` / `ndo_stop` implemented end-to-end
 - One TX queue, one RX queue, standard MTU
 - No offloads — `ethtool -k` reports all offloads disabled initially
@@ -773,7 +774,7 @@ M0b physical topology, peer details, L2 isolation, and `r8169`/`r8125` throughpu
 
 1. **Exact RTL8125 revision** on the physical MS-A2 unit — drives the register dispatch table. **RESOLVED (validation finding 3, evidence `docs/baseline/chip_revision.txt`): RTL8125B, XID `0x641`, PCI rev `0x05`, firmware `rtl8125b-2_0.0.2`.** This is the first/only revision the `hw.rs` dispatch table must support at M2; unknown revisions are refused (no silent fallback).
 2. **IOMMU group composition** — does the group include only the RTL8125, or are other functions captive? If captive, the setup is marked test-only and the README documents it.
-3. **C-shim scope freeze** — what is the maximum LOC budget for `cshim/netdev_bridge.c`? Proposed: 400 LOC, hard-capped, reviewed line-by-line.
+3. **C-shim scope freeze** — what is the maximum LOC budget for the primary bridge? `src/netdev_bridge.c` is hard-capped at 400 LOC and reviewed line-by-line; PHY/MDIO glue may live in a separate focused C file to keep that cap meaningful.
 4. **Tracepoint schema** — **all tracepoints are marked experimental/versioned until M6.** No external tooling should treat them as a stable ABI before that. Minimum event set: RX submit, RX complete, TX submit, TX complete, TX busy exception, IRQ entry, NAPI poll entry/exit, ASPM state change, suspend/resume entry/exit.
 5. **Out-of-tree distribution model** — DKMS is **not** viable as the default mechanism on Ubuntu LTS because Hardware Enablement (HWE) kernel updates can silently change the kernel's required `rustc` version (e.g., 1.93 → 1.95) under a user during a routine `apt upgrade`. The next boot rebuilds the module with the wrong toolchain and the network interface vanishes — exactly the failure mode that destroys user trust in out-of-tree drivers. *(Framing note, validation finding 1: this end-user distribution problem is distinct from the **developer-box** Rust-toolchain gap in §13, which is fixed by simply apt-installing the distro-provided kernel-rust set — `linux-lib-rust-<ver>` + pinned `rustc`/`rust-src` + `bindgen`. The toolchain-drift hazard below is about user systems at `apt upgrade` time, not the dev box.)*
    - **Primary: pre-built module package per exact kernel ABI tuple.** A small APT repository publishes one binary per tuple:

@@ -3,7 +3,7 @@
  * netdev_bridge.h — the canonical Rust ↔ C ownership contract for the
  *                   r8125_rust driver (plan §5.2 / §6.3 / §7 M4).
  *
- * This file is the DELIVERABLE, not its implementation in netdev_bridge.c.
+ * This file is the DELIVERABLE, not its implementation in netdev_bridge*.c.
  * Reviewers compare every `struct sk_buff *`-touching call against the
  * pre/post-conditions stated here. Any change to a function signature or
  * an ownership transition requires updating both this header AND the
@@ -299,5 +299,64 @@ void r8125_bridge_counters_snapshot(struct net_device *ndev,
 /* Accessor for the `napi_struct` embedded in the bridge — needed by Rust
  * to call `r8125_bridge_skb_deliver_rx` from the poll callback. */
 struct napi_struct *r8125_bridge_napi(struct net_device *ndev);
+
+/* ──────────────────────────────────────────────────────────────────────
+ *  PHY plumbing (plan §7 M4-traffic, task #46).
+ *
+ *  The cshim owns the kernel-side MDIO bus + `struct phy_device` (the
+ *  Rust crate does not expose these surfaces yet). Rust supplies the
+ *  two MDIO transaction callbacks via the function-pointer struct
+ *  below; the cshim wires them into a kernel `mii_bus->{read,write}`.
+ *  Rust then drives `phy_start` / `phy_stop` through the helpers
+ *  below at the appropriate ndo lifecycle points.
+ *
+ *  Why Rust callbacks?  The PHY registers are accessed through a
+ *  32-bit MMIO transaction at offset 0xB8 (GPHY_OCP). MMIO must stay
+ *  inside the Rust `unsafe_boundary`; the cshim is forbidden from
+ *  touching the BAR directly.
+ * ────────────────────────────────────────────────────────────────────── */
+
+/* MDIO read: returns u16 in [0, 0xFFFF] on success, negative errno on
+ * failure. Called from process context (RTNL held). */
+typedef int (*r8125_bridge_mdio_read_fn)(void *priv, int phyreg);
+typedef int (*r8125_bridge_mdio_write_fn)(void *priv, int phyreg, u16 val);
+
+struct r8125_bridge_mdio_ops {
+	r8125_bridge_mdio_read_fn  read;
+	r8125_bridge_mdio_write_fn write;
+};
+
+/*
+ * Allocate an MDIO bus for this netdev, register it with the kernel,
+ * walk it, and attach a phy_device. Stores the resulting phy_device
+ * inside the bridge so subsequent `phy_start` / `phy_stop` calls find
+ * it. Returns 0 on success, negative errno on failure.
+ *
+ * Must be called AFTER `r8125_bridge_register` and BEFORE any
+ * `r8125_bridge_phy_connect_and_reset`. The MDIO bus is explicitly
+ * unregistered and freed by `r8125_bridge_unregister_and_free`, while
+ * this module's text is still loaded.
+ *
+ * If no PHY driver (realtek.ko) is loaded for the discovered phy_id
+ * the function returns `-EUNATCH`, matching r8169's behaviour.
+ */
+int r8125_bridge_phy_register(struct net_device *ndev,
+			      const struct r8125_bridge_mdio_ops *ops);
+
+/* Two-step PHY bring-up matching the r8169 ordering for 8125B (the
+ * embedded MAC/PHY couple: phy_soft_reset clobbers ChipCmd, so the
+ * MAC init must happen AFTER PHY reset, with phy_start LAST).
+ *
+ * Call from ndo_open in this order:
+ *   1. bridge_phy_connect_and_reset()   - early, before MAC init
+ *   2. <MAC OCP init + ChipCmd RX|TX + IMR>
+ *   3. bridge_phy_kick_state_machine()  - last, kicks autoneg
+ */
+int r8125_bridge_phy_connect_and_reset(struct net_device *ndev);
+int r8125_bridge_phy_kick_state_machine(struct net_device *ndev);
+
+/* Tear down the open-time PHY state: phy_stop + phy_disconnect. Idempotent;
+ * safe to call when phy_start was never reached. */
+void r8125_bridge_phy_stop(struct net_device *ndev);
 
 #endif /* _R8125_NETDEV_BRIDGE_H */

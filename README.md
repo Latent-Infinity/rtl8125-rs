@@ -17,7 +17,8 @@ This is **not** a "fully safe Rust driver". It is a layered prototype:
   gated behind `#![deny(unsafe_code)]` at the crate root, with exactly one
   module — `src/unsafe_boundary.rs` — permitted to locally `#![allow(unsafe_code)]`
   (enforced by `.unsafe-allowlist` + CI).
-- A small, audited C shim (`cshim/netdev_bridge.c`, target < 400 LOC) bridging
+- Small, audited C shim files (`src/netdev_bridge*.{c,h}`; primary
+  `netdev_bridge.c` target < 400 LOC) bridging
   the Rust core to `net_device` / NAPI / `sk_buff` **until** the upstream Rust
   netdev abstractions stabilize. The shim's value is the documented `sk_buff`
   ownership contract (plan §6.3), not its source.
@@ -50,7 +51,7 @@ critical path. This is an out-of-tree kernel Rust module:
 | `docs/baseline/` | M0a pre-link fact-discovery artifacts; M0b physical-link baseline (plan §7 M0a/M0b) |
 | `docs/perf/` | M6 before/after performance numbers (plan §7 M6) |
 | `src/` | Rust core plus the co-located C bridge required by kbuild's composite-module layout |
-| `cshim/` | C bridge rationale; source lives in `src/netdev_bridge.{c,h}` |
+| `cshim/` | C bridge rationale; source lives in `src/netdev_bridge*.{c,h}` |
 | `tools/` | `fetch_references.sh`, `bind_vfio.sh`, `unbind_vfio.sh`, `capture_m0_baseline.sh` |
 | `ci/` | Mechanical-enforcement checks (plan §9.4) |
 | `references/` | **Gitignored.** GPL reference sources, fetched not copied (plan §9.3) |

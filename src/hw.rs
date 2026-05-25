@@ -74,10 +74,90 @@ pub(crate) fn identify(regs: &Regs<'_>) -> Option<&'static ChipInfo> {
     KNOWN.iter().find(|info| (xid & info.mask) == info.val)
 }
 
+/// MAC OCP poll: wait for register 0xE00E bit 13 to clear. Mirrors r8169
+/// `rtl_mac_ocp_e00e_cond` — 1000 iterations × 10 µs = 10 ms total.
+fn wait_mac_ocp_e00e_clear(regs: &Regs<'_>) -> Result<()> {
+    let step = Delta::from_micros(10);
+    for _ in 0..1000 {
+        if regs.mac_ocp_read(0xE00E) & (1 << 13) == 0 {
+            return Ok(());
+        }
+        udelay(step);
+    }
+    Err(EIO)
+}
+
+/// Port of r8169 `rtl_hw_start_8125_common` specialized for MAC_VER_63
+/// (RTL8125B). This is the minimum MAC OCP / MMIO init sequence required
+/// for the 8125B's TX and RX engines to actually move packets — without
+/// it, ChipCmd RX|TX enable appears to take effect but the engines are
+/// silent. We deliberately skip the optional pieces (RSS, PCIe state
+/// transitions, ASPM clkreq tuning) — those become M5 work.
+///
+/// Sequence in source-of-truth order so cross-referencing with r8169 is
+/// trivial. Every line is a direct port from r8169_main.c
+/// `rtl_hw_start_8125_common` (line ~3855) with VER_63-specific branches.
+pub(crate) fn hw_start_8125b(regs: &Regs<'_>) -> Result<()> {
+    // Config1 (8-bit at 0x52): clear bit 4 — "PM enable" override per r8169.
+    let cfg1 = regs.config1();
+    regs.set_config1(cfg1 & !0x10);
+
+    // r8168_mac_ocp_modify(0xd40a, 0x0010, 0x0000) — disable UPS
+    regs.mac_ocp_modify(0xD40A, 0x0010, 0x0000);
+
+    regs.mac_ocp_write(0xC140, 0xFFFF);
+    regs.mac_ocp_write(0xC142, 0xFFFF);
+
+    regs.mac_ocp_modify(0xD3E2, 0x0FFF, 0x03A9);
+    regs.mac_ocp_modify(0xD3E4, 0x00FF, 0x0000);
+    regs.mac_ocp_modify(0xE860, 0x0000, 0x0080);
+
+    // Critical for our 16-byte (legacy r8169) TX descriptors.
+    regs.mac_ocp_modify(
+        regs::MAC_OCP_NEW_TX_DESC,
+        regs::MAC_OCP_NEW_TX_DESC_BIT0,
+        0,
+    );
+
+    // VER_63 specific tuning.
+    regs.mac_ocp_modify(0xE614, 0x0700, 0x0200);
+    regs.mac_ocp_modify(0xE63E, 0x0C30, 0x0000);
+    regs.mac_ocp_modify(0xC0B4, 0x0000, 0x000C);
+    regs.mac_ocp_modify(0xEB6A, 0x00FF, 0x0033);
+    regs.mac_ocp_modify(0xEB50, 0x03E0, 0x0040);
+    regs.mac_ocp_modify(0xE056, 0x00F0, 0x0000);
+    regs.mac_ocp_modify(0xE040, 0x1000, 0x0000);
+    regs.mac_ocp_modify(0xEA1C, 0x0003, 0x0001);
+    regs.mac_ocp_modify(0xEA1C, 0x0004, 0x0000);
+    regs.mac_ocp_modify(0xE0C0, 0x4F0F, 0x4403);
+    regs.mac_ocp_modify(0xE052, 0x0080, 0x0068);
+    regs.mac_ocp_modify(0xD430, 0x0FFF, 0x047F);
+    regs.mac_ocp_modify(0xEA1C, 0x0004, 0x0000);
+
+    // Toggle 0xEB54 bit 0 (1 µs hold).
+    regs.mac_ocp_modify(0xEB54, 0x0000, 0x0001);
+    udelay(Delta::from_micros(1));
+    regs.mac_ocp_modify(0xEB54, 0x0001, 0x0000);
+
+    // Clear bits 4-5 of MMIO 0x1880 (16-bit).
+    let val_1880 = regs.read_u16_at(0x1880);
+    regs.write_u16_at(0x1880, val_1880 & !0x0030);
+
+    // Final MAC OCP write + wait for chip to settle.
+    regs.mac_ocp_write(0xE098, 0xC302);
+    wait_mac_ocp_e00e_clear(regs)?;
+
+    // rtl_disable_rxdvgate — RX_DV signal from PHY now reaches the MAC.
+    let misc = regs.misc();
+    regs.set_misc(misc & !regs::MISC_RXDV_GATED_EN);
+
+    Ok(())
+}
+
 /// Hardware reset — mirrors r8169 `rtl_hw_reset`. Writes `CmdReset` to
 /// `ChipCmd` and polls 100 × 100 µs for the bit to clear. If
-/// `inject_timeout` is true, the write is suppressed so the poll always
-/// times out (deliberate failure injection for the plan §7 M2 "failed
+/// `inject_timeout` is true, the early-exit check is suppressed so the poll
+/// always times out (deliberate failure injection for the plan §7 M2 "failed
 /// reset path is recoverable" gate).
 pub(crate) fn reset(regs: &Regs<'_>, inject_timeout: bool) -> Result<()> {
     // Trigger the reset normally either way — skipping the write would make

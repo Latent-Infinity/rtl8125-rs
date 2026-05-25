@@ -102,7 +102,7 @@ unsafe impl FromBytes for Descriptor {}
 // ───────────────────────────────────────────────────────────────────────
 // M4 — Rust ↔ C bridge FFI declarations + safe wrappers
 //
-// The C side lives in `src/netdev_bridge.c`; the contract is in
+// The C side lives in `src/netdev_bridge*.c`; the contract is in
 // `src/netdev_bridge.h`. Everything here is mechanical glue:
 //   - the function-pointer table the Rust side hands to the C bridge
 //     (`BridgeOps` — `#[repr(C)]` matches `struct r8125_bridge_ops`),
@@ -146,7 +146,6 @@ extern "C" {
     fn r8125_bridge_tx_stop_queue(ndev: *mut bindings::net_device);
     fn r8125_bridge_tx_wake_queue(ndev: *mut bindings::net_device);
     fn r8125_bridge_tx_disable(ndev: *mut bindings::net_device);
-    fn r8125_bridge_carrier_on(ndev: *mut bindings::net_device);
     fn r8125_bridge_carrier_off(ndev: *mut bindings::net_device);
 
     fn r8125_bridge_skb_dma_map_tx(
@@ -177,6 +176,23 @@ extern "C" {
         skb: *mut bindings::sk_buff,
     );
     fn r8125_bridge_rx_drop_error(ndev: *mut bindings::net_device);
+
+    // ── PHY plumbing (M4-traffic) ────────────────────────────────────────
+    fn r8125_bridge_phy_register(
+        ndev: *mut bindings::net_device,
+        ops: *const BridgeMdioOps,
+    ) -> c_int;
+    fn r8125_bridge_phy_connect_and_reset(ndev: *mut bindings::net_device) -> c_int;
+    fn r8125_bridge_phy_kick_state_machine(ndev: *mut bindings::net_device) -> c_int;
+    fn r8125_bridge_phy_stop(ndev: *mut bindings::net_device);
+}
+
+/// Rust mirror of `struct r8125_bridge_mdio_ops` — two function pointers
+/// the C MDIO bus uses to call back into Rust for PHY register access.
+#[repr(C)]
+pub(crate) struct BridgeMdioOps {
+    pub read: extern "C" fn(priv_: *mut c_void, phyreg: c_int) -> c_int,
+    pub write: extern "C" fn(priv_: *mut c_void, phyreg: c_int, val: u16) -> c_int,
 }
 
 // SAFETY: `NetdevHandle` wraps a raw `*mut bindings::net_device` from
@@ -449,11 +465,6 @@ pub(crate) fn bridge_tx_disable(ndev: *mut bindings::net_device) {
     unsafe { r8125_bridge_tx_disable(ndev) };
 }
 
-pub(crate) fn bridge_carrier_on(ndev: *mut bindings::net_device) {
-    // SAFETY: ndev alive.
-    unsafe { r8125_bridge_carrier_on(ndev) };
-}
-
 pub(crate) fn bridge_carrier_off(ndev: *mut bindings::net_device) {
     // SAFETY: ndev alive.
     unsafe { r8125_bridge_carrier_off(ndev) };
@@ -577,4 +588,126 @@ pub(crate) fn bridge_unregister_and_free(ndev: *mut bindings::net_device) {
 pub(crate) fn skb_free_error(skb: *mut bindings::sk_buff) {
     // SAFETY: see fn-level contract.
     unsafe { r8125_bridge_skb_free_error(skb) };
+}
+
+// ── PHY plumbing safe wrappers (M4-traffic) ──────────────────────────────
+
+/// Register the cshim's MDIO bus + phy_device for this netdev, with the
+/// Rust extern "C" callbacks the bus will use for MDIO transactions.
+/// Must be called after `bridge_register` succeeds.
+///
+/// # SAFETY
+///
+/// `ndev` is a registered net_device returned by `bridge_alloc`. `ops`
+/// is borrowed only for the duration of the call (the cshim copies the
+/// struct into its bridge state). The `fn` pointers must have `'static`
+/// lifetime — they refer to `extern "C" fn` Rust items in `crate::phy`,
+/// which do.
+pub(crate) fn bridge_phy_register(
+    ndev: *mut bindings::net_device,
+    ops: &BridgeMdioOps,
+) -> Result<()> {
+    // SAFETY: see fn-level contract.
+    let rc = unsafe { r8125_bridge_phy_register(ndev, ops) };
+    to_result(rc)
+}
+
+/// Step 1 of PHY bring-up (early, BEFORE MAC OCP init + ChipCmd):
+/// phy_connect_direct + phy_init_hw + genphy_soft_reset + phy_resume.
+/// On the 8125B's integrated MAC/PHY, genphy_soft_reset writes BMCR_RESET
+/// which clobbers ChipCmd; running this early means subsequent MAC init
+/// writes stick.
+///
+/// # SAFETY: `ndev` must be a registered net_device for which
+/// `bridge_phy_register` previously returned Ok.
+pub(crate) fn bridge_phy_connect_and_reset(
+    ndev: *mut bindings::net_device,
+) -> Result<()> {
+    // SAFETY: see fn-level contract.
+    let rc = unsafe { r8125_bridge_phy_connect_and_reset(ndev) };
+    to_result(rc)
+}
+
+/// Step 2 of PHY bring-up (LAST in ndo_open, AFTER ChipCmd + IMR):
+/// kicks the PHY state machine and starts autoneg.
+///
+/// # SAFETY: same as `bridge_phy_connect_and_reset`; must have been
+/// called first.
+pub(crate) fn bridge_phy_kick_state_machine(
+    ndev: *mut bindings::net_device,
+) -> Result<()> {
+    // SAFETY: see fn-level contract.
+    let rc = unsafe { r8125_bridge_phy_kick_state_machine(ndev) };
+    to_result(rc)
+}
+
+/// phy_stop + phy_disconnect — called from ndo_stop.
+///
+/// # SAFETY: as `bridge_phy_start`. Idempotent if `bridge_phy_start` was
+/// never called.
+pub(crate) fn bridge_phy_stop(ndev: *mut bindings::net_device) {
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_phy_stop(ndev) };
+}
+
+#[inline]
+fn errno_to_c_int(e: kernel::error::Error) -> c_int {
+    e.to_errno()
+}
+
+#[inline]
+fn valid_mii_reg(phyreg: c_int) -> bool {
+    (0..=31).contains(&phyreg)
+}
+
+// ── MDIO callback entry points called from the C `mii_bus` ──────────────
+//
+// These two `extern "C"` items are passed to the cshim by function pointer
+// in `BridgeMdioOps`. They live here because they translate the raw cookie
+// back into `&NetdevState`.
+
+/// MDIO read entry point — invoked by `mii_bus->read`. Returns a
+/// non-negative `u16` value on success or a negative kernel errno on
+/// failure. Reg 0x1F returns the current OCP page.
+pub(crate) extern "C" fn r8125_rust_mdio_read(
+    cookie: *mut c_void,
+    phyreg: c_int,
+) -> c_int {
+    if cookie.is_null() || !valid_mii_reg(phyreg) {
+        return errno_to_c_int(kernel::error::code::EINVAL);
+    }
+    let state = state_from_cookie(cookie);
+    let reg = phyreg as u8;
+
+    if reg == crate::regs::MII_PAGE_SELECT {
+        return crate::phy::page_select_read(state) as c_int;
+    }
+    match crate::phy::mdio_read(state, reg) {
+        Ok(v) => v as c_int,
+        Err(e) => errno_to_c_int(e),
+    }
+}
+
+/// MDIO write entry point — invoked by `mii_bus->write`. Returns 0 on
+/// success or a negative kernel errno. Writing to reg 0x1F updates the
+/// current OCP page selector (no PHY hardware access).
+pub(crate) extern "C" fn r8125_rust_mdio_write(
+    cookie: *mut c_void,
+    phyreg: c_int,
+    val: u16,
+) -> c_int {
+    if cookie.is_null() || !valid_mii_reg(phyreg) {
+        return errno_to_c_int(kernel::error::code::EINVAL);
+    }
+    let state = state_from_cookie(cookie);
+    let reg = phyreg as u8;
+
+    if reg == crate::regs::MII_PAGE_SELECT {
+        crate::phy::page_select_write(state, val);
+        return 0;
+    }
+    match crate::phy::mdio_write(state, reg, val) {
+        Ok(()) => 0,
+        Err(e) => errno_to_c_int(e),
+    }
 }

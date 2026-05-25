@@ -14,6 +14,7 @@
 
 use kernel::io::Io;
 use kernel::pci;
+use kernel::time::{delay::udelay, Delta};
 
 use crate::regs;
 
@@ -141,6 +142,131 @@ impl<'a> Regs<'a> {
     /// it as a diagnostic; the kernel PHY framework is the authority.
     pub(crate) fn phy_status(&self) -> u8 {
         self.bar.read8(0x6C)
+    }
+
+    // ── Config1 (8-bit at 0x52) ─────────────────────────────────────────
+
+    pub(crate) fn config1(&self) -> u8 {
+        self.bar.read8(regs::CONFIG1)
+    }
+
+    pub(crate) fn set_config1(&self, value: u8) {
+        self.bar.write8(value, regs::CONFIG1);
+    }
+
+    // ── Generic small-region accessors used by hw_start_8125b ───────────
+
+    /// Read a 16-bit register at an arbitrary BAR offset. Used by the
+    /// 8125B init sequence which pokes one-off offsets like 0x1880.
+    pub(crate) fn read_u16_at(&self, offset: usize) -> u16 {
+        self.bar.read16(offset)
+    }
+
+    /// Write a 16-bit register at an arbitrary BAR offset.
+    pub(crate) fn write_u16_at(&self, offset: usize, value: u16) {
+        self.bar.write16(value, offset);
+    }
+
+    // ── MAC OCP — internal MAC register access (8125 family) ────────────
+    //
+    // Unlike GPHY OCP (which polls OCPAR_FLAG), MAC OCP writes complete
+    // synchronously: write to OCPDR, the chip latches; reads return the
+    // value on the next read of OCPDR.
+
+    pub(crate) fn mac_ocp_write(&self, reg: u32, data: u16) {
+        let cmd = regs::OCPAR_FLAG | ((reg & 0xFFFF) << 15) | (data as u32);
+        self.bar.write32(cmd, regs::OCPDR);
+    }
+
+    pub(crate) fn mac_ocp_read(&self, reg: u32) -> u16 {
+        self.bar.write32((reg & 0xFFFF) << 15, regs::OCPDR);
+        (self.bar.read32(regs::OCPDR) & 0xFFFF) as u16
+    }
+
+    /// Read-modify-write helper. `mask` is the bit set to clear before
+    /// applying `set`. Mirrors r8169 `r8168_mac_ocp_modify`.
+    pub(crate) fn mac_ocp_modify(&self, reg: u32, mask: u16, set: u16) {
+        let cur = self.mac_ocp_read(reg);
+        self.mac_ocp_write(reg, (cur & !mask) | set);
+    }
+
+    // ── MISC (0xF0) — for rtl_disable_rxdvgate ──────────────────────────
+
+    pub(crate) fn misc(&self) -> u32 {
+        self.bar.read32(regs::MISC)
+    }
+
+    pub(crate) fn set_misc(&self, value: u32) {
+        self.bar.write32(value, regs::MISC);
+    }
+
+    // ── GPHY OCP — PHY register access path (8125 family) ───────────────
+
+    /// Write a 16-bit value to a PHY OCP register. `ocp_addr` is the
+    /// 16-bit OCP address (already includes the page base — i.e.
+    /// `OCP_STD_PHY_BASE + mii_reg * 2`). Polls up to ~25×10 µs for the
+    /// transaction to complete.
+    ///
+    /// Returns `Err(EIO)` on timeout (the chip never cleared OCPAR_FLAG).
+    pub(crate) fn gphy_ocp_write(
+        &self,
+        ocp_addr: u32,
+        data: u16,
+    ) -> kernel::error::Result<()> {
+        // OCPAR_FLAG | (ocp_addr << 15) | data
+        let cmd = regs::OCPAR_FLAG | ((ocp_addr & 0xFFFF) << 15) | (data as u32);
+        self.bar.write32(cmd, regs::GPHY_OCP);
+        let step = Delta::from_micros(10);
+        for _ in 0..25 {
+            udelay(step);
+            if self.bar.read32(regs::GPHY_OCP) & regs::OCPAR_FLAG == 0 {
+                return Ok(());
+            }
+        }
+        Err(kernel::error::code::EIO)
+    }
+
+    /// Read a 16-bit value from a PHY OCP register. See `gphy_ocp_write`.
+    pub(crate) fn gphy_ocp_read(&self, ocp_addr: u32) -> kernel::error::Result<u16> {
+        let cmd = (ocp_addr & 0xFFFF) << 15;
+        self.bar.write32(cmd, regs::GPHY_OCP);
+        let step = Delta::from_micros(10);
+        for _ in 0..25 {
+            udelay(step);
+            let v = self.bar.read32(regs::GPHY_OCP);
+            if v & regs::OCPAR_FLAG != 0 {
+                return Ok((v & 0xFFFF) as u16);
+            }
+        }
+        Err(kernel::error::code::EIO)
+    }
+
+    /// MDIO-style PHY read: convert MII reg to OCP address using the
+    /// caller-supplied `ocp_base` (default = `OCP_STD_PHY_BASE`). On
+    /// non-default pages r8169 subtracts 0x10 from the reg (see
+    /// `r8168g_mdio_read`).
+    pub(crate) fn mdio_read(&self, ocp_base: u32, reg: u8) -> kernel::error::Result<u16> {
+        let reg_adj = if ocp_base != regs::OCP_STD_PHY_BASE && reg >= 0x10 {
+            reg - 0x10
+        } else {
+            reg
+        };
+        self.gphy_ocp_read(ocp_base + (reg_adj as u32) * 2)
+    }
+
+    /// MDIO-style PHY write — same page logic as `mdio_read`.
+    pub(crate) fn mdio_write(
+        &self,
+        ocp_base: u32,
+        reg: u8,
+        val: u16,
+    ) -> kernel::error::Result<()> {
+        let reg_adj = if ocp_base != regs::OCP_STD_PHY_BASE && reg >= 0x10 {
+            reg - 0x10
+        } else {
+            reg
+        };
+        self.gphy_ocp_write(ocp_base + (reg_adj as u32) * 2, val)
     }
 
     /// Zero the per-MAC_VER_63 interrupt-coalescing table:

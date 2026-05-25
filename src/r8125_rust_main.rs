@@ -47,6 +47,7 @@ mod mmio;
 mod napi;
 mod netdev;
 mod pci;
+mod phy;
 mod pm;
 mod regs;
 mod ring;

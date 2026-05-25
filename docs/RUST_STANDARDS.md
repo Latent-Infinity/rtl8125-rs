@@ -91,7 +91,7 @@ The following code paths are HOT and demand strict standards adherence:
    - Minimum work: read+ack ISR, mask further IRQs, schedule NAPI.
    - Currently follows this discipline.
 
-Counters in `cshim/netdev_bridge.c` (`tx_received`, `tx_consumed`, …) are
+Counters in `src/netdev_bridge.c` (`tx_received`, `tx_consumed`, …) are
 currently single `u64` with `READ_ONCE`/`WRITE_ONCE`. Section 15.2 calls
 for **per-core sharding with cache padding** to avoid false sharing under
 load — **TODO M5 refactor**, possibly via percpu counters.

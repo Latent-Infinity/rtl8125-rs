@@ -1,0 +1,88 @@
+M4-traffic — proof of first-time packet flow through rtl8125-rs (2026-05-25)
+================================================================================
+
+End-to-end working: probe → register MDIO bus + attach PHY → ndo_open →
+PHY autoneg → ChipCmd RX|TX → IMR enable → phy_start → 1G/Full link
+established → ARP exchange → ping reply path closed → iperf3 streams.
+
+## Ping (5 packets, 0 loss, sub-ms RTT)
+
+  PING 10.0.0.1 (10.0.0.1) from 10.0.0.2 enp5s0: 56(84) bytes of data.
+  64 bytes from 10.0.0.1: icmp_seq=1 ttl=64 time=0.554 ms
+  64 bytes from 10.0.0.1: icmp_seq=2 ttl=64 time=0.304 ms
+  64 bytes from 10.0.0.1: icmp_seq=3 ttl=64 time=0.418 ms
+  64 bytes from 10.0.0.1: icmp_seq=4 ttl=64 time=0.401 ms
+  64 bytes from 10.0.0.1: icmp_seq=5 ttl=64 time=0.412 ms
+  rtt min/avg/max/mdev = 0.304/0.417/0.554/0.079 ms
+
+  ARP resolved:  10.0.0.1 lladdr 38:05:25:36:a6:32 REACHABLE
+
+## iperf3 TCP guest → host
+
+  10s steady-state stream: 1.08 GiB transferred at 929 Mbps
+  Re-captured for JSON evidence: 1110 MB / 10.003 s = 931 Mbps, 0 retransmits.
+  Saved as docs/baseline/iperf3/iperf3_r8125_rust_guest2host_tcp_1500.json
+  (8394 bytes).
+
+  IRQs handled in iperf3 window: 299,535 on IO-APIC line 21 r8125_rust.
+
+## Link state at the chip + host
+
+  Guest enp5s0: UP/LOWER_UP, MAC 38:05:25:36:a6:31
+  Host  enp4s0: 2.5Gbps/Full, Link detected: yes  (igc/I226-V peer)
+  Both sides see L1 link; chip-level PHYStatus reads ungated.
+
+## Caveats / known limitations of this baseline
+
+  - Link autonegotiated at 1Gbps/Full (not 2.5G). The dedicated "Realtek
+    Internal NBASE-T PHY" driver's probe returns -EOPNOTSUPP, so the
+    PHY framework falls back to genphy which doesn't advertise 2.5G.
+    Reaching 2.5G requires either porting the chip-specific PHY config
+    table from r8169_phy_config.c::rtl8125b_hw_phy_config or making the
+    Realtek PHY driver's probe succeed. M5 work; tracked separately.
+
+  - netdev->stats.{tx,rx}_{bytes,packets} are not populated by this
+    driver (they read 0/0 in `ip -s link`). Real traffic IS flowing —
+    iperf3 confirms — but we don't bump the sw stats. M5 work; tracked
+    as part of the §15.2 counter-sharding refactor (task 45).
+
+  - rmmod under in-flight TCP can wedge the chip (host link drops, our
+    PHY teardown succeeds but the chip needs a power-cycle / VM reboot
+    to recover). Recommended: ip link down + sleep → rmmod. Tracked as
+    a residual M4-traffic finish task.
+
+## Build + load discipline
+
+  - host: `make` (kernel-build, NOT cargo). One module: r8125_rust.ko.
+  - guest: `rsync src/ → /tmp/r8125_rust_build/; make`.
+  - load order: `modprobe -r r8169; modprobe realtek; insmod r8125_rust.ko`.
+    (realtek.ko is the PHY driver — must be loaded before our driver
+    attaches the phy_device, or the bind fails with -EUNATCH.)
+
+## Implementation summary (the path from `git log` since last commit)
+
+  src/phy.rs (NEW)             — Rust extern "C" MDIO read/write entry points
+  src/unsafe_boundary.rs       — extern decls for new C side + safe wrappers
+                                 (BridgeMdioOps, bridge_phy_register,
+                                 bridge_phy_connect_and_reset,
+                                 bridge_phy_kick_state_machine, bridge_phy_stop)
+  src/mmio.rs                  — gphy_ocp_read/write, mac_ocp_read/write/modify,
+                                 set_misc, config1, read_u16_at/write_u16_at,
+                                 set_int_cfg0/1, zero_coalesce_table_8125b,
+                                 phy_status, imr_readback
+  src/regs.rs                  — 8125-correct offsets (IMR=0x38, ISR=0x3C, TxPoll
+                                 =0x90 NPQ=BIT(0), INT_CFG0=0x34, INT_CFG1=0x7A,
+                                 GPHY_OCP=0xB8, OCPDR=0xB0, MISC=0xF0, CONFIG1
+                                 =0x52, OCP_STD_PHY_BASE=0xA400)
+  src/hw.rs                    — hw_start_8125b: port of r8169 rtl_hw_start_
+                                 8125_common for MAC_VER_63 (~25 MAC OCP writes +
+                                 MISC ungate + 0xE098 finalizer + 0xE00E wait)
+  src/netdev.rs                — ndo_open reorder: phy connect+reset BEFORE MAC
+                                 init, ChipCmd middle, phy_start LAST; ndo_stop
+                                 adds bridge_phy_stop before disabling chip
+  src/netdev_bridge.{h,c}      — netdev/skb/NAPI bridge, kept under 400 LOC.
+  src/netdev_bridge_phy.c      — r8125_bridge_phy_register, _phy_connect_and_
+                                 reset, _phy_kick_state_machine, _phy_stop;
+                                 explicit mdiobus_alloc/register (NOT devm,
+                                 fixes _phy_state_machine UAF on rmmod);
+                                 bridge_phylink_handler drives netif_carrier.

@@ -1,7 +1,7 @@
 # `cshim/` — the C↔Rust netdev bridge
 
 **Status: M4.** The bridge rationale and migration plan live here. The actual
-kbuild-visible implementation lives in `../src/netdev_bridge.c` and the
+kbuild-visible implementation lives in `../src/netdev_bridge*.c` and the
 canonical ownership contract lives in `../src/netdev_bridge.h`, because the
 kernel composite-module pattern requires C and Rust objects in the same `M=`
 directory.
@@ -21,7 +21,8 @@ target. So:
 
 ## Scope freeze (plan §16 Q3)
 
-- `../src/netdev_bridge.c` — **hard cap 400 LOC**, reviewed line-by-line.
+- `../src/netdev_bridge.c` — primary netdev/skb/NAPI bridge, **hard cap 400 LOC**, reviewed line-by-line.
+- `../src/netdev_bridge_phy.c` — PHY/MDIO bridge split out to keep the primary bridge within the review cap.
 - `../src/netdev_bridge.h` — the **canonical `sk_buff` ownership contract** (plan §6.3).
   Every function carries explicit pre/post-conditions on skb ownership,
   including the TX flow-control invariants (`netif_tx_stop_queue` before the
