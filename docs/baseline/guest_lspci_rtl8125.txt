@@ -1,0 +1,27 @@
+# Captured 2026-05-21T04:54:05+00:00 from rtl8125-guest
+
+## lspci -nnk for RTL8125
+05:00.0 Ethernet controller [0200]: Realtek Semiconductor Co., Ltd. RTL8125 2.5GbE Controller [10ec:8125] (rev 05)
+	Subsystem: Realtek Semiconductor Co., Ltd. Device [10ec:0123]
+	Kernel driver in use: r8169
+	Kernel modules: r8169
+06:00.0 Unclassified device [00ff]: Red Hat, Inc. Virtio 1.0 balloon [1af4:1045] (rev 01)
+	Subsystem: Red Hat, Inc. QEMU [1af4:1100]
+	Kernel driver in use: virtio-pci
+	Kernel modules: virtio_pci
+07:00.0 Unclassified device [00ff]: Red Hat, Inc. Virtio 1.0 RNG [1af4:1044] (rev 01)
+
+## ip link / link state
+lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP>
+enp1s0           UP             52:54:00:ae:58:f5 <BROADCAST,MULTICAST,UP,LOWER_UP>
+enp5s0           DOWN           38:05:25:36:a6:31 <NO-CARRIER,BROADCAST,MULTICAST,UP>
+
+## ethtool -i (if r8169 bound)
+--- enp1s0 ---
+driver: virtio_net
+version: 1.0.0
+bus-info: 0000:01:00.0
+--- enp5s0 ---
+driver: r8169
+version: 7.0.0
+bus-info: 0000:05:00.0

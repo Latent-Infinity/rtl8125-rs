@@ -1,0 +1,72 @@
+# Phase 7 — Trivial OOT Rust module load-loop (guest)
+# Captured 2026-05-22 from rtl8125-guest (custom debug+Rust kernel 7.0.0)
+# Clears the *load* half of M1 trackers 4 and 14.
+
+## Environment
+guest        : rtl8125-guest @ 192.168.122.174 (NAT)
+kernel       : 7.0.0  #2 SMP PREEMPT_DYNAMIC  (CONFIG_RUST=y, KASAN=y,
+               DEBUG_KMEMLEAK=y, PROVE_LOCKING=y, DMA_API_DEBUG=y)
+build tree   : /lib/modules/7.0.0/build -> /usr/src/linux-headers-7.0.0
+
+## Toolchain installed on the guest this session (apt, Ubuntu 26.04 resolute)
+rustc-1.93   : rustc 1.93.1 (01f6ddf75 2026-02-11)   [matches CONFIG_RUSTC_VERSION_TEXT]
+bindgen      : 0.72.1
+gcc          : 15.2.0 (Ubuntu 15.2.0-16ubuntu1)      [matches kernel build compiler]
+pahole       : v1.31 (dwarves)
+clang/llvm/lld: 21.1.8  (libclang consumed by bindgen)
+
+## Prerequisite fix-ups this session
+- The guest kernel headers package shipped ZERO files under rust/. Staged the
+  full rust/ artifact set (428 files, 188 MB) from the host build tree
+  ~/kbuild/linux-7.0.0/rust/ into /usr/src/linux-headers-7.0.0/rust/ via rsync.
+- The guest had NO build toolchain; installed it via apt (see versions above).
+
+## Build command (NOTE: deviates from runbook — see corrections below)
+cd /tmp/oot
+# hello_rust_oot.rs : minimal module mirroring samples/rust/rust_minimal.rs
+echo 'obj-m += hello_rust_oot.o' > Kbuild
+make -C /lib/modules/$(uname -r)/build M=$PWD RUSTC=rustc-1.93 BINDGEN=bindgen modules
+
+  RUSTC [M] hello_rust_oot.o
+  MODPOST Module.symvers
+  CC [M]  hello_rust_oot.mod.o
+  CC [M]  .module-common.o
+  LD [M]  hello_rust_oot.ko
+  BTF [M] hello_rust_oot.ko   (skipped — headers package has no vmlinux; non-fatal)
+=> hello_rust_oot.ko  755328 bytes
+
+modinfo: license GPL, name hello_rust_oot, depends (none), retpoline Y
+
+## 100x insmod/rmmod load-loop
+RESULT: 100 insmod/rmmod cycles OK; refcount returned to 0 each cycle
+module unloaded cleanly (not in /proc/modules)
+init lines in dmesg: 100   exit lines in dmesg: 100
+
+sample dmesg:
+[ 2692.705304] hello_rust_oot: loading out-of-tree module taints kernel.
+[ 2692.707237] hello_rust_oot: hello_rust_oot: init
+[ 2692.747463] hello_rust_oot: hello_rust_oot: exit
+[ 2692.828513] hello_rust_oot: hello_rust_oot: init
+
+## kmemleak / lockdep / sanitizer scan (loop window)
+kmemleak: 2 scans triggered, unreferenced-object report = 0 lines (CLEAN)
+dmesg grep -iE 'kmemleak|lockdep|BUG:|WARNING|KASAN|UBSAN' = (none — CLEAN)
+
+## ACCEPTANCE: PASS
+100 insmod/rmmod cycles, refcount 0 each time, zero kmemleak/lockdep/BUG/WARN.
+
+## Runbook corrections required (docs/M0a_TO_M1_RUNBOOK.md Phase 7)
+The Phase 7 recipe as written does NOT work in this environment:
+1. `LLVM=1` is WRONG — the guest kernel is GCC-built (gcc 15.2.0). LLVM=1
+   forces clang for the C module-glue (.mod.o) and clang rejects GCC-only
+   flags (-mindirect-branch=thunk-extern, -mpreferred-stack-boundary=3, ...).
+   Correct: build with the default CC (gcc); drop LLVM=1.
+2. The `module!{...}` snippet is missing `authors:` and `description:` and a
+   trailing comma; the macro fails with "expected `,`". Use the field set from
+   samples/rust/rust_minimal.rs (type/name/authors/description/license, each
+   comma-terminated).
+3. `echo 0 | sudo tee /sys/kernel/debug/kmemleak` is not a valid kmemleak
+   command. Use `echo scan` to force a scan.
+4. Phase 7 has an unstated prerequisite: the guest needs the build toolchain
+   installed (rustc-1.93, bindgen, build-essential, dwarves) AND the rust/
+   subtree staged. Neither shipped on the guest.

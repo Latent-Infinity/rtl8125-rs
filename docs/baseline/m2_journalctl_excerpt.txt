@@ -1,0 +1,11 @@
+May 24 16:47:02 rtl8125-guest kernel: r8125_rust 0000:05:00.0: RTL8125 probe: vendor=REALTEK device=0x8125 rev=0x05
+May 24 16:47:02 rtl8125-guest kernel: r8125_rust 0000:05:00.0: RTL8125 chip identified: RTL8125B (MAC version Rtl8125B)
+May 24 16:47:02 rtl8125-guest kernel: r8125_rust 0000:05:00.0: RTL8125 reset OK
+May 24 16:47:02 rtl8125-guest kernel: r8125_rust 0000:05:00.0: RTL8125 probe: vendor=REALTEK device=0x8125 rev=0x05
+May 24 16:47:02 rtl8125-guest kernel: r8125_rust 0000:05:00.0: RTL8125 chip identified: RTL8125B (MAC version Rtl8125B)
+...
+May 24 16:49:07 rtl8125-guest kernel: r8125_rust 0000:05:00.0: RTL8125 chip identified: RTL8125B (MAC version Rtl8125B)
+May 24 16:49:07 rtl8125-guest kernel: r8125_rust 0000:05:00.0: RTL8125 reset OK
+May 24 16:49:07 rtl8125-guest kernel: r8125_rust 0000:05:00.0: RTL8125 probe: vendor=REALTEK device=0x8125 rev=0x05
+May 24 16:49:07 rtl8125-guest kernel: r8125_rust 0000:05:00.0: RTL8125 chip identified: RTL8125B (MAC version Rtl8125B)
+May 24 16:49:07 rtl8125-guest kernel: r8125_rust 0000:05:00.0: RTL8125 reset OK

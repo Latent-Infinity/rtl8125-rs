@@ -1,7 +1,10 @@
 # `cshim/` — the C↔Rust netdev bridge
 
-**Status: M0. No code here yet.** This directory is created so its rationale and
-migration plan are committed before any code is written (plan §5.3).
+**Status: M4.** The bridge rationale and migration plan live here. The actual
+kbuild-visible implementation lives in `../src/netdev_bridge.c` and the
+canonical ownership contract lives in `../src/netdev_bridge.h`, because the
+kernel composite-module pattern requires C and Rust objects in the same `M=`
+directory.
 
 ## Why a C shim exists at all
 
@@ -18,8 +21,8 @@ target. So:
 
 ## Scope freeze (plan §16 Q3)
 
-- `netdev_bridge.c` — **hard cap 400 LOC**, reviewed line-by-line.
-- `netdev_bridge.h` — the **canonical `sk_buff` ownership contract** (plan §6.3).
+- `../src/netdev_bridge.c` — **hard cap 400 LOC**, reviewed line-by-line.
+- `../src/netdev_bridge.h` — the **canonical `sk_buff` ownership contract** (plan §6.3).
   Every function carries explicit pre/post-conditions on skb ownership,
   including the TX flow-control invariants (`netif_tx_stop_queue` before the
   ring fills; `netif_tx_wake_queue` from completion; `NETDEV_TX_BUSY` is a
@@ -27,7 +30,7 @@ target. So:
 
 ## The contract is the deliverable, not the source
 
-`netdev_bridge.h` is the contract. Any change to it requires updating
+`../src/netdev_bridge.h` is the contract. Any change to it requires updating
 `../src/skb.rs` in the **same commit**. Reviewers reject patches that touch one
 without the other (plan §6.3).
 

@@ -1,0 +1,44 @@
+# pre-reboot guest state
+Tue May 19 07:29:17 PM UTC 2026
+
+Linux rtl8125-guest 7.0.0-15-generic #15-Ubuntu SMP PREEMPT_DYNAMIC Wed Apr 22 16:06:43 UTC 2026 x86_64 GNU/Linux
+
+## installed kernels
+ii  linux-headers-7.0.0                     7.0.0-2                                    amd64        Linux kernel headers for 7.0.0 on amd64
+ii  linux-headers-7.0.0-14                  7.0.0-14.14                                all          Header files related to Linux kernel version 7.0.0
+ii  linux-headers-7.0.0-14-generic          7.0.0-14.14                                amd64        Linux kernel headers for version 7.0.0
+ii  linux-headers-7.0.0-15                  7.0.0-15.15                                all          Header files related to Linux kernel version 7.0.0
+ii  linux-headers-7.0.0-15-generic          7.0.0-15.15                                amd64        Linux kernel headers for version 7.0.0
+ii  linux-headers-generic                   7.0.0-15.15                                amd64        Generic Linux kernel headers
+ii  linux-image-7.0.0                       7.0.0-2                                    amd64        Linux kernel, version 7.0.0
+ii  linux-image-7.0.0-15-generic            7.0.0-15.15                                amd64        Signed kernel image generic
+ii  linux-image-generic                     7.0.0-15.15                                amd64        Generic Linux kernel image
+ii  linux-image-unsigned-7.0.0-14-generic   7.0.0-14.14                                amd64        Linux kernel image for version 7.0.0
+ii  linux-libc-dev:amd64                    7.0.0-2                                    amd64        Linux support headers for userspace development
+
+## grub default
+GRUB_DEFAULT="Advanced options for Ubuntu>Ubuntu, with Linux 7.0.0"
+
+## custom kernel config excerpt
+CONFIG_RUST=y
+CONFIG_DMA_API_DEBUG=y
+CONFIG_DEBUG_KMEMLEAK=y
+CONFIG_KASAN=y
+CONFIG_KASAN_GENERIC=y
+CONFIG_PROVE_LOCKING=y
+CONFIG_DEBUG_LOCK_ALLOC=y
+
+## rtl8125 visible in guest
+05:00.0 Ethernet controller [0200]: Realtek Semiconductor Co., Ltd. RTL8125 2.5GbE Controller [10ec:8125] (rev 05)
+	Subsystem: Realtek Semiconductor Co., Ltd. Device [10ec:0123]
+	Physical Slot: 0-5
+	Control: I/O+ Mem+ BusMaster+ SpecCycle- MemWINV- VGASnoop- ParErr- Stepping- SERR- FastB2B- DisINTx+
+	Status: Cap+ 66MHz- UDF- FastB2B- ParErr- DEVSEL=fast >TAbort- <TAbort- <MAbort- >SERR- <PERR- INTx-
+	Latency: 0, Cache Line Size: 64 bytes
+	Interrupt: pin A routed to IRQ 21
+	Region 0: I/O ports at 6000 [size=256]
+	Region 2: Memory at 81200000 (64-bit, non-prefetchable) [size=64K]
+	Region 4: Memory at 81210000 (64-bit, non-prefetchable) [size=16K]
+	Capabilities: <access denied>
+	Kernel driver in use: r8169
+	Kernel modules: r8169

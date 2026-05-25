@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# capture_m0_baseline.sh — NON-DESTRUCTIVE M0 fact discovery (plan §7 M0, §15).
+# capture_m0_baseline.sh — NON-DESTRUCTIVE M0a fact discovery (plan §7 M0a, §15).
 #
-# Captures everything in plan §7 M0 that does NOT disturb the live NIC or the
+# Captures everything in plan §7 M0a that does NOT disturb the live NIC or the
 # system: hardware inventory, lspci, ethtool (read-only), IOMMU groups, kernel
 # config, vermagic, Module.symvers hash, Secure Boot state, the kernel-build
 # Rust-toolchain feasibility check, and a trivial OOT Rust module BUILD attempt
 # (build only — never insmod; that is a later, operator-driven step).
 #
 # It does NOT: unbind r8169, bind vfio-pci, run iperf3, change link state, or
-# install packages. Those are the destructive M0 steps (plan §15) and are out
-# of scope for this script.
+# install packages. Those are the destructive M0a operator steps (VFIO bind,
+# serial-panic test) and the M0b physical-link baseline (topology, peer,
+# iperf3) — out of scope for this script. Per the v3.3/v3.4 split: M0a gates
+# M1; M0b gates M4.
 #
 # Root is optional. Without it, root-only facts (dmidecode, full lspci -vv,
 # restricted dmesg) are marked SKIPPED-NEEDS-ROOT; re-run with `sudo` to fill.
@@ -32,7 +34,7 @@ cap(){ # cap <file> <command...>
   echo "  -> $f"
 }
 
-echo "M0 baseline capture @ $TS  (root=$ROOT)"
+echo "M0a baseline capture @ $TS  (root=$ROOT)"
 echo "RTL8125 PCI=$PCI iface=$IFACE KDIR=$KDIR"
 
 # --- 1. Hardware inventory (plan §15 first checkbox) -------------------------
@@ -171,27 +173,40 @@ echo 'obj-m += hello_rust_oot.o' > "$TMPD/Kbuild"
   echo "KDIR/rust -> ${RUSTLNK:-<dangling/absent>}"
   if [[ -z "$RUSTLNK" || ! -d "$RUSTLNK" ]]; then
     echo "RESULT: BLOCKED — kernel Rust metadata tree absent (linux-lib-rust-$(uname -r) NOT installed)."
-    echo "        This is the plan §13/§16 High risk. MITIGATION (operator, system change):"
-    echo "          sudo apt-get install linux-lib-rust-$(uname -r)"
+    echo "        Plan §13/§16 risk — Medium in v3.4 (apt-installable; NOT a self-built-kernel"
+    echo "        trigger; validation finding 1). MITIGATION = install the distro kernel-rust SET"
+    echo "        (operator, system change):"
+    echo "          sudo apt-get install linux-lib-rust-$(uname -r) \\"
+    echo "               <kernel-pinned rustc 1.93.1> rust-src bindgen dwarves"
     echo "        then re-run this script. NOT auto-installed by this script."
   else
     echo "kernel Rust metadata present; attempting build..."
   fi
   echo
-  echo "## make -C $KDIR M=$TMPD (build only):"
-  make -C "$KDIR" M="$TMPD" LLVM=1 modules 2>&1 | tail -30
-  echo "exit=${PIPESTATUS:-?}"
+  MOD_ARGS=()
+  if grep -q '^CONFIG_CC_IS_CLANG=y' "$CFG" 2>/dev/null; then
+    MOD_ARGS+=(LLVM=1)
+  fi
+  have rustc-1.93 && MOD_ARGS+=(RUSTC=rustc-1.93)
+  have bindgen && MOD_ARGS+=(BINDGEN=bindgen)
+  echo "## make -C $KDIR M=$TMPD ${MOD_ARGS[*]} modules (build only):"
+  BUILD_LOG="$TMPD/build.log"
+  make -C "$KDIR" M="$TMPD" "${MOD_ARGS[@]}" modules >"$BUILD_LOG" 2>&1
+  BUILD_RC=$?
+  tail -40 "$BUILD_LOG"
+  echo "exit=$BUILD_RC"
   [[ -f "$TMPD/hello_rust_oot.ko" ]] && echo "RESULT: .ko BUILT OK (load step deferred to operator with root)" \
-                                     || echo "RESULT: build did NOT produce .ko (see above; expected if metadata pkg missing)"
+                                     || echo "RESULT: build did NOT produce .ko (see compiler/toolchain error above)"
 } > "$OUT/oot_rust_buildtest.txt"; echo "  -> $OUT/oot_rust_buildtest.txt"
 rm -rf "$TMPD"
 
-# --- 9. Physical topology template (operator must complete; plan §15) -------
-sec "9. Physical topology template (operator fills)"
+# --- 9. Physical topology template (M0b; operator must complete) -----------
+sec "9. Physical topology template (M0b — operator fills; gates M4 not M1)"
 if [[ ! -s "$OUT/TOPOLOGY.md" ]]; then
 cat > "$OUT/TOPOLOGY.md" <<'EOF'
-# RTL8125 physical test topology (plan §7 M0 / §15 — OPERATOR MUST COMPLETE)
+# RTL8125 physical test topology (plan §7 M0b — OPERATOR MUST COMPLETE)
 
+M0b, required before M4 (first packet-moving milestone) — NOT an M1 gate.
 Not auto-detectable. Without this, link-stability and ASPM results (plan §3.3,
 M5) are not reproducible. Fill every field:
 

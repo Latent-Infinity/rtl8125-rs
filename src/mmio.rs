@@ -1,0 +1,156 @@
+// SPDX-License-Identifier: GPL-2.0
+//! Typed MMIO register accessors — the only module outside `unsafe_boundary`
+//! that touches BAR memory (plan §6.1, §6.2, §7 M2 gate). All other modules
+//! pass around `&Regs` and call its typed methods rather than reaching into
+//! the `pci::Bar` themselves.
+//!
+//! At M2 the typed surface is intentionally small: `tx_config()` for the
+//! revision-detect path and `chip_cmd()` / `set_chip_cmd()` for the reset
+//! path. M3+ will add register groups (descriptors, MAC address, IRQ status,
+//! …) here as new typed accessors.
+//!
+//! All accesses go through the kernel's safe `pci::Bar` wrappers
+//! (`read8`/`read32`/etc), so this module needs no `unsafe`.
+
+use kernel::io::Io;
+use kernel::pci;
+
+use crate::regs;
+
+/// Size of BAR2 on the RTL8125 (the MAC-register window). Authoritative for
+/// the BAR type generic the driver carries around; pinned here so a future
+/// resize requires touching only this constant.
+pub(crate) const R8125_MMIO_LEN: usize = 0x1_0000;
+
+/// Lightweight view over the device's mapped MMIO BAR. `&Regs` is what the
+/// rest of the crate consumes — `pci.rs` / `hw.rs` / `pm.rs` never see the
+/// `pci::Bar` directly.
+pub(crate) struct Regs<'a> {
+    bar: &'a pci::Bar<{ R8125_MMIO_LEN }>,
+}
+
+impl<'a> Regs<'a> {
+    /// Wrap a borrow of the device's mapped BAR.
+    pub(crate) fn new(bar: &'a pci::Bar<{ R8125_MMIO_LEN }>) -> Self {
+        Self { bar }
+    }
+
+    /// Read `TxConfig` (offset 0x40, 32-bit). The XID extraction is done
+    /// in `hw.rs` so this stays a single hardware read with no semantics.
+    pub(crate) fn tx_config(&self) -> u32 {
+        self.bar.read32(regs::TX_CONFIG)
+    }
+
+    /// Read `ChipCmd` (offset 0x37, 1-byte).
+    pub(crate) fn chip_cmd(&self) -> u8 {
+        self.bar.read8(regs::CHIP_CMD)
+    }
+
+    /// Write `ChipCmd` (offset 0x37, 1-byte). M2 only ever writes
+    /// `regs::CMD_RESET` here; M3+ will read-modify-write to preserve TX/RX
+    /// enable bits during the packet path.
+    pub(crate) fn set_chip_cmd(&self, value: u8) {
+        self.bar.write8(value, regs::CHIP_CMD);
+    }
+
+    /// Read the MAC address from `IDR0..IDR5` (MMIO 0x00..0x05) as one
+    /// 32-bit and one 16-bit access. After M2's hardware reset the chip
+    /// repopulates these registers from on-chip storage; r8169 reads the
+    /// same offsets at probe time.
+    pub(crate) fn mac_address(&self) -> [u8; 6] {
+        let low = self.bar.read32(regs::MAC_ADDR_LOW);
+        let high = self.bar.read16(regs::MAC_ADDR_HIGH);
+        [
+            low as u8,
+            (low >> 8) as u8,
+            (low >> 16) as u8,
+            (low >> 24) as u8,
+            high as u8,
+            (high >> 8) as u8,
+        ]
+    }
+
+    // ── M4 hot-path accessors ─────────────────────────────────────────────
+
+    /// Program the TX ring base address (TNPDS — low 32 bits then high 32).
+    pub(crate) fn set_tx_ring_base(&self, addr: u64) {
+        self.bar.write32(addr as u32, regs::TNPDS_LOW);
+        self.bar.write32((addr >> 32) as u32, regs::TNPDS_HIGH);
+    }
+
+    /// Program the RX ring base address (RDSAR — low 32 bits then high 32).
+    pub(crate) fn set_rx_ring_base(&self, addr: u64) {
+        self.bar.write32(addr as u32, regs::RDSAR_LOW);
+        self.bar.write32((addr >> 32) as u32, regs::RDSAR_HIGH);
+    }
+
+    /// Set the maximum RX frame size the chip accepts.
+    pub(crate) fn set_rx_max_size(&self, sz: u16) {
+        self.bar.write16(sz, regs::RX_MAX_SIZE);
+    }
+
+    /// Write the Receive Configuration Register.
+    pub(crate) fn set_rcr(&self, value: u32) {
+        self.bar.write32(value, regs::RCR);
+    }
+
+    /// Write CPlusCmd.
+    pub(crate) fn set_cpluscmd(&self, value: u16) {
+        self.bar.write16(value, regs::CPLUSCMD);
+    }
+
+    /// Enable/disable IRQ sources via the Interrupt Mask Register.
+    /// **32-bit on 8125** (was 16-bit on 8169 — see `regs.rs` doc).
+    pub(crate) fn set_imr(&self, mask: u32) {
+        self.bar.write32(mask, regs::IMR);
+    }
+
+    /// Read the Interrupt Status Register (which sources fired). 32-bit.
+    pub(crate) fn isr(&self) -> u32 {
+        self.bar.read32(regs::ISR)
+    }
+
+    /// Read back IMR — diagnostic only; production code should not need it.
+    pub(crate) fn imr_readback(&self) -> u32 {
+        self.bar.read32(regs::IMR)
+    }
+
+    /// Clear the given ISR bits (W1C). 32-bit.
+    pub(crate) fn ack_isr(&self, bits: u32) {
+        self.bar.write32(bits, regs::ISR);
+    }
+
+    /// Kick the TX engine after posting one or more descriptors. On 8125
+    /// this is a 16-bit write to TxPoll_8125 (0x90) with `NPQ = BIT(0)`.
+    pub(crate) fn tx_poll(&self) {
+        self.bar.write16(regs::TPPOLL_NPQ, regs::TPPOLL);
+    }
+
+    /// Write `INT_CFG0_8125` (0x34, 8-bit). 0x00 disables interrupt-config
+    /// modes baseline.
+    pub(crate) fn set_int_cfg0(&self, value: u8) {
+        self.bar.write8(value, regs::INT_CFG0);
+    }
+
+    /// Write `INT_CFG1_8125` (0x7A, 16-bit). 0x0000 disables coalescing.
+    pub(crate) fn set_int_cfg1(&self, value: u16) {
+        self.bar.write16(value, regs::INT_CFG1);
+    }
+
+    /// Read `PHYStatus_8125` (MMIO 0x6C, 8-bit). Bit 1 = LinkSts. We use
+    /// it as a diagnostic; the kernel PHY framework is the authority.
+    pub(crate) fn phy_status(&self) -> u8 {
+        self.bar.read8(0x6C)
+    }
+
+    /// Zero the per-MAC_VER_63 interrupt-coalescing table:
+    /// `0xa00..0xa80` step 4 (32-bit writes). Mirrors r8169
+    /// `rtl_hw_start_8125` for VER_63 / VER_70.
+    pub(crate) fn zero_coalesce_table_8125b(&self) {
+        let mut off = regs::COALESCE_TABLE_8125B_START;
+        while off < regs::COALESCE_TABLE_8125B_END {
+            self.bar.write32(0u32, off);
+            off += 4;
+        }
+    }
+}

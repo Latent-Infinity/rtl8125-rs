@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-2.0
+# Composite Kbuild for r8125_rust.ko (Rust + C-shim OOT module).
+#
+# Crate root: r8125_rust.rs (Rust). C bridge: netdev_bridge.c (per plan §5.2
+# / §6.3, providing net_device / NAPI / sk_buff glue that has no stable
+# kernel-Rust API yet). Both objects link into a single r8125_rust.ko.
+#
+# Pattern mirrors samples/rust/rust_print (rust_print_main.rs +
+# rust_print_events.c → rust_print.ko). C and Rust components live in the
+# same M= directory because kbuild's composite-object syntax requires it.
+obj-m += r8125_rust.o
+
+# Note: the Rust crate root is r8125_rust_main.rs, NOT r8125_rust.rs.
+# Naming the composite (r8125_rust.o) the same as the Rust component
+# triggers a kbuild circular-dep warning and silently drops the Rust .o
+# from the final link. Same trick samples/rust/rust_print uses.
+r8125_rust-y := r8125_rust_main.o netdev_bridge.o

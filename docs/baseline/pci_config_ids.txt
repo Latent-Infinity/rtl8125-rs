@@ -1,5 +1,5 @@
 # bash -c cd /sys/bus/pci/devices/0000:03:00.0 && for f in vendor device subsystem_vendor subsystem_device revision class; do printf '%-18s %s\n' "$f" "$(cat $f 2>/dev/null)"; done 
-# captured 2026-05-18T04:50:08Z
+# captured 2026-05-22T17:41:24Z
 
 vendor             0x10ec
 device             0x8125

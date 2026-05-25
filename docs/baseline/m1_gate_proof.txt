@@ -1,0 +1,90 @@
+# M1 gate proof — 1000× insmod/rmmod, clean
+# Captured 2026-05-23 in rtl8125-guest (custom debug+Rust kernel 7.0.0 #2).
+# Satisfies plan §7 M1 acceptance criterion.
+
+## What this proves
+
+The Rust PCI skeleton `r8125_rust` (this repo's M1 deliverable) **passes the
+M1 entry gate**: 1,000 consecutive `insmod`/`rmmod` cycles against the
+passed-through RTL8125 at `0000:05:00.0`, with:
+
+- module loading + probe + binding the device + clean teardown each cycle,
+- module refcount returning to 0 (implicit in 1000/1000 `rmmod` successes),
+- zero `kmemleak` unreferenced-object reports across **ten** scans during the
+  loop (every 100 cycles) plus a final scan,
+- zero `lockdep` / `BUG:` / `WARNING` / `KASAN` / `UBSAN` reports anywhere
+  in the loop window.
+
+## Test rig
+
+- guest        : `rtl8125-guest` @ 192.168.122.174, kernel `7.0.0 #2 SMP
+                 PREEMPT_DYNAMIC` (CONFIG_RUST=y, KASAN=y, DEBUG_KMEMLEAK=y,
+                 PROVE_LOCKING=y, DMA_API_DEBUG=y)
+- target       : RTL8125B at guest PCI `0000:05:00.0` (rev 0x05), passed
+                 through via VFIO from host `0000:03:00.0`
+- module       : `r8125_rust.ko`, 978 648 bytes, built with rustc 1.93.1
+- driver_override : `r8125_rust` set on `0000:05:00.0` so only this driver
+                    can bind during the test
+- pre-condition : `r8169` unbound from the device before the loop
+
+## Loop body (per cycle, in order)
+
+  insmod r8125_rust.ko
+  test /proc/modules contains 'r8125_rust'
+  test /sys/bus/pci/devices/0000:05:00.0/driver -> r8125_rust    (probe ran)
+  rmmod r8125_rust
+  test ! -e /sys/module/r8125_rust                                (unloaded clean)
+
+  every 100th cycle:
+    echo scan > /sys/kernel/debug/kmemleak;  wait;
+    record line-count of /sys/kernel/debug/kmemleak (== 0 means clean)
+
+Driver script: `tools/m1_gate.sh` (staged on the guest at `/tmp/m1_gate.sh`).
+
+## Results
+
+  baseline kmemleak lines : 0
+  @cycle  100  elapsed= 12s  kmemleak_lines=0
+  @cycle  200  elapsed= 26s  kmemleak_lines=0
+  @cycle  300  elapsed= 38s  kmemleak_lines=0
+  @cycle  400  elapsed= 50s  kmemleak_lines=0
+  @cycle  500  elapsed= 62s  kmemleak_lines=0
+  @cycle  600  elapsed= 74s  kmemleak_lines=0
+  @cycle  700  elapsed= 86s  kmemleak_lines=0
+  @cycle  800  elapsed= 98s  kmemleak_lines=0
+  @cycle  900  elapsed=110s  kmemleak_lines=0
+  @cycle 1000  elapsed=123s  kmemleak_lines=0
+  final kmemleak lines    : 0
+  loop result             : cycles=1000  fail=0  elapsed=123s
+
+  dmesg probe lines       : 1000 / 1000     (every cycle's probe ran)
+  WARN/BUG/oops/KASAN     : 0               (post-loop dmesg grep)
+
+Mean cycle time: 123 ms; nothing leaked across 1000 ioremap / pci_request_region /
+pci_release_region / iounmap rounds; lockdep clean across 1000 probe/unbind
+state transitions.
+
+## Sample probe line from dmesg
+
+  r8125_rust 0000:05:00.0: RTL8125 probe: vendor=REALTEK device=0x8125 rev=0x05 (M1 skeleton)
+
+Vendor / device / revision read via `kernel::pci::Device::{vendor_id,
+device_id, revision_id}` — these are the "validate §5.1 claims about
+`kernel::pci`" data points the plan §7 M1 calls for.
+
+## Files in this evidence set
+
+  docs/baseline/m1_gate_proof.txt        — this summary
+  docs/baseline/m1_gate_log.txt          — raw run log (kept verbatim)
+  docs/baseline/m1_kmemleak_final.txt    — final `/sys/kernel/debug/kmemleak`
+                                           dump (0 bytes = clean)
+
+## ACCEPTANCE: PASS
+
+Plan §7 M1 gate satisfied: `insmod`/`rmmod` cycle succeeds 1,000 times in
+the guest with zero dmesg warnings, zero lockdep complaints, zero kmemleak
+reports, and module refcount returning cleanly to zero each iteration. The
+selected `kernel::pci` / `kernel::io::mem` / `kernel::devres` APIs are
+confirmed to exist and behave as expected in this kernel tree.
+
+M2 (register and reset layer) is unblocked.

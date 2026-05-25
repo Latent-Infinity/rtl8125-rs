@@ -1,0 +1,6 @@
+--- DMA-rings-allocated lines, first 2 and last 2 ---
+May 24 17:21:15 rtl8125-guest kernel: r8125_rust 0000:05:00.0: DMA rings allocated: TX dma=0x000000012dc54000 RX dma=0x000000018a90c000 (256 descriptors each, +1 tail canary)
+May 24 17:21:16 rtl8125-guest kernel: r8125_rust 0000:05:00.0: DMA rings allocated: TX dma=0x0000000116686000 RX dma=0x000000018837a000 (256 descriptors each, +1 tail canary)
+...
+May 24 17:23:21 rtl8125-guest kernel: r8125_rust 0000:05:00.0: DMA rings allocated: TX dma=0x000000011cffe000 RX dma=0x000000019c7fa000 (256 descriptors each, +1 tail canary)
+May 24 17:23:21 rtl8125-guest kernel: r8125_rust 0000:05:00.0: DMA rings allocated: TX dma=0x000000010e6ee000 RX dma=0x000000019cbc0000 (256 descriptors each, +1 tail canary)

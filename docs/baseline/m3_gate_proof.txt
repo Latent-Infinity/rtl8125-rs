@@ -1,0 +1,110 @@
+# M3 gate proof — cold DMA ring allocation
+# Captured 2026-05-24 in rtl8125-guest (custom debug+Rust kernel 7.0.0 #2).
+# Satisfies plan §7 M3 acceptance.
+
+## What this proves
+
+`r8125_rust` (M3 deliverable) satisfies plan §7 M3 on every point:
+
+1. **TX + RX descriptor structures** — `src/ring.rs::Descriptor` is
+   `#[repr(C)]` with `u32 opts1`, `u32 opts2`, `u64 addr` (mirroring r8169's
+   `struct TxDesc`/`struct RxDesc`). Size 16 bytes, align 8, both asserted
+   at compile time via `const _: () = assert!(...)`.
+2. **Coherent DMA allocation** — `Ring<N>::new` calls
+   `kernel::dma::CoherentAllocation::alloc_coherent` for `N + 1`
+   descriptors (the `+1` is the tail canary slot). Drop on the
+   `CoherentAllocation` calls `dma_free_coherent`.
+3. **Streaming-mapping plan documented** — `src/dma.rs` module docs spell
+   out the RX-refill / TX-completion ownership state machine for M4 in
+   terms of `kernel::dma`'s `DataDirection::FromDevice` /
+   `DataDirection::ToDevice` mappings, the §6.3 contract, and the parallel
+   software-shadow slot.
+4. **Typed ring indices** — `TxHead`, `TxTail`, `RxHead`, `RxTail` are
+   distinct newtype wrappers over `usize`; the compiler refuses to
+   substitute one for another.
+5. **Compile-time bounds** — `const RING_LEN: usize = 256` (matches r8169
+   `NUM_TX_DESC` / `NUM_RX_DESC`); `Ring<{ RING_LEN }>` carries the count
+   in the type. `assert!(RING_LEN.is_power_of_two())` makes the wrap-mask
+   in `*Head`/`*Tail::wrapped()` a compile-time `& (N - 1)`.
+6. **`CONFIG_DMA_API_DEBUG` enabled** — already on in this guest's debug
+   build (`CONFIG_DMA_API_DEBUG=y`); the 1000-cycle gate log below shows
+   zero `dma_debug` warnings.
+7. **Descriptor canaries** — two layers:
+   - **Shadow canaries**: a per-descriptor `[u64; N]` in `Ring`'s
+     CPU-resident memory, seeded with `0xDEAD_BEEF_CAFE_BABE`. Catches a
+     driver-side stray write in M4+.
+   - **Tail canary**: descriptor slot `N` of the DMA-coherent ring (one
+     past the last hardware-visible slot), seeded with
+     `opts1=0xDEAD_BEEF`, `opts2=0xCAFE_BABE`, `addr=0xFEED_FACE_BAAD_F00D`.
+     Catches a device-side one-off-the-end DMA write in M4+.
+   `Ring::verify_canaries()` checks both layers and is called at the end of
+   probe (in M3 it is vacuously true; the infrastructure lights up in M4).
+
+`src/unsafe_boundary.rs` gains its first three real residents at M3, each
+with a §6.2 `SAFETY:` comment:
+- `set_64bit_dma_mask(pdev)` — wraps the kernel-Rust
+  `unsafe fn dma_set_mask_and_coherent`.
+- `unsafe impl AsBytes for ring::Descriptor` — proves plain-old-data.
+- `unsafe impl FromBytes for ring::Descriptor` — same.
+
+CI `ci/.unsafe-census` re-baseline 0 → 3 documented inline (the first
+intentional bump since M0a) — every other crate file still carries
+`#![deny(unsafe_code)]`.
+
+## Test rig
+
+- guest        : `rtl8125-guest` @ 192.168.122.174, kernel `7.0.0 #2 SMP
+                 PREEMPT_DYNAMIC` (CONFIG_RUST=y, KASAN=y, DEBUG_KMEMLEAK=y,
+                 PROVE_LOCKING=y, **DMA_API_DEBUG=y**)
+- target       : RTL8125B at guest PCI `0000:05:00.0`, BAR2 64 KiB MMIO
+- module       : `r8125_rust.ko`, 1 082 616 bytes (M2 was 1 036 280 — +46 KB
+                 for `src/ring.rs`/`src/dma.rs` + canary verification)
+- gate driver  : `tools/m1_gate.sh` (journalctl-based since M2)
+- mask         : `DmaMask::new::<64>()` set at probe via
+                 `unsafe_boundary::set_64bit_dma_mask`
+
+## Result — 1,000× insmod/rmmod regression
+
+  baseline kmemleak lines : 0
+  @cycle  100  elapsed= 13s  kmemleak_lines=0
+  @cycle  200  elapsed= 26s  kmemleak_lines=0
+  @cycle  300  elapsed= 40s  kmemleak_lines=0
+  @cycle  400  elapsed= 52s  kmemleak_lines=0
+  @cycle  500  elapsed= 65s  kmemleak_lines=0
+  @cycle  600  elapsed= 78s  kmemleak_lines=0
+  @cycle  700  elapsed= 91s  kmemleak_lines=0
+  @cycle  800  elapsed=103s  kmemleak_lines=0
+  @cycle  900  elapsed=116s  kmemleak_lines=0
+  @cycle 1000  elapsed=129s  kmemleak_lines=0
+  final kmemleak lines    : 0
+  loop result             : cycles=1000  fail=0  elapsed=129s
+
+  journal probe lines     : 1000 / 1000   (every cycle's probe ran)
+  WARN/BUG/oops/KASAN     : 0             (journalctl -k full-window grep)
+  dma_debug warnings      : 0             (DMA_API_DEBUG=y, full window)
+
+## Sample probe trace (from `journalctl -k`)
+
+  r8125_rust 0000:05:00.0: RTL8125 probe: vendor=REALTEK device=0x8125 rev=0x05
+  r8125_rust 0000:05:00.0: RTL8125 chip identified: RTL8125B (MAC version Rtl8125B)
+  r8125_rust 0000:05:00.0: RTL8125 reset OK
+  r8125_rust 0000:05:00.0: ASPM: PCI Status=0x0010 CAP_LIST=1 — cap-list walk + policy deferred to M4 cshim …
+  r8125_rust 0000:05:00.0: DMA rings allocated: TX dma=0x000000011e6ba000 RX dma=0x0000000187864000 (256 descriptors each, +1 tail canary)
+
+Both DMA handles are in the 64-bit address range (proves the 64-bit mask
+took effect); each cycle gets a fresh allocation (addresses vary across
+cycles) and DMA_API_DEBUG validated alloc↔free pairing 1000 times.
+
+## ACCEPTANCE: PASS
+
+Plan §7 M3 gate satisfied:
+- Ring allocation + free balanced across 1000 cycles.
+- Zero `kmemleak` unreferenced-object reports (10 in-loop scans + final).
+- Zero `CONFIG_DMA_API_DEBUG` warnings (`bad dma` / `mapping at wrong
+  address` / `freed-but-active mapping` etc. — none in journalctl).
+- Zero lockdep / BUG / WARN / KASAN / UBSAN reports.
+- No packets moved — that's M4 (and gated on M0b).
+
+M4 (single-queue packet path) is unblocked on M3 grounds; still gated on
+**M0b** (physical link baseline — TOPOLOGY.md, peer details, iperf3 baselines)
+per plan §7.

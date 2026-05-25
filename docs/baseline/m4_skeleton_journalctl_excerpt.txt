@@ -1,0 +1,12 @@
+Warning: Permanently added '192.168.122.174' (ED25519) to the list of known hosts.
+--- first 2 + last 2 netdev-registered lines ---
+May 24 19:27:12 rtl8125-guest kernel: r8125_rust 0000:05:00.0: r8125_rust netdev registered (M4-skeleton; carrier stays off, TX queue stays stopped — peer-driven hot paths still to land)
+May 24 19:27:12 rtl8125-guest kernel: r8125_rust 0000:05:00.0: r8125_rust netdev registered (M4-skeleton; carrier stays off, TX queue stays stopped — peer-driven hot paths still to land)
+...
+May 24 19:30:06 rtl8125-guest kernel: r8125_rust 0000:05:00.0: r8125_rust netdev registered (M4-skeleton; carrier stays off, TX queue stays stopped — peer-driven hot paths still to land)
+May 24 19:30:06 rtl8125-guest kernel: r8125_rust 0000:05:00.0: r8125_rust netdev registered (M4-skeleton; carrier stays off, TX queue stays stopped — peer-driven hot paths still to land)
+
+--- count: probe + DMA-rings-allocated + netdev-registered ---
+  RTL8125 probe              1000 / 1000
+  DMA rings allocated        1000 / 1000
+  netdev registered          1000 / 1000

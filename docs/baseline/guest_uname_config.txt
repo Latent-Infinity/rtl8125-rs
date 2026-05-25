@@ -1,0 +1,33 @@
+# Captured 2026-05-21T04:54:02+00:00 from rtl8125-guest after non-secure-OVMF switch
+
+## uname -a
+Linux rtl8125-guest 7.0.0 #2 SMP PREEMPT_DYNAMIC Tue May 19 05:38:12 UTC 2026 x86_64 GNU/Linux
+
+## relevant /boot/config-$(uname -r) flags
+CONFIG_RUST=y
+CONFIG_DMA_API_DEBUG=y
+CONFIG_DEBUG_KMEMLEAK=y
+CONFIG_KASAN=y
+CONFIG_KASAN_GENERIC=y
+CONFIG_PROVE_LOCKING=y
+CONFIG_DEBUG_LOCK_ALLOC=y
+
+## /lib/modules/$(uname -r)/build
+lrwxrwxrwx 1 root root 28 May 19 05:22 /lib/modules/7.0.0/build -> /usr/src/linux-headers-7.0.0
+
+Makefile
+Module.symvers
+arch
+include
+scripts
+tools
+
+## rust subtree under build (expected for Phase 7 — currently MISSING)
+MISSING
+
+## installed custom-kernel debs
+ii  linux-headers-7.0.0                     7.0.0-2                                    amd64        Linux kernel headers for 7.0.0 on amd64
+ii  linux-headers-7.0.0-15                  7.0.0-15.15                                all          Header files related to Linux kernel version 7.0.0
+ii  linux-headers-7.0.0-15-generic          7.0.0-15.15                                amd64        Linux kernel headers for version 7.0.0
+ii  linux-image-7.0.0                       7.0.0-2                                    amd64        Linux kernel, version 7.0.0
+ii  linux-image-7.0.0-15-generic            7.0.0-15.15                                amd64        Signed kernel image generic

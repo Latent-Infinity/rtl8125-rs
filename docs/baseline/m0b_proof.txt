@@ -1,0 +1,68 @@
+# M0b proof — physical-link baseline complete
+# Captured 2026-05-25 on the validated MS-A2 (ms-a2-controller).
+# Satisfies plan §7 M0b acceptance; unblocks M4.
+
+## Topology — direct cable, no switch
+
+Host I226-V enp4s0 (0000:04:00.0) ↔ Cat6 ↔ RTL8125 (0000:03:00.0 → VFIO →
+guest 0000:05:00.0, r8169-bound enp5s0). Both NICs on the same MS-A2
+chassis; the host doubles as the iperf3 peer. L2 is private to the
+10.0.0.0/24 loop — host management stays on Wi-Fi `wlp6s0`, k3s uses
+that exclusively.
+
+## Plan §7 M0b deliverables
+
+| Deliverable | Status | Evidence |
+|---|---|---|
+| Physical topology documented (peer NIC/OS/driver/MTU, switch model/fw, negotiated link, EEE/802.3az/power-save) | ✅ | `TOPOLOGY.md` |
+| Peer device details (NIC model, kernel version, driver, MTU) | ✅ | `TOPOLOGY.md` (host I226-V / igc 7.0.0-15-generic / 10.0.0.1) |
+| Baseline iperf3 numbers under r8169 (TCP, UDP, 1500 + 9000 MTU) | ✅ | `iperf3/iperf3_r8169_*.json` (8 files) |
+| Baseline iperf3 numbers under out-of-tree r8125, if installed | n/a | r8125 OOT module not installed on host or guest |
+| Packet capture path on the peer verified | ✅ | `iperf3/m0b_peer_capture.pcap` (193 KB headers-only, 2000 TCP packets w/ 3WHS + TSO) |
+
+## L2 isolation (plan §8.1.6 / M1 board row 10)
+
+✅ The RTL8125 (enp5s0) is on a private direct-cable segment with the
+host I226-V (enp4s0). No other devices. Host mgmt is on Wi-Fi; k3s is
+on Wi-Fi. tcpdump on enp4s0 sees only 10.0.0.x traffic — none of the
+main-LAN multicast that earlier capture caught.
+
+## Link facts
+
+- Negotiated: 2500 Mb/s Full-Duplex, both ends.
+- Flow control: host I226-V RX/TX on (autoneg landed RX-only at the
+  last link-up event); guest RTL8125 RX/TX off (no pause-frame
+  negotiation on r8169 side).
+- EEE: I226-V disabled locally; RTL8125 enabled-but-inactive
+  (advertised but not active because the partner doesn't enable).
+- Jumbo (9000 MTU): works end-to-end after MTU set on both sides.
+  Verified by `ping -M do -s 8972`: 5/5, 0% loss after a brief
+  PHY-renegotiation settling period (~1–2 s post-mtu-change).
+
+## r8169 baseline summary
+
+| Test                              | Tx Gb/s | Rx Gb/s | Notes |
+|---|---:|---:|---|
+| TCP 1500 host→guest (RTL8125 RX)  |   2.348 |   2.326 | 0 retrans |
+| TCP 1500 guest→host (RTL8125 TX)  |   2.331 |   2.328 | 0 retrans |
+| TCP 9000 host→guest                |   2.475 |   2.473 | 0 retrans (TSO @ MSS 8960) |
+| TCP 9000 guest→host                |   2.377 |   2.374 | 0 retrans |
+| UDP 1500 host→guest                |   2.380 |   2.379 | 0 lost |
+| UDP 1500 guest→host                |   0.895 |   0.895 | guest-CPU-bound (KASAN + ~77K pps single-core syscall cap) |
+| UDP 9000 host→guest                |   2.290 |   2.157 | ~6 % RX-loss at guest under KASAN |
+| UDP 9000 guest→host                |   2.296 |   2.296 | 0 lost |
+
+TCP across the board hits 93–99 % of the 2.5G theoretical wire (after
+Eth/IP/TCP overhead) — that's the r8169 baseline target for r8125_rust
+to match.
+
+## ACCEPTANCE: PASS
+
+Plan §7 M0b gate satisfied:
+- TOPOLOGY.md fields all populated (no blanks).
+- Baseline iperf3 JSON committed for all 8 (TCP/UDP × 1500/9000 × both directions).
+- Peer-side packet capture procedure verified and reproducible.
+
+M1 board rows **7, 10, 11** flip to ✅. **M4 (single-queue packet path)
+is unblocked**: the cshim + skeleton from 2026-05-24 plus this peer +
+baseline are all the prerequisites in place.

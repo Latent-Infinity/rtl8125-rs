@@ -1,8 +1,8 @@
 # bash -c grep -E "MemTotal|MemAvailable" /proc/meminfo; free -h 
-# captured 2026-05-18T04:50:08Z
+# captured 2026-05-22T17:41:24Z
 
-MemTotal:       29936296 kB
-MemAvailable:   24553620 kB
+MemTotal:       29936904 kB
+MemAvailable:   27124936 kB
                total        used        free      shared  buff/cache   available
-Mem:            28Gi       5.1Gi        13Gi       830Mi        11Gi        23Gi
+Mem:            28Gi       2.7Gi        20Gi       4.2Mi       6.0Gi        25Gi
 Swap:          8.0Gi          0B       8.0Gi

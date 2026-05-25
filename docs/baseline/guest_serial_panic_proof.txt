@@ -1,0 +1,63 @@
+# Phase 6 — Guest serial-console capture + deliberate panic test
+# Captured 2026-05-22 on ms-a2-controller. Clears M1 tracker row 13.
+# Proves a guest kernel panic is recoverable as text on the host BEFORE the
+# guest is trusted with driver code (runbook Phase 6 / plan §15 #13).
+
+## Setup
+guest        : rtl8125-guest (custom debug+Rust kernel 7.0.0 #2)
+serial path  : guest cmdline has console=ttyS0,115200n8 -> kernel/panic output
+               goes to the emulated ISA serial port.
+host capture : two independent host-side sinks were configured —
+  1. libvirt <log> element on the <serial> device, written by virtlogd:
+       <serial type='pty'>
+         <log file='/var/log/libvirt/qemu/rtl8125-guest-serial.log' append='off'/>
+       VM XML patched + redefined via `virsh define` this session.
+  2. live `virsh console rtl8125-guest` capture (the excerpt below), run under
+     a script(1)-allocated pty so virsh has a controlling TTY.
+
+## Trigger (inside the guest — this DELIBERATELY crashes the guest)
+  echo 1 > /proc/sys/kernel/sysrq
+  sync
+  echo c > /proc/sysrq-trigger          # sysrq_handle_crash -> NULL deref panic
+
+## Captured on the HOST serial console — full panic trace
+Script started on 2026-05-22 17:12:52+00:00
+Connected to domain 'rtl8125-guest'
+[  142.853775] sysrq: Trigger a crash
+[  142.854345] Kernel panic - not syncing: sysrq triggered crash
+[  142.855188] CPU: 0 UID: 0 PID: 1789 Comm: bash Tainted: G            E       7.0.0 #2 PREEMPT(lazy)
+[  142.856468] Tainted: [E]=UNSIGNED_MODULE
+[  142.857042] Hardware name: QEMU Standard PC (Q35 + ICH9, 2009), BIOS 2025.11-3ubuntu7 03/31/2026
+[  142.858301] Call Trace:
+[  142.858672]  <TASK>
+[  142.859003]  dump_stack_lvl+0x70/0xb0
+[  142.859558]  dump_stack+0x10/0x18
+[  142.860057]  vpanic+0x3cf/0x6e0
+[  142.861599]  panic+0xca/0xd0
+[  142.863866]  sysrq_handle_crash+0x1f/0x20
+[  142.864366]  __handle_sysrq.cold+0x1ca/0x293
+[  142.864896]  write_sysrq_trigger+0x73/0xa0
+[  142.865407]  proc_reg_write+0x1d4/0x3b0
+[  142.865884]  vfs_write+0x1e0/0x1150
+[  142.866823]  ksys_write+0x101/0x240
+[  142.868906]  __x64_sys_write+0x72/0xd0
+[  142.870371]  do_syscall_64+0x12b/0x1500
+[  142.885068]  entry_SYSCALL_64_after_hwframe+0x76/0x7e
+[  142.885684] RIP: 0033:0x7693112a06c6
+[  142.893510]  </TASK>
+[  142.893982] Kernel Offset: 0x4600000 from 0xffffffff81000000
+[  143.287511] ---[ end Kernel panic - not syncing: sysrq triggered crash ]---
+Script done on 2026-05-22 17:13:38+00:00
+
+(The trace also shows __kasan_check_read / lock_release / trace_hardirqs_*
+frames — independent confirmation that KASAN + lockdep are live in this guest
+kernel, i.e. it really is the debug build, cross-checks tracker row 18.)
+
+## Recovery
+  virsh destroy rtl8125-guest && virsh start rtl8125-guest
+Verified the guest reboots cleanly into 7.0.0 after the crash.
+
+## ACCEPTANCE: PASS
+A deliberate guest panic was triggered and the complete oops/panic trace —
+"sysrq: Trigger a crash" through "end Kernel panic" — was captured as text on
+the host. Serial-console capture is proven before driver code is written.

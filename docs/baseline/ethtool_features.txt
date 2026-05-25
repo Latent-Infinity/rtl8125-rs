@@ -1,5 +1,5 @@
 # ethtool -k enp3s0 
-# captured 2026-05-18T04:50:08Z
+# captured 2026-05-22T17:41:24Z
 
 Features for enp3s0:
 rx-checksumming: on

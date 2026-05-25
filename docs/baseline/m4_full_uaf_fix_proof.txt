@@ -1,0 +1,75 @@
+M4-full UAF fix — proof of resolution (2026-05-25)
+====================================================
+
+Root cause
+----------
+Rust drops struct fields in DECLARATION order (top→bottom) per the Reference.
+`R8125Driver` previously listed `_netdev: NetdevHandle` LAST in its field
+declaration with an incorrect doc comment claiming "drop happens in reverse".
+Actual drop order was `pdev → _bar → tx_ring → rx_ring → _netdev`, so by
+the time `_netdev` dropped (which synchronously runs `ndo_stop` via
+`bridge_unregister_and_free` → `unregister_netdev` → kernel dev_close), the
+BAR mapping (via Devres) and both DMA descriptor allocations had already
+been freed. Rust's `rust_stop` then read `state.bar_ptr`, `state.tx_desc`,
+`state.rx_desc` against freed slab memory → KASAN slab-use-after-free at
+`rust_stop+0x80`.
+
+Fix
+---
+src/pci.rs — moved `_netdev` to FIRST in declaration order so it drops
+first while everything it references is still mapped. Rewrote the doc
+comment to spell out the actual Rust drop-order rule.
+
+Same pass also applied:
+- `src/netdev.rs` `CachePadded<T>` wrapper applied to NetdevState's
+  `tx_head / tx_tail / rx_tail` per RUST_STANDARDS.md §15.2 — eliminates
+  false-sharing between xmit (writes tx_head) and NAPI poll (writes
+  tx_tail + rx_tail).
+- `src/regs.rs` / `src/mmio.rs` corrected to 8125-family register
+  offsets: IMR=0x38 (32-bit), ISR=0x3C (32-bit), TxPoll=0x90 (16-bit
+  with NPQ=BIT(0)), added INT_CFG0=0x34, INT_CFG1=0x7A, and
+  zero-coalesce-table 0xA00..0xA80 for MAC_VER_63. (Older 8169 layout
+  was the 16-bit IMR/ISR at 0x3C/0x3E with TxPoll=0x38 — completely
+  wrong addresses on 8125.)
+
+Smoke + regression evidence
+---------------------------
+Single-cycle smoke (insmod → ip link set up → ping attempt → ip link
+set down → rmmod):
+  * insmod rc=0
+  * register_netdev OK, enp5s0 visible, MAC=38:05:25:36:a6:31
+  * ndo_open complete: IRQ=21 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x2f
+    PHYStatus=0x08
+  * 13 ndo_start_xmit calls (kernel ARPs/IPv6 NS)
+  * ndo_stop: xmit_calls=13 irq_fires=0 napi_polls=0
+  * rmmod OK, module-gone YES
+  * NO KASAN, NO BUG, NO use-after-free, NO new DMA-API debug entries
+
+100-cycle stress (M4_FULL_OPS active, insmod/up/down/rmmod each cycle):
+  * 100/100 cycles passed
+  * elapsed 45s (~0.45s/cycle)
+  * NO KASAN entries in window
+  * NO DMA-API warnings in window
+  * kmemleak scan after 100 cycles: 0 leaks
+  * /proc/interrupts entry for line 21 r8125_rust persists across cycles
+    cleanly (kernel routes legacy INTx to the same line each registration).
+
+Standards compliance (RUST_STANDARDS.md)
+----------------------------------------
+- §15.2 cache padding: applied to NetdevState atomics (CachePadded<T>).
+- §6 typed errors at FFI: ndo_open already returns kernel::Result<()>
+  internally; xmit returns NETDEV_TX_OK / NETDEV_TX_BUSY (kernel ABI
+  values). Further typed-enum work tracked as residual M5.
+- §17 hot paths: napi::poll, ndo_start_xmit, raw_irq_handler — all
+  borrow `&NetdevState`, no allocations on the hot path, no `dyn Trait`.
+- §18 mechanical enforcement: existing CI (ci/check_unsafe_allowlist.sh)
+  green; Clippy + cache-padding lint gates tracked under task 43.
+
+Outstanding gap (separate task)
+-------------------------------
+PHYStatus = 0x08 (`_100bps` set, `LinkStatus` bit 0x02 CLEAR) — the
+embedded PHY has not been initialised. Without PHY init the chip
+never establishes link, never generates an IRQ, so ping cannot
+succeed. PHY init scope (MAC OCP / MDIO bus / phy_device attach /
+phy_start) is tracked under task 46 ("M4-traffic"). The M4-full UAF
+work is complete and orthogonal to PHY init.

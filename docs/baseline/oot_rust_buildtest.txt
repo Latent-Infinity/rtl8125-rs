@@ -1,34 +1,38 @@
-# captured 2026-05-18T04:50:08Z
-KDIR/rust -> <dangling/absent>
-RESULT: BLOCKED — kernel Rust metadata tree absent (linux-lib-rust-7.0.0-15-generic NOT installed).
-        This is the plan §13/§16 High risk. MITIGATION (operator, system change):
-          sudo apt-get install linux-lib-rust-7.0.0-15-generic
-        then re-run this script. NOT auto-installed by this script.
+# captured 2026-05-22T17:41:24Z
+KDIR/rust -> /usr/src/linux-lib-rust-7.0.0-15-generic/rust
+kernel Rust metadata present; attempting build...
 
-## make -C /lib/modules/7.0.0-15-generic/build M=/tmp/tmp.R9T1IOkBBV (build only):
+## make -C /lib/modules/7.0.0-15-generic/build M=/tmp/tmp.ZBY03e8Ixa RUSTC=rustc-1.93 BINDGEN=bindgen modules (build only):
 make: Entering directory '/usr/src/linux-headers-7.0.0-15-generic'
-make[1]: Entering directory '/tmp/tmp.R9T1IOkBBV'
+make[1]: Entering directory '/tmp/tmp.ZBY03e8Ixa'
 warning: the compiler differs from the one used to build the kernel
   The kernel was built by: x86_64-linux-gnu-gcc (Ubuntu 15.2.0-16ubuntu1) 15.2.0
-  You are using:           
-warning: pahole version differs from the one used to build the kernel
-  The kernel was built with: 131
-  You are using:             0
+  You are using:           gcc (Ubuntu 15.2.0-16ubuntu1) 15.2.0
   RUSTC [M] hello_rust_oot.o
-error[E0463]: can't find crate for `core`
-  |
-  = note: the `target` target may not be installed
-  = help: consider downloading the target with `rustup target add target`
-  = help: consider building the standard library from source with `cargo build -Zbuild-std`
+warning: missing documentation for the crate
+  --> hello_rust_oot.rs:3:1
+   |
+ 3 | / use kernel::prelude::*;
+ 4 | | module! {
+ 5 | |     type: HelloRustOot,
+ 6 | |     name: "hello_rust_oot",
+...  |
+11 | |     fn init(_m: &'static ThisModule) -> Result<Self> { pr_info!("hello_rust_oot loaded\n"); Ok(HelloRustOot) }
+12 | | }
+   | |_^
+   |
+   = note: requested on the command line with `-W missing-docs`
 
-error: aborting due to 1 previous error
+warning: 1 warning emitted
 
-For more information about this error, try `rustc --explain E0463`.
-make[3]: *** [/usr/src/linux-headers-7.0.0-15-generic/scripts/Makefile.build:358: hello_rust_oot.o] Error 1
-make[2]: *** [/usr/src/linux-headers-7.0.0-15-generic/Makefile:2110: .] Error 2
-make[1]: *** [/usr/src/linux-headers-7.0.0-15-generic/Makefile:248: __sub-make] Error 2
-make[1]: Leaving directory '/tmp/tmp.R9T1IOkBBV'
-make: *** [Makefile:248: __sub-make] Error 2
+  MODPOST Module.symvers
+WARNING: modpost: missing MODULE_DESCRIPTION() in hello_rust_oot.o
+  CC [M]  hello_rust_oot.mod.o
+  CC [M]  .module-common.o
+  LD [M]  hello_rust_oot.ko
+  BTF [M] hello_rust_oot.ko
+Skipping BTF generation for hello_rust_oot.ko due to unavailability of vmlinux
+make[1]: Leaving directory '/tmp/tmp.ZBY03e8Ixa'
 make: Leaving directory '/usr/src/linux-headers-7.0.0-15-generic'
-exit=2
-RESULT: build did NOT produce .ko (see above; expected if metadata pkg missing)
+exit=0
+RESULT: .ko BUILT OK (load step deferred to operator with root)

@@ -1,9 +1,16 @@
 # RTL8125 Rust Driver Plan — Validation Report
 
 **Generated:** 2026-05-18 · **Host:** `ms-a2-controller` (the actual Minisforum MS-A2) ·
-**Plan validated:** `RTL8125_Rust_Driver_Implementation_Plan.md` v3.2 ·
-**Scope:** asset gathering + non-destructive M0 fact discovery. No NIC was
+**Plan validated:** `RTL8125_Rust_Driver_Implementation_Plan.md` v3.2/v3.3 ·
+**Recommendations applied in:** plan **v3.4** (owner-directed 2026-05-18 — see §5) ·
+**Scope:** asset gathering + non-destructive M0a fact discovery. No NIC was
 disturbed; no packages were installed; no driver code was written (M1 is gated).
+
+> **Status update (2026-05-18, post-review).** The six §5 recommended edits
+> below were **approved by the project owner and applied to the plan in v3.4**
+> (plan §17 changelog). This report is retained as the audit trail: it records
+> what was observed and *why* each v3.4 edit was made. The claim-by-claim
+> validation in §1 still stands against the (unchanged) architecture.
 
 This report maps every material claim, assumption, and risk in the plan to what
 was actually observed on the target hardware and against the fetched upstream
@@ -162,23 +169,29 @@ comments* (and ewaldc's *code*), not ewaldc's git log.
 
 ---
 
-## 5. Recommended plan edits (for the human owner)
+## 5. Recommended plan edits — ✅ ALL APPLIED in plan v3.4 (owner-directed 2026-05-18)
 
-1. **§13 + §16 Q5:** reword the Rust-metadata mitigation to "install
+The six edits below were approved by the project owner and applied to
+`RTL8125_Rust_Driver_Implementation_Plan.md` in v3.4 (see plan §17). They are
+kept here verbatim as the rationale/audit trail for each change.
+
+1. ✅ **§13 + §16 Q5:** reword the Rust-metadata mitigation to "install
    distro-provided `linux-lib-rust-<ver>` + pinned kernel `rustc`/`rust-src` +
    `bindgen`"; reserve "self-built kernel" for the debug-instrumentation reason.
-2. **§7 M0 / §15:** add explicit criterion — *"a debug+Rust guest kernel
+2. ✅ **§7 M0a / §15:** add explicit criterion — *"a debug+Rust guest kernel
    (`KASAN KCSAN DEBUG_LOCK_ALLOC PROVE_LOCKING DEBUG_KMEMLEAK DMA_API_DEBUG`
    + `CONFIG_RUST`) is built and boots in the guest"* — it is the true M1 gate.
-3. **§1.2 / §8.1:** record that on this unit host mgmt must be deliberately
+3. ✅ **§1.2 / §8.1:** record that on this unit host mgmt must be deliberately
    moved to the I226-V and the existing Kubernetes/L2 domain isolated from the
    RTL8125 test segment before any destructive M0 step.
-4. **§3.1 / §16 Q1:** fill in *RTL8125B, XID 0x641, rev 0x05, fw
+4. ✅ **§3.1 / §16 Q1:** fill in *RTL8125B, XID 0x641, rev 0x05, fw
    rtl8125b-2_0.0.2* as the resolved target revision.
-5. **§3.3:** repoint the "ASPM workaround database" reference from ewaldc's
-   changelog to Realtek-official's git history + `r8125_n.c` comments.
-6. **§8 addresses:** globally treat `07:00.0` as illustrative; canonical is
-   `0000:03:00.0` (already done in `tools/`).
+5. ✅ **§3.3:** repoint the "ASPM workaround database" reference from ewaldc's
+   changelog to Realtek-official's git history + `r8125_n.c` comments. (Also
+   propagated to `references/PROVENANCE.md` and `tools/fetch_references.sh`.)
+6. ✅ **§8 addresses:** globally treat `07:00.0` as illustrative; canonical is
+   `0000:03:00.0` (already done in `tools/`; now also stated in plan §8).
 
-None of these change the architecture. The layered Rust-core + audited C-shim
-design, the unsafe-boundary discipline, and the gated milestones all stand.
+None of these changed the architecture. The layered Rust-core + audited C-shim
+design, the unsafe-boundary discipline, and the gated milestones all stand. The
+remaining path to M1 is unchanged and is tracked in `docs/M1_ENTRY_CRITERIA.md`.

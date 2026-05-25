@@ -11,13 +11,21 @@ bad(){ printf '\033[1;31mFAIL\033[0m %s\n' "$*"; fail=1; }
 
 mapfile -t RS < <(find src -name '*.rs' 2>/dev/null)
 
-# 1. crate root carries #![deny(unsafe_code)]  (only enforced once lib.rs exists)
-if [[ -f src/lib.rs ]]; then
-  grep -qE '^\s*#!\[deny\(unsafe_code\)\]' src/lib.rs \
-    && ok "src/lib.rs has #![deny(unsafe_code)]" \
-    || bad "src/lib.rs missing #![deny(unsafe_code)] (plan §6.2)"
+# 1. crate root carries #![deny(unsafe_code)]  (plan §6.2).
+# Kernel-Rust build rule $(obj)/%.o: $(obj)/%.rs forces the crate-root filename
+# to match the obj-m target — see src/Kbuild — so on this project the crate
+# root is src/r8125_rust.rs, not src/lib.rs. We still tolerate src/lib.rs to
+# keep the rule semantically about "whatever file is the crate root."
+CRATE_ROOT=""
+for cand in src/r8125_rust_main.rs src/r8125_rust.rs src/lib.rs; do
+  [[ -f "$cand" ]] && CRATE_ROOT="$cand" && break
+done
+if [[ -n "$CRATE_ROOT" ]]; then
+  grep -qE '^\s*#!\[deny\(unsafe_code\)\]' "$CRATE_ROOT" \
+    && ok "$CRATE_ROOT has #![deny(unsafe_code)]" \
+    || bad "$CRATE_ROOT missing #![deny(unsafe_code)] (plan §6.2)"
 else
-  ok "no src/lib.rs yet (M0) — deny-check vacuous"
+  ok "no crate root in src/ yet (pre-M1) — deny-check vacuous"
 fi
 
 # 2. no file outside .unsafe-allowlist may #![allow(unsafe_code)]
@@ -46,10 +54,19 @@ for f in "${RS[@]:-}"; do
 done
 ok "raw-MMIO containment check ran"
 
-# 4. unsafe-block census: count may only DECREASE over time (plan §9.4)
+# 4. unsafe-block census: count may only DECREASE over time (plan §9.4).
+# Counts actual unsafe code constructs — `unsafe { ... }`, `unsafe fn`,
+# `unsafe impl`, `unsafe trait`, `unsafe extern` — not the bare word "unsafe"
+# in doc comments (which is fine and even encouraged for boundary docs).
 CENSUS="ci/.unsafe-census"
 cur=0
-for f in "${RS[@]:-}"; do [[ -z "$f" ]] && continue; c=$(grep -cE '\bunsafe\b' "$f" 2>/dev/null || echo 0); cur=$((cur+c)); done
+for f in "${RS[@]:-}"; do
+  [[ -z "$f" ]] && continue
+  c=$(grep -nE '\bunsafe[[:space:]]+(fn|impl|trait|extern)\b|\bunsafe[[:space:]]*\{' "$f" 2>/dev/null \
+      | grep -vE '^[0-9]+:[[:space:]]*(///?|//!|\*)' \
+      | wc -l)
+  cur=$((cur+${c:-0}))
+done
 if [[ -f "$CENSUS" ]]; then
   prev=$(cat "$CENSUS");
   if [[ "$cur" -gt "$prev" ]]; then

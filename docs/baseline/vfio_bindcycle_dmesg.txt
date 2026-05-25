@@ -1,0 +1,39 @@
+# Phase 4 — Host VFIO 100x bind-cycle (RTL8125 r8169 <-> vfio-pci)
+# Captured 2026-05-22 on ms-a2-controller (host kernel 7.0.0-15-generic).
+# Runbook Phase 4; satisfies the M0a "100x bind-cycle" deliverable (plan §15).
+
+## Environment
+host         : ms-a2-controller, Ubuntu 26.04, kernel 7.0.0-15-generic (stock)
+device       : RTL8125B  0000:03:00.0  (XID 0x641, rev 0x05, IOMMU group 18)
+host mgmt    : Wi-Fi wlp6s0 — default route NOT via the RTL8125 (bind guard OK)
+VM state     : rtl8125-guest SHUT OFF for the duration (else libvirt owns the device)
+driver path  : tools/bind_vfio.sh / unbind_vfio.sh (per-device driver_override)
+loop driver  : tools/vfio_bindcycle.sh (committed this session)
+
+## Run
+command : for i in 1..100: bind_vfio.sh ; unbind_vfio.sh
+cycles  : 100
+elapsed : 33 s
+RESULT  : 100 bind/unbind cycles OK
+          bind   OK (-> vfio-pci): 100/100
+          unbind OK (-> r8169)   : 100/100
+
+## Kernel-log scan over the cycle window (journalctl -k)
+grep -iE 'WARNING|BUG:|Oops|call trace|kasan|lockdep|panic|use-after-free'
+RESULT: (none) — CLEAN. Zero new WARN/BUG/oops across all 100 cycles.
+
+Each cycle re-probed r8169 cleanly: device re-enumerated as RTL8125B, PHY
+driver re-attached, netdev renamed eth0 -> enp3s0. Representative lines:
+
+  r8169 0000:03:00.0 eth0: RTL8125B, 38:05:25:36:a6:31, XID 641, IRQ 68
+  r8169 0000:03:00.0 eth0: jumbo features [frames: 16362 bytes, tx checksumming: ko]
+  r8169 0000:03:00.0 enp3s0: renamed from eth0
+  Realtek Internal NBASE-T PHY r8169-0-300:00: attached PHY driver
+  r8169 0000:03:00.0 enp3s0: Link is Down
+  ... (x100) ...
+  r8169 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+
+## ACCEPTANCE: PASS
+100 bind/unbind cycles OK, zero new dmesg WARN/oops, device returns to r8169
+cleanly each cycle. Left bound to r8169 at end of run; libvirt re-binds it to
+vfio-pci (hostdev managed='yes') on the next guest start.

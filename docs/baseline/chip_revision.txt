@@ -1,9 +1,17 @@
-# captured 2026-05-18T04:50:08Z
+# captured 2026-05-22T17:41:24Z
 PCI revision (config space): 0x05
 
 ## r8169/RTL8125 MAC-version lines from kernel log (authoritative sub-revision):
-May 17 16:22:41 ms-a2-controller kernel: r8169 0000:03:00.0 eth0: RTL8125B, 38:05:25:36:a6:31, XID 641, IRQ 68
-May 17 16:22:41 ms-a2-controller kernel: r8169 0000:03:00.0 eth0: jumbo features [frames: 16362 bytes, tx checksumming: ko]
-May 17 16:22:41 ms-a2-controller kernel: r8169 0000:03:00.0 enp3s0: renamed from eth0
-May 17 16:22:41 ms-a2-controller kernel: Realtek Internal NBASE-T PHY r8169-0-300:00: attached PHY driver (mii_bus:phy_addr=r8169-0-300:00, irq=MAC)
-May 17 16:22:42 ms-a2-controller kernel: r8169 0000:03:00.0 enp3s0: Link is Down
+r8169 0000:03:00.0 eth0: RTL8125B, 38:05:25:36:a6:31, XID 641, IRQ 68
+r8169 0000:03:00.0 eth0: jumbo features [frames: 16362 bytes, tx checksumming: ko]
+r8169 0000:03:00.0 enp3s0: renamed from eth0
+Realtek Internal NBASE-T PHY r8169-0-300:00: attached PHY driver (mii_bus:phy_addr=r8169-0-300:00, irq=MAC)
+r8169 0000:03:00.0 enp3s0: Link is Down
+r8169 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+r8169 0000:03:00.0 enp3s0: Link is Down
+r8169 0000:03:00.0 eth0: RTL8125B, 38:05:25:36:a6:31, XID 641, IRQ 68
+r8169 0000:03:00.0 eth0: jumbo features [frames: 16362 bytes, tx checksumming: ko]
+r8169 0000:03:00.0 enp3s0: renamed from eth0
+Realtek Internal NBASE-T PHY r8169-0-300:00: attached PHY driver (mii_bus:phy_addr=r8169-0-300:00, irq=MAC)
+r8169 0000:03:00.0 enp3s0: Link is Down
+r8169 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx

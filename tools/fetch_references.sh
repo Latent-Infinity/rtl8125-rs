@@ -36,10 +36,12 @@ done
 # the commit we EXPECT it to resolve to (verified, warned on drift).
 #
 # DEPTH POLICY: the two r8125 references are cloned with FULL history on
-# purpose — plan §3.3 says "its long change-log of ASPM workarounds is
-# effectively a database of known-bad revision/platform combinations. Read it."
-# The changelog IS the deliverable, so `--depth 1` would discard it. They are
-# small (~1.5 MB each). All other refs are shallow.
+# purpose. Plan §3.3 (v3.4) makes Realtek-official's history (~99 commits) +
+# its `src/r8125_n.c` comments the effective ASPM/L1.x workaround database;
+# the ewaldc rewrite (only 3 commits) is kept for its code/approach to the
+# fragment-count / data-corruption fixes (plan §4). For both, history IS part
+# of the deliverable, so `--depth 1` would discard it. They are small
+# (~1.5 MB each). All other refs are shallow.
 #
 # LAUNCHPAD CAVEAT: git.launchpad.net does NOT honour `--filter=blob:none`
 # ("filtering not recognized by server, ignoring") and its annotated tags can
@@ -50,8 +52,8 @@ done
 REFS=(
 "linux-mainline|https://github.com/torvalds/linux.git|028ef9c96e96197026887c0f092424679298aae8|v7.0|drivers/net/ethernet/realtek drivers/net/phy rust samples/rust Documentation/networking Documentation/process Documentation/rust include/uapi/linux|Mainline v7.0: upstream r8169 (§12 baseline), Rust abstractions to validate §5.1, kernel AI/DCO policy (§9.2)"
 "rust-for-linux|https://github.com/Rust-for-Linux/linux.git|5d6919055dec134de3c40167a490f33c74c12581|rust-next|rust/kernel rust/kernel/net samples/rust drivers/net Documentation/rust|Rust-for-Linux rust-next: most-advanced netdev/sk_buff/NAPI/phylib abstractions for the §5.2 status check (MOVING branch — drift expected)"
-"realtek-r8125-official|https://github.com/awesometic/realtek-r8125-dkms.git|60c86586fbe22cea7ed660a629e2d1374cc26196|9.016.01-1||Realtek official OOT r8125 v9.016.01 (clean DKMS mirror): feature/perf reference (§12), register behavior reference (§13)"
-"ewaldc-r8125-rewrite|https://github.com/ewaldc/realtek-r8125-dkms.git|527bcbe5ed45c67b20abae73dccc683eb6f0dc2b|master||The ewaldc r8125 rewrite (plan §4, §3.3): changelog is a database of known-bad ASPM revision/platform combos and the hang/data-corruption fixes that motivate this project"
+"realtek-r8125-official|https://github.com/awesometic/realtek-r8125-dkms.git|60c86586fbe22cea7ed660a629e2d1374cc26196|9.016.01-1||Realtek official OOT r8125 v9.016.01 (clean DKMS mirror): feature/perf reference (§12), register behavior reference (§13), and the ASPM/L1.x workaround DATABASE — ~99 commits + r8125_n.c comments (plan §3.3 v3.4); full history kept on purpose"
+"ewaldc-r8125-rewrite|https://github.com/ewaldc/realtek-r8125-dkms.git|527bcbe5ed45c67b20abae73dccc683eb6f0dc2b|master||The ewaldc r8125 rewrite (plan §4, §3.3): kept for its CODE/APPROACH to the wrong-fragment-count / data-corruption fixes that motivate this project (README citation, §4). Only 3 commits — NOT the ASPM database (validation finding 4)"
 "ubuntu-kernel-7.0.0-15|https://git.launchpad.net/~ubuntu-kernel/ubuntu/+source/linux/+git/resolute|6ed57a7b3d0cdb198711521ba0c88a3ecbf7325e|Ubuntu-7.0.0-15.15|drivers/net/ethernet/realtek rust samples/rust Documentation/networking Documentation/process debian.master|EXACT source of the running kernel — authoritative for §5.1 API validation and the §15 OOT-Rust-metadata check"
 )
 
@@ -64,7 +66,14 @@ fetch_one() {
   local dest="$REF_DIR/$name"
 
   if [[ -d "$dest/.git" && $FORCE -eq 0 ]]; then
-    log "$name: already present (use --force to refresh) — skipping"
+    # Already present: still record it so the regenerated MANIFEST is COMPLETE
+    # even on a partial/idempotent run (no network needed for this path).
+    local cur; cur="$(git -C "$dest" rev-parse HEAD 2>/dev/null || echo unknown)"
+    log "$name: already present (use --force to refresh) — skipping (recorded $cur)"
+    if [[ "$cur" != "$pin" && "$cur" != "unknown" ]]; then
+      warn "$name: present tree at $cur differs from pin $pin (expected for rust-next; investigate for tags)"
+    fi
+    printf '%s\t%s\t%s\t%s\tpinned=%s\n' "$name" "$url" "$ref" "$cur" "$pin" >> "$MANIFEST.tmp"
     return 0
   fi
   rm -rf "$dest"; mkdir -p "$dest"
@@ -109,12 +118,13 @@ for line in "${REFS[@]}"; do
 done
 
 # --- Kernel Rust metadata package (NOT a git ref): download the .deb for
-#     offline reference. This is the package whose ABSENCE is the §13/§16 High
-#     risk; installing it (apt install linux-lib-rust-7.0.0-15-generic) is the
-#     mitigation. We download, we do NOT auto-install (system change).
+#     offline reference. Its ABSENCE is the §13/§16 risk (Medium in plan v3.4 —
+#     apt-installable; validation finding 1); installing the distro kernel-rust
+#     SET is the mitigation. We download, we do NOT auto-install (system change).
 if [[ ${#SELECT[@]} -eq 0 || " ${SELECT[*]} " == *" rust-metadata-pkg "* ]]; then
   PKG_DIR="$REF_DIR/rust-metadata-pkg"
-  if [[ ! -e "$PKG_DIR"/*.deb || $FORCE -eq 1 ]] 2>/dev/null; then
+  # nullglob-safe presence test: a literal "*.deb" must not count as present.
+  if ! ls "$PKG_DIR"/*.deb >/dev/null 2>&1 || [[ $FORCE -eq 1 ]]; then
     mkdir -p "$PKG_DIR"
     log "rust-metadata-pkg: downloading linux-lib-rust-7.0.0-15-generic .deb (reference only; not installed)"
     if (cd "$PKG_DIR" && apt-get download linux-lib-rust-7.0.0-15-generic >/dev/null 2>&1); then
@@ -124,7 +134,8 @@ if [[ ${#SELECT[@]} -eq 0 || " ${SELECT[*]} " == *" rust-metadata-pkg "* ]]; the
       warn "rust-metadata-pkg: apt-get download failed (offline?) — see docs/VALIDATION_REPORT.md for the apt install mitigation"
     fi
   else
-    log "rust-metadata-pkg: already present — skipping"
+    log "rust-metadata-pkg: already present — skipping (recorded)"
+    printf 'rust-metadata-pkg\tapt\tlinux-lib-rust-7.0.0-15-generic\t7.0.0-15.15\tNOT installed\n' >> "$MANIFEST.tmp"
   fi
 fi
 

@@ -1,8 +1,8 @@
 # AI-Assisted Rust Driver for the Realtek RTL8125 on the Minisforum MS-A2
 
-**Implementation Planning Document — v3.2**
+**Implementation Planning Document — v3.4**
 **Target: Ubuntu 26.04 LTS / Linux 7.0+ / Rust-for-Linux**
-**Status: Ready for M0a (pre-link fact discovery). M1 begins only when §15 entry criteria are met.**
+**Status: M0a (pre-link fact discovery) in progress on the validated MS-A2. M1 begins only when §15 entry criteria are met. M0b (physical-link baseline) is required before M4.**
 
 ---
 
@@ -55,6 +55,8 @@ The MS-A2 ships with **four heterogeneous NICs**, and this is the single most im
 
 The Intel I226-V (or one X710 port) carries all host traffic. The Realtek port is dedicated to the experimental driver via VFIO passthrough into the guest. A guest kernel panic never touches host connectivity.
 
+**Operator precondition on the validated MS-A2 (validation finding 3).** This redundancy is a *design intent*, not the current state of the box. As observed: the I226-V (`enp4s0`) is **down**, host connectivity is currently on **Wi-Fi (`wlp6s0`, MT7922)**, and the box also runs **Kubernetes** (flannel/cni/veth bridges on the host L2). Before any destructive M0b step, the operator MUST deliberately (a) pin host management onto the I226-V so SSH survives a guest panic, and (b) isolate the RTL8125 test segment from the existing Kubernetes/host L2 domain (see §8.1 step 6). Until both are done, the "SSH never drops" guarantee is not yet realized.
+
 ---
 
 ## 2. Validated Software Baseline
@@ -80,6 +82,8 @@ The RTL8125 is a single-lane PCIe 2.x controller integrating a 4-speed IEEE 802.
 ### 3.1 Revision Detection Is Mandatory
 
 The family includes RTL8125A, RTL8125B, RTL8125BG, RTL8125BGS, RTL8125BP — differing in EMI tuning, core voltage rails (e.g., 0.95 V), and minor register layouts. **The driver MUST read PCIe config space to determine the exact revision and dispatch through a per-revision register table.** Hard-coding a single register layout is the most common cause of immediate lockups in community drivers.
+
+**Resolved target on the validated MS-A2 (§16 Q1, evidence `docs/baseline/chip_revision.txt`):** the physical part is **RTL8125B, XID `0x641`, PCI config-space revision `0x05`, firmware `rtl8125b-2_0.0.2`**. This is the first entry the `hw.rs` per-revision dispatch table must support; revision detection logic must still refuse to bind to any revision not explicitly in the table (M2, **no silent fallback**).
 
 ### 3.2 Hardware Features the Driver Will Eventually Expose
 
@@ -121,7 +125,7 @@ The Rust driver **MUST**:
    - `aggressive` — opt-in for allowlisted revision/board combinations to use deeper states
 5. **Treat suspend/resume cycling as a tier-1 test gate** at M5, not a future enhancement.
 
-This is the area where the out-of-tree `r8125` rewrite is most valuable as a reference: its long change-log of ASPM workarounds is effectively a database of known-bad revision/platform combinations. Read it, don't copy it.
+This is the area where the out-of-tree `r8125` sources are most valuable as a reference. The effective database of known-bad revision/platform ASPM combinations is **Realtek's official `r8125` git history (~99 commits) plus the in-source comments in `src/r8125_n.c`** — not the `ewaldc` rewrite's changelog, which is only 3 commits (validation finding 4). Use Realtek-official's history and code comments as the workaround database; use the `ewaldc` rewrite for its *code and approach* to the fragment-count / data-corruption fixes (§4). Read both, copy neither (§9.3).
 
 ---
 
@@ -129,7 +133,7 @@ This is the area where the out-of-tree `r8125` rewrite is most valuable as a ref
 
 The motivation is not "Rust is fashionable" and not "C is bad." The motivation is specific:
 
-The community `r8125` derivatives (notably the well-known rewrite by developer `ewaldc`) are explicit in their commit history about the bugs they exist to fix: **"several hangs/crashes (wrong fragment count with lots of small packets) and occasional data corruption."** Translated, these are the classic memory-safety failure modes of complex DMA-ring lifecycle management in C:
+The community `r8125` derivatives (notably the well-known rewrite by developer `ewaldc`) are explicit in their project description about the bugs they exist to fix — the `ewaldc` `README.md` states verbatim: **"several hangs/crashes (wrong fragment count with lots of small packets) and occasional data corruption."** (Citation verified against the fetched source; validation report §1.) Translated, these are the classic memory-safety failure modes of complex DMA-ring lifecycle management in C:
 
 - Off-by-one errors in descriptor indexing
 - Use-after-free when an interrupt fires asynchronously with the cleanup path
@@ -346,7 +350,8 @@ This milestone is deliberately runnable with the RTL8125 RJ45 port unplugged. It
 - Exact chip revision (A / B / BG / BGS / BP) of the physical part
 - IOMMU group membership of the RTL8125 PCI function
 - **Kernel-build feasibility check** (pre-M1 blocker): `make LLVM=1 rustavailable` runs successfully against the selected kernel source tree, accepted versions recorded
-- **Trivial OOT Rust module check** (pre-M1 blocker): a "hello world" Rust kernel module (e.g., the Rust-for-Linux samples) builds and loads against the *exact* installed guest kernel and headers. If it does not, the Ubuntu kernel package lacks the Rust metadata required for OOT Rust modules, and the project switches the guest to a self-built kernel before M1.
+- **Trivial OOT Rust module check** (pre-M1 blocker): a "hello world" Rust kernel module builds and loads against the *exact* installed guest kernel and headers. If the build fails for missing Rust metadata / `bindgen` / pinned `rustc`, the recovery is to **install the distro-provided kernel-rust toolchain set** (`linux-lib-rust-<ver>` + kernel-pinned `rustc`+`rust-src` + `bindgen`) — *not* a self-built kernel (validation finding 1). A self-built kernel is required for the separate debug-instrumentation reason below, not for this one.
+- **Debug+Rust guest kernel built and boots** (pre-M1 blocker, validation finding 2 — *the true M1 gate*): a purpose-built **guest** kernel with `CONFIG_RUST` **and** `KASAN`+`KCSAN`+`DEBUG_LOCK_ALLOC`+`PROVE_LOCKING`+`DEBUG_KMEMLEAK`+`DMA_API_DEBUG` is built and boots in the VFIO guest. Stock Ubuntu generic has none of these debug configs, so the M1/M3/M5 gates cannot run without it. The host stays stock; only the guest kernel is custom, and it is the natural place to also pin the kernel Rust toolchain.
 - **Guest kernel configuration captured**: `CONFIG_RUST`, `CONFIG_MODVERSIONS`, `CONFIG_DMA_API_DEBUG` feasibility, `CONFIG_DEBUG_LOCK_ALLOC` (lockdep), `CONFIG_KASAN`, `CONFIG_KCSAN`, `CONFIG_DEBUG_KMEMLEAK`, Secure Boot state, `vermagic` string, `Module.symvers` hash
 - **Host VFIO bind-cycle automation**: 100 cycles of `r8169 → vfio-pci → r8169` using per-device `driver_override`, with the final driver verified by `lspci -k` and zero new `dmesg` warnings
 - **Guest VFIO visibility**: QEMU/libvirt guest boots with the RTL8125 passed through; guest `lspci -nnvv` sees the device and host-side serial-console capture is working
@@ -497,6 +502,8 @@ Enabled **one at a time**, each with the following gates applied per feature bef
 
 A faulty driver will panic the kernel. The point of VFIO is that the kernel that panics is the guest's, not the host's.
 
+> **Canonical address (validation finding 3).** On the validated MS-A2 the RTL8125 is **`0000:03:00.0`** (`[10ec:8125]` rev `0x05`, IOMMU group 18, isolated). Every `07:00.0` / `bus='0x07'` below is **illustrative of the procedure only**; the concrete commands in this section and in `tools/bind_vfio.sh` / `tools/unbind_vfio.sh` use the real `0000:03:00.0`. Re-derive the address on any other unit with step 3.
+
 ### 8.1 Host Preparation (One-Time)
 
 1. Enable AMD-V and AMD IOMMU in UEFI.
@@ -505,22 +512,22 @@ A faulty driver will panic the kernel. The point of VFIO is that the kernel that
    GRUB_CMDLINE_LINUX_DEFAULT="... amd_iommu=on iommu=pt"
    ```
    then `update-grub` and reboot.
-3. Confirm the RTL8125's PCI address: `lspci -nn | grep 8125` → record (e.g., `07:00.0`).
+3. Confirm the RTL8125's PCI address: `lspci -nn | grep 8125` → record it. On the validated MS-A2 this is `03:00.0` (`0000:03:00.0`).
 4. Confirm its IOMMU group is isolated:
    ```
-   for d in /sys/kernel/iommu_groups/*/devices/*; do echo "$d"; done | grep 07:00.0
+   for d in /sys/kernel/iommu_groups/*/devices/*; do echo "$d"; done | grep 03:00.0
    ```
    The group must contain **only** the RTL8125. If it contains other functions, passthrough is unsafe — see §13 risk register.
 5. Blacklist `r8169` from auto-binding to the target device, **without** blacklisting it globally (other Realtek devices on the box may still need it).
-6. **Physical / L2 isolation**: ensure the RTL8125 RJ45 is not plugged into the same management switch port domain as the host's I226-V or X710 ports. Even with VFIO containment, a misbehaving driver inside the guest can still generate L2 noise (broadcast storms, malformed frames, MAC flapping). Use a dedicated test-segment switch or a direct cable to a peer machine for the Realtek port.
+6. **Physical / L2 isolation**: ensure the RTL8125 RJ45 is not plugged into the same management switch port domain as the host's I226-V or X710 ports. Even with VFIO containment, a misbehaving driver inside the guest can still generate L2 noise (broadcast storms, malformed frames, MAC flapping). Use a dedicated test-segment switch or a direct cable to a peer machine for the Realtek port. **On the validated MS-A2 specifically (finding 3): the host runs Kubernetes with host-side L2 bridges (flannel/cni/veth); the RTL8125 test segment MUST be isolated from that domain, and host management MUST be moved off Wi-Fi onto the I226-V (§1.2), before any destructive M0b step.**
 
 ### 8.2 Per-Session Binding
 
 A script in `tools/bind_vfio.sh` performs:
 
-1. Unbind RTL8125 from `r8169` via `/sys/bus/pci/devices/0000:07:00.0/driver/unbind`
-2. **Prefer `driver_override`** over `new_id`: write `vfio-pci` to `/sys/bus/pci/devices/0000:07:00.0/driver_override`, then trigger a rebind. Using `new_id` matches by VID/DID and can affect **all** devices with the same Realtek VID/DID on the system; `driver_override` is per-device and safer.
-3. Trigger driver probe: `echo 0000:07:00.0 > /sys/bus/pci/drivers_probe`
+1. Unbind RTL8125 from `r8169` via `/sys/bus/pci/devices/0000:03:00.0/driver/unbind`
+2. **Prefer `driver_override`** over `new_id`: write `vfio-pci` to `/sys/bus/pci/devices/0000:03:00.0/driver_override`, then trigger a rebind. Using `new_id` matches by VID/DID and can affect **all** devices with the same Realtek VID/DID on the system; `driver_override` is per-device and safer.
+3. Trigger driver probe: `echo 0000:03:00.0 > /sys/bus/pci/drivers_probe`
 4. Verify with `lspci -k` — driver should report `vfio-pci`
 
 A matching `tools/unbind_vfio.sh` reverses the operation cleanly by clearing `driver_override` and rebinding to `r8169`.
@@ -534,7 +541,7 @@ QEMU/libvirt domain XML includes:
 ```xml
 <hostdev mode='subsystem' type='pci' managed='yes'>
   <source>
-    <address domain='0x0000' bus='0x07' slot='0x00' function='0x0'/>
+    <address domain='0x0000' bus='0x03' slot='0x00' function='0x0'/>
   </source>
 </hostdev>
 ```
@@ -551,7 +558,7 @@ The guest's serial console is captured to a host-side file so a panic is recover
 
 On guest panic:
 1. Read `/var/log/r8125-guest-serial.log` for the panic trace.
-2. Reset the PCI function: `echo 1 > /sys/bus/pci/devices/0000:07:00.0/reset` (if function-level reset is supported).
+2. Reset the PCI function: `echo 1 > /sys/bus/pci/devices/0000:03:00.0/reset` (if function-level reset is supported).
 3. If the device is wedged hard, a host reboot is the fallback — the I226-V keeps SSH alive throughout the diagnosis.
 
 ---
@@ -697,7 +704,8 @@ Metrics tracked per milestone:
 | Rust netdev/`sk_buff` abstractions never stabilize in a form compatible with our shim | High | C shim is documented and self-contained; migration is a refactor, not a rewrite |
 | **ASPM / L1 sub-state mishandling causes silent DMA loss or idle-time lockup** | **High** | **Conservative default at M2 (L1.x disabled for unvalidated revisions); suspend/resume + 24h idle soak as M5 gate; per-revision allowlist for aggressive policy; module parameter override for users** |
 | **`sk_buff` ownership leak or double-free at the FFI boundary** | **High** | **Typed wrapper with type-state transitions in `skb.rs`; panic-on-Drop in debug builds, `WARN_ON_ONCE` + queue quarantine in release; explicit allocation-accounting invariants asserted in CI; protocol fixed in `cshim/netdev_bridge.h` as the canonical contract** |
-| **Installed Ubuntu kernel headers lack Rust metadata needed for OOT Rust modules** | **High** | **M0a pre-M1 blocker: build and load a trivial OOT Rust kernel module against the exact installed guest kernel; if it fails, switch the guest to a self-built kernel** |
+| **Installed Ubuntu kernel lacks Rust metadata / `bindgen` / pinned kernel `rustc` for OOT Rust modules** | ~~High~~ → **Medium** (validation finding 1) | **Mis-scoped in v≤3.3 — it is not "distro doesn't ship it." The pieces are apt-installable on stock Ubuntu: `linux-lib-rust-7.0.0-15-generic` + the kernel-pinned `rustc 1.93.1` + `rust-src` + `bindgen` (+ `dwarves`/`pahole`). Default recovery is *install the distro-provided kernel-rust toolchain set*, not a self-built kernel. M0a verifies it by building **and** loading a trivial OOT Rust module against the exact guest kernel.** |
+| **No debug-instrumented kernel for the M1/M3/M5 gates** (validation finding 2) | **High (new)** | **Stock `7.0.0-15-generic` has none of `KASAN/KCSAN/DEBUG_LOCK_ALLOC/PROVE_LOCKING/DEBUG_KMEMLEAK/DMA_API_DEBUG`. The M1 lockdep/kmemleak, M3 `DMA_API_DEBUG`, and M5 `KASAN+KCSAN` gates *cannot run* on it. Mitigation: build one purpose-built debug+Rust **guest** kernel (host stays stock); this is the true M1 gate and an explicit §15 entry criterion. The self-built kernel exists for *this* reason, not for the Rust-metadata reason above.** |
 | **`NETDEV_TX_BUSY` used as a normal backpressure path instead of as an exceptional ring-full race** | **High** | **Queue stop/wake flow-control invariants in M5; `tx_busy_exception` counter must trend to zero under sustained traffic; tracepoint-logged for diagnosis** |
 | **Secure Boot blocks the unsigned out-of-tree module on user systems** | **High (distribution)** | **Provide MOK enrollment instructions or signed-package flow; refuse to load rather than fall back silently; lab builds may disable Secure Boot in the VFIO guest** |
 | Upstream rejects another RTL8125 driver as duplicate of `r8169` | High | Plan as out-of-tree first; build the case (safety, features, perf) before any submission |
@@ -741,6 +749,7 @@ This document's overall status is **ready for M0a (pre-link fact discovery)**. M
 - [ ] **`make LLVM=1 rustavailable` accepted against the selected kernel source tree**; accepted Rust, LLVM, `bindgen` versions recorded
 - [ ] **A trivial out-of-tree Rust kernel module builds and loads against the exact guest kernel** using the same KDIR, Rust metadata, LLVM, `bindgen`, `Module.symvers`, and `vermagic` that the RTL8125 module will use
 - [ ] `CONFIG_RUST`, `CONFIG_MODVERSIONS`, `CONFIG_DMA_API_DEBUG`, `CONFIG_DEBUG_LOCK_ALLOC`, `CONFIG_KASAN`, `CONFIG_KCSAN`, `CONFIG_DEBUG_KMEMLEAK` feasibility checked and recorded
+- [ ] **A debug+Rust guest kernel (`CONFIG_RUST` + `KASAN` + `KCSAN` + `DEBUG_LOCK_ALLOC` + `PROVE_LOCKING` + `DEBUG_KMEMLEAK` + `DMA_API_DEBUG`) is built and boots in the VFIO guest** — the true M1 gate (validation finding 2); stock Ubuntu generic cannot satisfy the M1/M3/M5 gates without it
 - [ ] Secure Boot state captured (enabled/disabled, MOK status)
 - [ ] Pre-link `r8169` facts captured for the unplugged target port (`ethtool -i`, `ethtool -k`, `ethtool --show-eee`, link state, and relevant `dmesg`)
 - [ ] VFIO passthrough procedure executed end-to-end against the RTL8125, with the guest seeing the device, **before any driver code is written**
@@ -762,11 +771,11 @@ M0b physical topology, peer details, L2 isolation, and `r8169`/`r8125` throughpu
 
 ## 16. Open Questions to Resolve Before M1
 
-1. **Exact RTL8125 revision** on the physical MS-A2 unit — drives the register dispatch table.
+1. **Exact RTL8125 revision** on the physical MS-A2 unit — drives the register dispatch table. **RESOLVED (validation finding 3, evidence `docs/baseline/chip_revision.txt`): RTL8125B, XID `0x641`, PCI rev `0x05`, firmware `rtl8125b-2_0.0.2`.** This is the first/only revision the `hw.rs` dispatch table must support at M2; unknown revisions are refused (no silent fallback).
 2. **IOMMU group composition** — does the group include only the RTL8125, or are other functions captive? If captive, the setup is marked test-only and the README documents it.
 3. **C-shim scope freeze** — what is the maximum LOC budget for `cshim/netdev_bridge.c`? Proposed: 400 LOC, hard-capped, reviewed line-by-line.
 4. **Tracepoint schema** — **all tracepoints are marked experimental/versioned until M6.** No external tooling should treat them as a stable ABI before that. Minimum event set: RX submit, RX complete, TX submit, TX complete, TX busy exception, IRQ entry, NAPI poll entry/exit, ASPM state change, suspend/resume entry/exit.
-5. **Out-of-tree distribution model** — DKMS is **not** viable as the default mechanism on Ubuntu LTS because Hardware Enablement (HWE) kernel updates can silently change the kernel's required `rustc` version (e.g., 1.93 → 1.95) under a user during a routine `apt upgrade`. The next boot rebuilds the module with the wrong toolchain and the network interface vanishes — exactly the failure mode that destroys user trust in out-of-tree drivers.
+5. **Out-of-tree distribution model** — DKMS is **not** viable as the default mechanism on Ubuntu LTS because Hardware Enablement (HWE) kernel updates can silently change the kernel's required `rustc` version (e.g., 1.93 → 1.95) under a user during a routine `apt upgrade`. The next boot rebuilds the module with the wrong toolchain and the network interface vanishes — exactly the failure mode that destroys user trust in out-of-tree drivers. *(Framing note, validation finding 1: this end-user distribution problem is distinct from the **developer-box** Rust-toolchain gap in §13, which is fixed by simply apt-installing the distro-provided kernel-rust set — `linux-lib-rust-<ver>` + pinned `rustc`/`rust-src` + `bindgen`. The toolchain-drift hazard below is about user systems at `apt upgrade` time, not the dev box.)*
    - **Primary: pre-built module package per exact kernel ABI tuple.** A small APT repository publishes one binary per tuple:
      ```
      (kernel release,
@@ -793,6 +802,7 @@ M0b physical topology, peer details, L2 isolation, and `r8169`/`r8125` throughpu
 
 ## 17. Changelog
 
+- **v3.4** — Applied the six owner-approved `docs/VALIDATION_REPORT.md` §5 edits from the 2026-05-18 non-destructive M0a validation pass on the actual MS-A2: (1) §13 + §16 Q5 — reworded the Rust-metadata risk from "distro lacks it → self-build kernel" to "apt-install the distro-provided kernel-rust toolchain set"; **downgraded High → Medium**; added a separate **new High** risk for the missing debug-instrumented kernel. (2) §7 M0a + §15 — added an explicit entry criterion: a **debug+Rust guest kernel** (`KASAN KCSAN DEBUG_LOCK_ALLOC PROVE_LOCKING DEBUG_KMEMLEAK DMA_API_DEBUG` + `CONFIG_RUST`) is built and boots; this is the true M1 gate. (3) §1.2 + §8.1 — recorded that on this unit host management is currently on Wi-Fi (not the I226-V) and the box runs Kubernetes; both must be deliberately corrected before destructive M0b. (4) §3.1 + §16 Q1 — filled in the resolved target: **RTL8125B, XID 0x641, rev 0x05, fw rtl8125b-2_0.0.2**. (5) §3.3 — repointed the "ASPM-workaround database" from the `ewaldc` changelog (3 commits) to **Realtek-official's git history (~99 commits) + `r8125_n.c` comments**. (6) §8 — canonicalized the device address to **`0000:03:00.0`** (the `07:00.0` examples are now explicitly illustrative). Also corrected the title version stamp, which had lagged at v3.2 while the body already carried the v3.3 M0a/M0b split, and tightened the §4 citation to name the `ewaldc` README. **No architectural change** — the layered Rust-core + audited C-shim design, the unsafe-boundary discipline, and the gated milestones all stand.
 - **v3.3** — Split M0 into M0a pre-link automation and M0b physical-link baseline. M0a is explicitly runnable with the RTL8125 RJ45 unplugged and adds automated host VFIO bind cycling, guest passthrough visibility, privileged trivial-module load/unload looping, serial-capture validation, and CI policy checks before any switch or peer is connected. M0b now owns physical topology, peer details, L2 isolation, peer packet-capture readiness, and `r8169`/`r8125` throughput baselines, and is required before M4 rather than before M1. Clarified that M1-M3 may run unplugged, while M4 is the first packet-moving milestone requiring a link partner. Removed duplicate "Only then does M1 begin."
 - **v3.2** — Addressed second-round review feedback. Softened §0 Rust API maturity claim from "production-grade" to "sufficient for a staged out-of-tree prototype, must be validated against the selected kernel tree." Switched lint discipline from `#![forbid(unsafe_code)]` to `#![deny(unsafe_code)]` (forbid cannot be overridden by allow). Made Kbuild/Makefile authoritative in §6.1; removed `Cargo.toml` and `rust-toolchain.toml` from the critical build path; replaced `cargo asm`/`cargo clippy` with kernel-build equivalents (`make CLIPPY=1`, `llvm-objdump`, `perf annotate`, `pahole`) throughout §10 and §11. Replaced rust-toolchain.toml pin language in §2 with `make LLVM=1 rustavailable` against the kernel tree. Added a pre-M1 blocker for OOT Rust kernel-metadata feasibility (M0 + §15). Reframed `NETDEV_TX_BUSY` in §6.3 as an exceptional ring-full race, with explicit queue-stop/wake flow-control invariants moved into M5; reconciled the §6.3 vs §6.4 RX-allocation contradiction (no descriptor/page allocation on the hot path; skb head via NAPI fast paths is the supported, counted exception). Renamed ASPM module-parameter values to unambiguous `kernel|conservative|force_off|aggressive`. Fixed PCIe 2.0 bandwidth claim (5.0 GT/s with 8b/10b ≈ 4 Gbps per direction); softened jumbo-frame language. Expanded M5 with explicit NAPI edge cases (budget==0, exactly-budget-consumed, IRQ-masking, `napi_disable` race, PREEMPT_RT note). Clarified syzkaller scope re: KCOV not collecting soft/hard IRQ coverage by default. Added `CONFIG_DMA_API_DEBUG`, IOMMU fault logging, descriptor canaries, and ring-snapshot-on-panic to §10 and M3. Made the type-state `Drop` behavior environment-specific (panic in debug VFIO guest; `WARN_ON_ONCE` + quarantine in release). Switched VFIO binding to `driver_override` (per-device, safer than `new_id`); added ACS-override negative gate and L2 isolation requirement. Added CI rule rejecting `Assisted-by:` without human `Signed-off-by:`. Reworded §12 baseline (r8169 as upstream-supported baseline, not "floor"). Added P0/P1 risks: OOT Rust metadata missing, `NETDEV_TX_BUSY` misuse, Secure Boot block, syzkaller miss, tracepoint ABI accident, and the v3.1 forbid/allow lint bug itself. Added §14 pre-RFC maintainer consultation gate. Renamed §15 to "M1 Entry Criteria" to remove the "implementation-ready" contradiction with the status line; expanded checklist with kernel-build feasibility, OOT module test, kernel config capture, Secure Boot state, physical topology, L2 isolation, `.unsafe-allowlist`. Marked tracepoints experimental in §16 Q4. Expanded §16 Q5 distribution tuple with `vermagic`, `Module.symvers` CRC, kernel config hash, Rust metadata package version, module signing state, plus an explicit Secure Boot policy. Removed MS-A1 distraction and "community-validated 128 GB" anecdote.
 - **v3.1** — Addressed review feedback. Added §3.3 (ASPM and runtime power management as a first-class hazard, with module-parameter override and per-revision allowlist). Added §6.3 (`sk_buff` and DMA ownership protocol at the FFI boundary) with explicit TX and RX state-machine tables, type-state Rust wrapper sketch, panic-on-Drop leak detection, and an allocation-accounting invariant. Renumbered §6.3 Performance Discipline → §6.4. Added `skb.rs` and `pm.rs` to the module layout. Added ASPM capability detection and conservative-default policy to M2. Renamed M5 to "NAPI Stability, Power Management, and Fuzzing" and added suspend/resume cycling under load, 24-hour ASPM idle soak, and a 4-hour `syzkaller` fuzzing run to its gate. Added `syzkaller`, `pktgen`, Scapy/`mausezahn`, and `pcap` replay+mutation to the §10 debug stack. Added three risks to §13: ASPM lockup, `sk_buff` ownership leak, and HWE-triggered Rust toolchain drift. Rewrote §16 Q5 with a concrete distribution model that rejects DKMS as the default install path in favor of per-kernel-build pre-built artifacts.

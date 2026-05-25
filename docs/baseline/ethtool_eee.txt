@@ -1,9 +1,9 @@
 # ethtool --show-eee enp3s0 
-# captured 2026-05-18T04:50:08Z
+# captured 2026-05-22T17:41:24Z
 
 EEE settings for enp3s0:
 	EEE status: enabled - inactive
-	Tx LPI: 0 (us)
+	Tx LPI: 5 (us)
 	Supported EEE link modes:  100baseT/Full
 	                           1000baseT/Full
 	                           2500baseT/Full

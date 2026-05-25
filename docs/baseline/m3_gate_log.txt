@@ -1,0 +1,21 @@
+=== M1/M2 gate: 1000 insmod/rmmod cycles of r8125_rust ===
+started 2026-05-24T17:21:12Z
+guest: Linux rtl8125-guest 7.0.0 #2 SMP PREEMPT_DYNAMIC Tue May 19 05:38:12 UTC 2026 x86_64 GNU/Linux
+module: /tmp/r8125_rust_build/src/r8125_rust.ko (1082616 bytes)
+kmemleak baseline lines: 0
+@cycle 100  elapsed=13s  kmemleak_lines=0
+@cycle 200  elapsed=26s  kmemleak_lines=0
+@cycle 300  elapsed=40s  kmemleak_lines=0
+@cycle 400  elapsed=52s  kmemleak_lines=0
+@cycle 500  elapsed=65s  kmemleak_lines=0
+@cycle 600  elapsed=78s  kmemleak_lines=0
+@cycle 700  elapsed=91s  kmemleak_lines=0
+@cycle 800  elapsed=103s  kmemleak_lines=0
+@cycle 900  elapsed=116s  kmemleak_lines=0
+@cycle 1000  elapsed=129s  kmemleak_lines=0
+loop done: cycles=1000 fail=0 elapsed=129s
+final kmemleak file: 0 lines
+journal probe lines: 1000 / 1000
+=== WARN/BUG/oops scan (post-loop, via journalctl -k) ===
+WARN/BUG/oops/KASAN lines: 0
+ACCEPTANCE: PASS
