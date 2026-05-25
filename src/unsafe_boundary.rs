@@ -177,6 +177,11 @@ extern "C" {
     );
     fn r8125_bridge_rx_drop_error(ndev: *mut bindings::net_device);
 
+    // ── HW checksum offload + stats (M4-perf, task 48) ──────────────────
+    fn r8125_bridge_skb_tx_csum_opts(skb: *mut bindings::sk_buff) -> u32;
+    fn r8125_bridge_skb_rx_csum_set(skb: *mut bindings::sk_buff, desc_opts1: u32);
+    fn r8125_bridge_account_rx(ndev: *mut bindings::net_device, bytes: u32);
+
     // ── PHY plumbing (M4-traffic) ────────────────────────────────────────
     fn r8125_bridge_phy_register(
         ndev: *mut bindings::net_device,
@@ -187,12 +192,21 @@ extern "C" {
     fn r8125_bridge_phy_stop(ndev: *mut bindings::net_device);
 }
 
-/// Rust mirror of `struct r8125_bridge_mdio_ops` — two function pointers
+/// Rust mirror of `struct r8125_bridge_mdio_ops` — four function pointers
 /// the C MDIO bus uses to call back into Rust for PHY register access.
+/// The C22 pair drives standard MII regs 0..31; the C45 pair drives MMD
+/// access (only `MDIO_MMD_VEND2 + regnum > MDIO_STAT2` reaches the chip).
 #[repr(C)]
 pub(crate) struct BridgeMdioOps {
     pub read: extern "C" fn(priv_: *mut c_void, phyreg: c_int) -> c_int,
     pub write: extern "C" fn(priv_: *mut c_void, phyreg: c_int, val: u16) -> c_int,
+    pub read_c45: extern "C" fn(priv_: *mut c_void, devad: c_int, phyreg: c_int) -> c_int,
+    pub write_c45: extern "C" fn(
+        priv_: *mut c_void,
+        devad: c_int,
+        phyreg: c_int,
+        val: u16,
+    ) -> c_int,
 }
 
 // SAFETY: `NetdevHandle` wraps a raw `*mut bindings::net_device` from
@@ -590,6 +604,44 @@ pub(crate) fn skb_free_error(skb: *mut bindings::sk_buff) {
     unsafe { r8125_bridge_skb_free_error(skb) };
 }
 
+// ── HW checksum offload + stats safe wrappers (M4-perf, task 48) ────────
+
+/// Returns the `opts2` bits to OR into the TX descriptor for HW CSUM,
+/// or 0 to leave the descriptor unannotated (kernel did SW CSUM, or no
+/// CSUM requested). For short UDP frames hitting the chip errata, the
+/// cshim falls back to `skb_checksum_help` internally and returns 0. If
+/// that software fallback fails, it returns [`crate::regs::TX_CSUM_OPTS_DROP`]
+/// and the caller must drop the skb before DMA mapping.
+///
+/// # SAFETY: `skb` is the kernel-allocated buffer we just received from
+/// ndo_start_xmit — alive and exclusively owned by the driver right now.
+pub(crate) fn skb_tx_csum_opts(skb: *mut bindings::sk_buff) -> u32 {
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_skb_tx_csum_opts(skb) }
+}
+
+/// Inspect the RX descriptor's `opts1` and set `skb->ip_summed` if the
+/// chip validated the checksum. No-op if the descriptor reports no L4
+/// CSUM result or any fail bit.
+///
+/// # SAFETY: `skb` was just built by `skb_build_rx`; the driver holds
+/// the unique reference.
+pub(crate) fn skb_rx_csum_set(skb: *mut bindings::sk_buff, desc_opts1: u32) {
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_skb_rx_csum_set(skb, desc_opts1) };
+}
+
+/// Bump `netdev->stats.rx_{packets,bytes}` after a successfully built
+/// + delivered skb. Called from NAPI poll RX path.
+///
+/// # SAFETY: `ndev` is the registered net_device; lifetime is bounded
+/// by `NetdevHandle::drop` which unregisters before the kernel-side
+/// `struct net_device` memory is freed.
+pub(crate) fn bridge_account_rx(ndev: *mut bindings::net_device, bytes: u32) {
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_account_rx(ndev, bytes) };
+}
+
 // ── PHY plumbing safe wrappers (M4-traffic) ──────────────────────────────
 
 /// Register the cshim's MDIO bus + phy_device for this netdev, with the
@@ -709,5 +761,56 @@ pub(crate) extern "C" fn r8125_rust_mdio_write(
     match crate::phy::mdio_write(state, reg, val) {
         Ok(()) => 0,
         Err(e) => errno_to_c_int(e),
+    }
+}
+
+/// MDIO C45 read entry point — invoked by `mii_bus->read_c45`. For
+/// `MDIO_MMD_VEND2` with `phyreg > MDIO_STAT2` it reads the chip's PHY
+/// OCP register at `phyreg` directly (no `OCP_STD_PHY_BASE` offset —
+/// `phyreg` IS the OCP address). Other combinations return 0, matching
+/// r8169 `r8169_mdio_read_reg_c45`. Required so the dedicated Realtek
+/// NBASE-T PHY driver's `rtl822x_hwmon_init` (clears MMD VEND2 thermal-
+/// alarm bits) and `rtl822x_get_features` (reads `RTL_MDIO_PMA_SPEED`
+/// for 2.5G capability) work, unblocking 2.5G negotiation.
+pub(crate) extern "C" fn r8125_rust_mdio_read_c45(
+    cookie: *mut c_void,
+    devad: c_int,
+    phyreg: c_int,
+) -> c_int {
+    if cookie.is_null() {
+        return errno_to_c_int(kernel::error::code::EINVAL);
+    }
+    if devad == crate::regs::MDIO_MMD_VEND2 && phyreg > crate::regs::MDIO_STAT2 {
+        let state = state_from_cookie(cookie);
+        match state.regs().gphy_ocp_read(phyreg as u32) {
+            Ok(v) => v as c_int,
+            Err(e) => errno_to_c_int(e),
+        }
+    } else {
+        0
+    }
+}
+
+/// MDIO C45 write entry point — `mii_bus->write_c45`. Same routing as
+/// `r8125_rust_mdio_read_c45`: only `MDIO_MMD_VEND2 + phyreg > MDIO_STAT2`
+/// reaches the chip (direct OCP write at `phyreg`). Other combinations
+/// return `-ENODEV`, matching r8169.
+pub(crate) extern "C" fn r8125_rust_mdio_write_c45(
+    cookie: *mut c_void,
+    devad: c_int,
+    phyreg: c_int,
+    val: u16,
+) -> c_int {
+    if cookie.is_null() {
+        return errno_to_c_int(kernel::error::code::EINVAL);
+    }
+    if devad == crate::regs::MDIO_MMD_VEND2 && phyreg > crate::regs::MDIO_STAT2 {
+        let state = state_from_cookie(cookie);
+        match state.regs().gphy_ocp_write(phyreg as u32, val) {
+            Ok(()) => 0,
+            Err(e) => errno_to_c_int(e),
+        }
+    } else {
+        errno_to_c_int(kernel::error::code::ENODEV)
     }
 }

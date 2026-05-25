@@ -14,6 +14,9 @@ echo
 echo "== MDIO bridge lifecycle =="
 bash "$CI/check_mdio_bridge.sh" || rc=1
 echo
+echo "== checksum/stat offload path =="
+bash "$CI/check_offload_path.sh" || rc=1
+echo
 echo "== deferred to guest CI (need validated kernel toolchain — §15 #3/#4/#5) =="
 cat <<'EOF'
   - make CLIPPY=1            (kernel-build Clippy; NOT cargo clippy — plan §6.1/§11)

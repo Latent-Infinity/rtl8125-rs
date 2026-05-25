@@ -1,0 +1,101 @@
+M4-traffic 2.5G — proof of dedicated PHY driver bind + 2.5G negotiation (2026-05-25)
+======================================================================================
+
+Followup to docs/baseline/m4_traffic_proof.txt — adds C45 (MDIO MMD) support
+on the `mii_bus` so the dedicated Realtek NBASE-T PHY driver can bind. With
+that driver bound, `rtl822x_get_features` reads `RTL_MDIO_PMA_SPEED` from
+MMD VEND2 and advertises 2.5G during autoneg. The host I226-V peer accepts
+2.5G; resulting link is 2500 Mbps Full Duplex (vs the 1 Gbps cap of the
+genphy fallback at the first M4-traffic baseline).
+
+## What changed (since the 1G M4-traffic baseline)
+
+- `src/regs.rs` — added MDIO_MMD_VEND2 (31) + MDIO_STAT2 (8) constants.
+- `src/unsafe_boundary.rs` — added `r8125_rust_mdio_read_c45` /
+  `r8125_rust_mdio_write_c45` entry points. For
+  `devad == MDIO_MMD_VEND2 && phyreg > MDIO_STAT2`: direct
+  `gphy_ocp_read/write` at `phyreg` (NOT `OCP_STD_PHY_BASE`-relative —
+  `phyreg` IS the OCP address). Other combinations return 0 (read) or
+  -ENODEV (write). Mirrors `r8169_mdio_read_reg_c45`.
+- `src/unsafe_boundary.rs` — `BridgeMdioOps` struct extended with the
+  two new function-pointer fields; passed through to the C side at
+  `bridge_phy_register` time.
+- `src/netdev.rs` — `NetdevHandle::new_with_state` populates the new
+  C45 fields in the BridgeMdioOps literal.
+- `src/netdev_bridge_phy.c` — added `bridge_mii_read_c45` /
+  `bridge_mii_write_c45` static helpers + wired
+  `bus->read_c45 = bridge_mii_read_c45; bus->write_c45 =
+  bridge_mii_write_c45;` in `r8125_bridge_phy_register`.
+- `src/netdev_bridge.h` — extended `struct r8125_bridge_mdio_ops` and
+  the typedefs.
+
+## Kernel log evidence (post-change)
+
+  r8125_rust 0000:05:00.0: r8125_rust: PHY attached: Realtek Internal
+                                       NBASE-T PHY (phy_id=0x001cc840)
+  (NO "probe with driver Realtek Internal NBASE-T PHY failed with error
+   -95" line this time — dedicated PHY driver bound successfully.)
+
+  r8125_rust 0000:05:00.0 enp5s0: Link is Up - 2.5Gbps/Full -
+                                  flow control rx/tx
+
+  ping -c 3 -W 2 -I enp5s0 10.0.0.1:
+    3 packets transmitted, 3 received, 0% packet loss
+    rtt min/avg/max/mdev = 0.348/0.401/0.437/0.038 ms
+
+## iperf3 TCP at 2.5G link (single 10s steady-state stream)
+
+  guest → host  : 0.912 Gbps   (saved at iperf3/iperf3_r8125_rust_guest2host_tcp_1500.json)
+  host  → guest : 1.252 Gbps   (saved at iperf3/iperf3_r8125_rust_host2guest_tcp_1500.json)
+
+  Multi-stream (4 parallel):
+    guest → host : 1.02  Gbps (0 retransmits)
+      saved at iperf3/iperf3_r8125_rust_guest2host_tcp_1500_p4.json
+    host  → guest : 456   Mbps  (single-CPU NAPI saturation in debug guest)
+
+  Multi-stream (8 parallel, guest → host):
+    1.05 Gbps with 952 retransmits — TX queue overrun under context-switch
+    storm. Single TX queue + no GSO/TSO means the chip + Rust path can't
+    drain fast enough at this stream count in the KASAN-debug guest.
+
+## Comparison to r8169 baseline on the SAME guest (from docs/baseline/iperf3/)
+
+  r8169 guest → host TCP 1500: 2.328 Gbps
+  r8169 host  → guest TCP 1500: 2.326 Gbps
+
+  We are at ~40-54% of r8169 throughput on the same 2.5G link. The link
+  speed itself is now correct; the throughput gap is feature-parity
+  work: missing TX/RX checksum offload features advertisement, no
+  TSO/GSO/GRO, single TX queue, no scatter-gather, no jumbo support
+  beyond the default 1500-MTU path. All M5 polish items.
+
+## Diagnosis: why the dedicated PHY driver was failing before
+
+The Realtek Internal NBASE-T PHY driver entry at realtek_main.c:2364
+specifies `.probe = rtl822x_probe`, which (when CONFIG_REALTEK_PHY_HWMON
+is set, as in our guest kernel: `CONFIG_REALTEK_PHY_HWMON=y`) calls
+`rtl822x_hwmon_init`. That function's first action is
+`phy_clear_bits_mmd(phydev, MDIO_MMD_VEND2, RTL822X_VND2_TSALRM, 3)`
+— an MMD VEND2 access. Without a working `read_c45`/`write_c45` on the
+`mii_bus`, the PHY framework falls back to the MMD-over-C22 indirect
+path (regs 0x0d / 0x0e), which the 8125B's internal PHY does not
+implement. The MMD access returns 0 / -EOPNOTSUPP. `phy_clear_bits_mmd`
+propagates -EOPNOTSUPP, the dedicated PHY driver probe returns -95, and
+the framework falls back to genphy — which doesn't know about
+`RTL_MDIO_PMA_SPEED` and so never advertises 2.5G. Result: link at 1 Gbps.
+
+With the C45 callbacks added, MMD VEND2 access lands as a direct PHY
+OCP read/write (the same path r8169 uses), `rtl822x_hwmon_init` clears
+the thermal-alarm bits successfully, the dedicated driver binds, and
+`rtl822x_get_features` reads `RTL_MDIO_PMA_SPEED` to advertise 2.5G.
+
+## What still needs work (M5 polish queue)
+
+- TX/RX checksum offload and netdev stats are addressed by the follow-up
+  `m4_perf_csum_stats_proof.txt` phase. SG/TSO/GSO remain open.
+- Per-CPU stats/counter sharding remains M5 polish; the M4 cshim updates
+  scalar `netdev->stats` counters so `ip -s link` is no longer 0/0.
+- Optional: port chip-specific PHY tuning (rtl8125b_hw_phy_config) for
+  marginal-cable signal-integrity headroom. The MAC OCP init in
+  hw_start_8125b already gives us a working 2.5G link; the per-channel
+  equalisation tuning is incremental.

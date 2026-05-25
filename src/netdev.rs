@@ -474,6 +474,15 @@ fn ndo_start_xmit(state: &NetdevState, skb: *mut bindings::sk_buff) -> c_int {
         return NETDEV_TX_BUSY;
     }
 
+    // M4-perf: HW checksum offload. This must run BEFORE DMA mapping:
+    // the short-UDP errata fallback calls skb_checksum_help(), which may
+    // write the completed checksum into skb data.
+    let opts2 = ub::skb_tx_csum_opts(skb);
+    if opts2 == regs::TX_CSUM_OPTS_DROP {
+        ub::skb_free_error(skb);
+        return NETDEV_TX_OK;
+    }
+
     // Map DMA; on failure, free + drop.
     let mut dma_handle: bindings::dma_addr_t = 0;
     let mut len: usize = 0;
@@ -503,7 +512,7 @@ fn ndo_start_xmit(state: &NetdevState, skb: *mut bindings::sk_buff) -> c_int {
         slot,
         Descriptor {
             opts1,
-            opts2: 0,
+            opts2,
             addr: dma_handle,
         },
     );
@@ -570,6 +579,8 @@ impl NetdevHandle {
         let mdio_ops = ub::BridgeMdioOps {
             read: ub::r8125_rust_mdio_read,
             write: ub::r8125_rust_mdio_write,
+            read_c45: ub::r8125_rust_mdio_read_c45,
+            write_c45: ub::r8125_rust_mdio_write_c45,
         };
         if let Err(e) = ub::bridge_phy_register(ndev, &mdio_ops) {
             dev_err!(pdev, "r8125_rust: bridge_phy_register failed: {:?}\n", e);

@@ -7,49 +7,44 @@ paused and what to do next.
 
 ---
 
-## TL;DR — M4-traffic ✅ (2026-05-25): actual packets flow through the Rust driver
+## TL;DR — M4-perf phase 1 ✅ (2026-05-25): HW CSUM offload + netdev stats
 
-**End-to-end working**: ping 5/5 sub-ms, iperf3 TCP guest→host **929-931
-Mbps** at 1Gbps link (0 retransmits, 299,535 IRQs handled cleanly in a
-single 10s window). rmmod clean, no KASAN, no kmemleak.
+Built on top of M4-traffic 2.5G. Now: link 2.5Gbps Full Duplex,
+NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM | NETIF_F_RXCSUM advertised
+and exercised. `ip -s link` shows real byte/packet counts (was 0/0).
+ethtool -k confirms tx-checksum-ipv4/ipv6 + rx-checksumming all `on`.
+Cross-validated TX descriptor bit layout against BOTH upstream r8169
+AND Realtek's vendor r8125_n.c (operator-flagged: don't trust upstream
+in isolation — they agree, plus the UDP-short-packet errata workaround
+is ported).
 
-Evidence: `docs/baseline/m4_traffic_proof.txt`,
-`docs/baseline/iperf3_rust_tcp_g2h.json`,
+iperf3 single-stream guest→host: **0.95 Gbps** (was 0.91 pre-CSUM).
+Single-stream host→guest: **1.25 Gbps**. r8169 reference: 2.33 Gbps.
+Remaining gap is per-packet kernel overhead in the KASAN-debug guest;
+TSO+SG would close most of it — tracked as task #49.
+
+**Implementation** (split for code-review hygiene):
+- New `src/netdev_bridge_offload.c` (~140 LOC) for the offload helpers
+  and stats counters — keeps `netdev_bridge.c` under the 400-line cap
+  (now 375).
+- New `src/phy.rs` (already there from M4-traffic), plus expanded
+  `src/unsafe_boundary.rs` for the four new wrappers
+  (`skb_tx_csum_opts`, `skb_rx_csum_set`, `bridge_account_tx/rx`).
+- Stats accounting in cshim's `bridge_skb_complete_tx` because the
+  chip clears the descriptor LEN field after TX completion and
+  `napi_consume_skb` invalidates the skb pointer.
+
+**Evidence**: `docs/baseline/m4_perf_csum_stats_proof.txt`,
+`docs/baseline/iperf3/iperf3_r8125_rust_{guest2host,host2guest}_tcp_1500.json`,
+`docs/baseline/m4_traffic_25g_proof.txt`,
+`docs/baseline/m4_traffic_proof.txt`,
 `docs/baseline/m4_full_uaf_fix_proof.txt`.
 
-**Caveats** (all M5 polish):
-- 1G not 2.5G — Realtek NBASE-T PHY driver probe returns -EOPNOTSUPP;
-  genphy fallback doesn't advertise 2.5G. Needs port of
-  `rtl8125b_hw_phy_config` from r8169_phy_config.c.
-- `ip -s link` shows 0/0 RX/TX bytes — driver doesn't bump netdev stats
-  yet. iperf3 confirms real traffic flows.
-- rmmod-while-traffic can wedge chip; use `ip link down → sleep → rmmod`
-  sequence.
+**Tasks**: task 48 ✅ closed; new task 49 opens for TSO+SG (the
+remaining 2x throughput gap). Census 50 → 50 (justified at
+`ci/CENSUS_JUSTIFICATIONS.md` — 4 new safe-wrapper unsafe blocks).
 
-**What landed this session (the long arc)**:
-
-1. M4-full UAF fix — struct field drop order in `R8125Driver` (Rust drops
-   declaration order, not reverse). Moved `_netdev` first. 100-cycle
-   regression clean.
-2. 8125-family register offsets corrected (IMR=0x38 32-bit, ISR=0x3C
-   32-bit, TxPoll=0x90 NPQ=BIT(0), INT_CFG0=0x34, INT_CFG1=0x7A).
-3. §15.2 cache padding applied to `NetdevState::{tx_head, tx_tail,
-   rx_tail}` via `CachePadded<T>` (`#[repr(C, align(64))]`).
-4. **M4-traffic** — the big one:
-   - `src/phy.rs` + extern Rust MDIO callbacks (translate MII → GPHY OCP).
-   - `src/mmio.rs` `gphy_ocp_*`, `mac_ocp_*`, `set_misc`, `config1`.
-   - `src/hw.rs::hw_start_8125b` port of r8169 `rtl_hw_start_8125_common`
-     for MAC_VER_63 (~25 MAC OCP writes + MISC ungate + 0xE098 finalizer
-     + 0xE00E wait).
-   - `src/netdev_bridge.{h,c}` — explicit (not devm) mdiobus_alloc +
-     register; `bridge_phylink_handler` drives carrier; split
-     `phy_connect_and_reset` (early, before MAC init) +
-     `phy_kick_state_machine` (last, after ChipCmd+IMR) — the split is
-     critical because genphy_soft_reset on the 8125B's integrated MAC/PHY
-     clobbers ChipCmd.
-   - `src/netdev.rs::ndo_open` reordered to r8169 sequence.
-
-CI green (unsafe census 47 → 47, justified at `ci/CENSUS_JUSTIFICATIONS.md`).
+CI green; `netdev_bridge.c stays within 400-line review cap (375)`.
 
 ## M0b ✅ (2026-05-25) — unchanged
 

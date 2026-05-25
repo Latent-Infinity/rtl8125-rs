@@ -41,6 +41,36 @@ static int bridge_mii_write(struct mii_bus *bus, int phyaddr, int phyreg,
 	return b->mdio_ops.write(b->priv, phyreg, val);
 }
 
+/* MDIO Clause-45 (MMD) read/write — mirrors r8169_mdio_read_reg_c45.
+ * Required so the dedicated "Realtek Internal NBASE-T PHY" driver's
+ * probe (rtl822x_hwmon_init → phy_clear_bits_mmd) and get_features
+ * (phy_read_mmd of RTL_MDIO_PMA_SPEED for 2.5G capability) work,
+ * unblocking 2.5G negotiation. Only MDIO_MMD_VEND2 + regnum > MDIO_STAT2
+ * reaches the chip; other combinations return 0 / -ENODEV. */
+static int bridge_mii_read_c45(struct mii_bus *bus, int phyaddr, int devad,
+			       int phyreg)
+{
+	struct r8125_bridge *b = bus->priv;
+
+	if (phyaddr != 0)
+		return -ENODEV;
+	if (!b->mdio_ops.read_c45)
+		return -EOPNOTSUPP;
+	return b->mdio_ops.read_c45(b->priv, devad, phyreg);
+}
+
+static int bridge_mii_write_c45(struct mii_bus *bus, int phyaddr, int devad,
+				int phyreg, u16 val)
+{
+	struct r8125_bridge *b = bus->priv;
+
+	if (phyaddr != 0)
+		return -ENODEV;
+	if (!b->mdio_ops.write_c45)
+		return -EOPNOTSUPP;
+	return b->mdio_ops.write_c45(b->priv, devad, phyreg, val);
+}
+
 static void bridge_phylink_handler(struct net_device *ndev)
 {
 	struct r8125_bridge *b = netdev_priv(ndev);
@@ -78,6 +108,11 @@ int r8125_bridge_phy_register(struct net_device *ndev,
 		 pci_domain_nr(b->pdev->bus), pci_dev_id(b->pdev));
 	bus->read = bridge_mii_read;
 	bus->write = bridge_mii_write;
+	/* C45 callbacks — see comment on bridge_mii_read_c45 above. Without
+	 * these the Realtek NBASE-T PHY driver fails to bind and genphy
+	 * fallback caps the link at 1G. */
+	bus->read_c45 = bridge_mii_read_c45;
+	bus->write_c45 = bridge_mii_write_c45;
 
 	ret = mdiobus_register(bus);
 	if (ret) {

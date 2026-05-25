@@ -110,10 +110,23 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	ndev->needs_free_netdev = false; /* we free explicitly */
 	eth_hw_addr_set(ndev, mac);
 
-	/* M4 baseline: single queue, no offloads, standard MTU range.
-	 * Jumbo lands with the M5 RX-buffer/page-fragment refactor. */
+	/* M4 baseline: single queue, standard MTU range. Jumbo lands with
+	 * the M5 RX-buffer/page-fragment refactor. */
 	ndev->min_mtu = ETH_MIN_MTU;
 	ndev->max_mtu = ETH_DATA_LEN;
+
+	/* M4-perf: advertise HW checksum offload for TCP/UDP over both
+	 * IPv4 and IPv6, plus the kernel-side RX-csum acknowledgement.
+	 * The Rust ndo_start_xmit path ORs the correct opts2 bits in via
+	 * r8125_bridge_skb_tx_csum_opts(); the NAPI RX path calls
+	 * r8125_bridge_skb_rx_csum_set(). Without these features the
+	 * kernel does all checksumming in software (the M4-traffic
+	 * baseline), capping single-stream throughput around 1 Gbps in
+	 * the KASAN-debug guest. SG/TSO/GSO come next. */
+	ndev->hw_features = NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
+			    NETIF_F_RXCSUM;
+	ndev->features = ndev->hw_features;
+	ndev->vlan_features = NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM;
 
 	b = netdev_priv(ndev);
 	b->ndev = ndev;
@@ -276,10 +289,21 @@ void r8125_bridge_skb_complete_tx(struct device *dev, dma_addr_t handle,
 {
 	struct net_device *ndev = skb->dev;
 	struct r8125_bridge *b = ndev ? netdev_priv(ndev) : NULL;
+	unsigned int skb_len = skb->len;
 
-	dma_unmap_single(dev, handle, len, DMA_TO_DEVICE);
+	(void)len;
+	/* Use the original skb length for unmap. Some sub-revisions clear the
+	 * descriptor length field after TX completion, and Rust passes that
+	 * descriptor field as `len`; the DMA mapping was made over skb->len. */
+	dma_unmap_single(dev, handle, skb_len, DMA_TO_DEVICE);
 	if (b)
 		WRITE_ONCE(b->tx_consumed, READ_ONCE(b->tx_consumed) + 1);
+	/* Account stats BEFORE napi_consume_skb — once napi consumes the
+	 * skb the pointer is stale. We use `skb->len` (the original packet
+	 * size at xmit) rather than the descriptor's len field because the
+	 * chip clears that field after TX completion on some sub-revisions. */
+	if (ndev)
+		r8125_bridge_account_tx(ndev, skb_len);
 	napi_consume_skb(skb, 1);
 }
 EXPORT_SYMBOL_GPL(r8125_bridge_skb_complete_tx);

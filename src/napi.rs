@@ -43,8 +43,15 @@ pub(crate) fn poll(state: &NetdevState, budget: c_int) -> c_int {
             let buf_ptr = ub::rx_buf_ptr(&state.rx_bufs, rx_tail);
             let skb = ub::skb_build_rx(ndev, buf_ptr, len);
             if !skb.is_null() {
+                // M4-perf: ask the chip-side opts1 if HW verified the L4
+                // checksum, set skb->ip_summed accordingly. Saves the
+                // kernel from re-computing on every RX packet.
+                ub::skb_rx_csum_set(skb, desc.opts1);
                 let napi = ub::bridge_napi(ndev);
                 ub::skb_deliver_rx(napi, skb);
+                // M4-perf: bump netdev stats so `ip -s link` reflects
+                // real traffic. `len` is the chip's reported frame size.
+                ub::bridge_account_rx(ndev, len as u32);
             } else {
                 // No skb exists to free, but the §6.3 disposition counter
                 // still needs to record the RX allocation failure.
@@ -89,6 +96,10 @@ pub(crate) fn poll(state: &NetdevState, budget: c_int) -> c_int {
         let skb = state.tx_shadow[slot].swap(ptr::null_mut(), Ordering::AcqRel);
         if !skb.is_null() {
             let len = (desc.opts1 & regs::DESC_LEN_MASK) as usize;
+            // skb_complete_tx unmaps DMA, accounts stats (via skb->len —
+            // the chip may clear the descriptor's LEN field after TX
+            // completion so we can't rely on it for the byte count),
+            // then napi_consume_skb.
             ub::skb_complete_tx(&state.pdev, desc.addr, len, skb);
         }
         // Clear the descriptor (preserve EOR if last slot).

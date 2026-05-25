@@ -272,6 +272,53 @@ struct sk_buff *r8125_bridge_skb_build_rx(struct net_device *ndev,
  */
 void r8125_bridge_skb_deliver_rx(struct napi_struct *napi, struct sk_buff *skb);
 
+/* ──────────────────────────────────────────────────────────────────────
+ *  HW checksum offload (M4-perf, task 48).
+ *
+ *  The Rust ndo_start_xmit / napi::poll paths don't peek into sk_buff
+ *  internals; the cshim does the protocol introspection and tells the
+ *  Rust side what TX descriptor `opts2` bits to OR in (or 0 = pass-
+ *  through software checksum), and consumes the RX descriptor `opts1`
+ *  to set `skb->ip_summed = CHECKSUM_UNNECESSARY` when the chip
+ *  validated the checksum.
+ *
+ *  Bit values mirror both r8169_main.c (TD1_*_CS) and Realtek's r8125
+ *  vendor driver (TxTCPCS_C / TxUDPCS_C / TxIPCS_C / TxIPV6F_C):
+ *    bit 31 (TxUDPCS_C) — chip computes UDP/IP checksum
+ *    bit 30 (TxTCPCS_C) — chip computes TCP/IP checksum
+ *    bit 29 (TxIPCS_C)  — chip computes IPv4 checksum
+ *    bit 28 (TxIPV6F_C) — frame is IPv6
+ *    bits [27:18] TCPHO_SHIFT — transport header offset
+ *
+ *  For short UDP frames (transport data < 47 bytes) the chip computes
+ *  the WRONG checksum (vendor errata, upstream r8169 has the same
+ *  workaround). This helper calls `skb_checksum_help` to fall back to
+ *  software in that case and returns 0 so the TX descriptor goes out
+ *  with no HW-CSUM bits set. If `skb_checksum_help` itself fails, the
+ *  helper returns `0xffffffff`; Rust drops the skb before DMA mapping.
+ */
+u32 r8125_bridge_skb_tx_csum_opts(struct sk_buff *skb);
+
+/* Inspect RX descriptor `opts1` and, if it indicates a successfully
+ * checksummed TCP or UDP packet (PID bits set, no fail bits),
+ * set `skb->ip_summed = CHECKSUM_UNNECESSARY`. Otherwise no change
+ * (kernel will fall back to software verification).
+ *
+ * Bits referenced from rtl_rx_desc_bit (r8169_main.c lines 622-638):
+ *   bit 17 (PID0) — TCP if set
+ *   bit 18 (PID1) — UDP if set
+ *   bit 16 (IPFail)   — IP   checksum failed
+ *   bit 15 (UDPFail)  — UDP  checksum failed
+ *   bit 14 (TCPFail)  — TCP  checksum failed
+ */
+void r8125_bridge_skb_rx_csum_set(struct sk_buff *skb, u32 desc_opts1);
+
+/* Bump netdev->stats from inside the cshim. The Rust hot-path
+ * doesn't have access to `struct net_device` members; counter
+ * mutation lives here. */
+void r8125_bridge_account_tx(struct net_device *ndev, unsigned int bytes);
+void r8125_bridge_account_rx(struct net_device *ndev, unsigned int bytes);
+
 /* Free an skb on the RX-error path (e.g. CRC error, truncated). Counter:
  * rx_dropped_error++. */
 void r8125_bridge_skb_drop_rx(struct sk_buff *skb);
@@ -316,14 +363,21 @@ struct napi_struct *r8125_bridge_napi(struct net_device *ndev);
  *  touching the BAR directly.
  * ────────────────────────────────────────────────────────────────────── */
 
-/* MDIO read: returns u16 in [0, 0xFFFF] on success, negative errno on
- * failure. Called from process context (RTNL held). */
+/* MDIO read/write: u16 in [0, 0xFFFF] on success, negative errno on
+ * failure. Called from process context (RTNL held). The C45 variants
+ * add an MMD device address (devad) — only MDIO_MMD_VEND2 with a
+ * regnum > MDIO_STAT2 actually reaches the chip; other (devad, regnum)
+ * combinations return 0 (read) / -ENODEV (write), matching r8169. */
 typedef int (*r8125_bridge_mdio_read_fn)(void *priv, int phyreg);
 typedef int (*r8125_bridge_mdio_write_fn)(void *priv, int phyreg, u16 val);
+typedef int (*r8125_bridge_mdio_read_c45_fn)(void *priv, int devad, int phyreg);
+typedef int (*r8125_bridge_mdio_write_c45_fn)(void *priv, int devad, int phyreg, u16 val);
 
 struct r8125_bridge_mdio_ops {
-	r8125_bridge_mdio_read_fn  read;
-	r8125_bridge_mdio_write_fn write;
+	r8125_bridge_mdio_read_fn      read;
+	r8125_bridge_mdio_write_fn     write;
+	r8125_bridge_mdio_read_c45_fn  read_c45;
+	r8125_bridge_mdio_write_c45_fn write_c45;
 };
 
 /*

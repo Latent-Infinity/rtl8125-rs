@@ -34,3 +34,21 @@ the one allowlisted file with a SAFETY comment.
 No new MMIO-touching `unsafe` was added by this milestone; all MMIO for
 the PHY OCP path goes through the existing `Regs::gphy_ocp_*` methods
 which use the kernel `pci::Bar` accessors (safe).
+
+## 2026-05-25 — M4-perf phase 1 bump 46 → 49
+
+Three new safe wrappers in `src/unsafe_boundary.rs`, each a one-line
+`unsafe { … }` calling a C bridge function:
+
+- `skb_tx_csum_opts(skb) -> u32` — wraps `r8125_bridge_skb_tx_csum_opts`.
+  SAFETY: `skb` is the kernel-allocated buffer just received by
+  ndo_start_xmit; the driver holds the unique reference.
+- `skb_rx_csum_set(skb, opts1)` — wraps `r8125_bridge_skb_rx_csum_set`.
+  SAFETY: `skb` was just built by `skb_build_rx` (driver-owned).
+- `bridge_account_rx(ndev, bytes)` — wraps `r8125_bridge_account_rx`.
+  SAFETY: `ndev` is registered and alive (NetdevHandle holds the
+  reference until Drop).
+
+All three mutate state owned by the kernel net stack (skb fields, netdev
+stats) and are therefore mechanical FFI wrappers. No new MMIO unsafe
+was added by this milestone.

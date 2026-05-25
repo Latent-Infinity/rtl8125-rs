@@ -130,6 +130,24 @@ pub(crate) const OCP_STD_PHY_BASE: u32 = 0xA400;
 /// MII page-select register (writing this picks an alternate OCP page).
 pub(crate) const MII_PAGE_SELECT: u8 = 0x1F;
 
+// ── MDIO Clause-45 access (MMD) — mirrors `r8169_mdio_read_reg_c45` ──────
+//
+// For RTL8125B the C45 callbacks accept ANY MMD device address, but only
+// `MDIO_MMD_VEND2` with a regnum greater than `MDIO_STAT2` reaches the
+// chip — the access lands as a direct PHY OCP read/write at `regnum`
+// (NOT the OCP_STD_PHY_BASE-relative path used by C22 mdio_read).
+// Anything else: read returns 0, write returns -ENODEV. The kernel's
+// `phy_read_mmd` for MMD VEND2 is how the dedicated Realtek PHY driver
+// reads `RTL_MDIO_PMA_SPEED` (for 2.5G capability) + writes
+// `RTL822X_VND2_TSALRM` (for thermal-sensor init in hwmon).
+pub(crate) const MDIO_MMD_VEND2: i32 = 31;
+pub(crate) const MDIO_STAT2: i32 = 8;
+
+// Sentinel returned by the cshim TX checksum helper when software checksum
+// completion failed. This is not a valid opts2 combination: real checksum
+// offload uses bits 28..31 plus TCPHO bits 18..27.
+pub(crate) const TX_CSUM_OPTS_DROP: u32 = 0xFFFF_FFFF;
+
 // ── TPPoll — 8125 layout (TxPoll_8125 = 0x90, 16-bit, NPQ = BIT(0)) ──────
 pub(crate) const TPPOLL: usize = 0x90;
 /// `NPQ` — Normal Priority Queue kick bit (write to TPPOLL after posting TX).

@@ -1,0 +1,122 @@
+M4-perf phase 1 — HW checksum offload + netdev stats (2026-05-25)
+====================================================================
+
+Followup to docs/baseline/m4_traffic_25g_proof.txt — adds HW TX/RX
+checksum offload (the chip computes IP/TCP/UDP checksum so the kernel
+doesn't have to) and populates netdev->stats so `ip -s link` reflects
+real traffic. Stats fix unblocks the §6.3 counter invariant CI check
+(task 40).
+
+## Cross-source validation note (per user feedback)
+
+Both upstream `r8169_main.c` (struct rtl_tx_desc_bit_1 lines 605-620) and
+the Realtek vendor `r8125_n.c` source (r8125.h lines 1878-1892) agree
+on the TX descriptor bit layout for 8125 family:
+- TxIPCS_C / TD1_IPv4_CS = BIT(29) = 0x20000000
+- TxIPV6F_C / TD1_IPv6_CS = BIT(28) = 0x10000000
+- TxTCPCS_C / TD1_TCP_CS  = BIT(30) = 0x40000000
+- TxUDPCS_C / TD1_UDP_CS  = BIT(31) = 0x80000000
+- TCPHO_SHIFT = 18 (transport header offset goes in opts2 bits 27:18)
+
+Realtek vendor driver also has a UDP short-packet workaround
+(`rtl8125_get_patch_pad_len` at r8125_n.c:19784) — chip miscomputes
+UDP CSUM if transport-data is < 47 bytes. Upstream r8169 has the same
+workaround at `rtl8125_quirk_udp_padto` (r8169_main.c:4395-4420). We
+ported the `R8125_MIN_UDP_PATCH_LEN = 47` check and fall back to
+`skb_checksum_help` in that case. If software checksum completion fails,
+the helper returns the `TX_CSUM_OPTS_DROP` sentinel and Rust drops the skb
+before DMA mapping, so a partially checksummed frame is never transmitted.
+
+## What changed (since M4-traffic 2.5G baseline)
+
+- `src/netdev_bridge.h` — added prototypes for
+  `r8125_bridge_skb_tx_csum_opts`, `r8125_bridge_skb_rx_csum_set`,
+  `r8125_bridge_account_tx`, `r8125_bridge_account_rx`.
+- `src/netdev_bridge.c` — implementations:
+  - `r8125_bridge_skb_tx_csum_opts(skb)`: inspects `skb->ip_summed`,
+    `vlan_get_protocol(skb)`, IP/IPv6 header `protocol`/`nexthdr`,
+    `skb_transport_offset(skb)`. Returns opts2 bits to OR. For short
+    UDP frames hitting the chip errata it calls `skb_checksum_help`
+    and returns 0 (SW CSUM fallback — packet still goes out correctly
+    just without HW acceleration).
+  - `r8125_bridge_skb_rx_csum_set(skb, opts1)`: reads PID0/PID1/fail
+    bits from RX descriptor `opts1`, sets `skb->ip_summed =
+    CHECKSUM_UNNECESSARY` when chip validated TCP or UDP checksum.
+  - `r8125_bridge_account_{tx,rx}(ndev, bytes)`: bumps
+    `ndev->stats.{rx,tx}_{packets,bytes}` (WRITE_ONCE/READ_ONCE).
+  - `r8125_bridge_skb_complete_tx`: now also calls `account_tx`
+    BEFORE `napi_consume_skb` (since skb->len would be stale after
+    consume; also the descriptor's LEN field gets cleared by the chip
+    on completion so we can't use that path either).
+  - `r8125_bridge_alloc`: sets `ndev->hw_features = NETIF_F_IP_CSUM |
+    NETIF_F_IPV6_CSUM | NETIF_F_RXCSUM`, `ndev->features =
+    hw_features`, `ndev->vlan_features = NETIF_F_IP_CSUM |
+    NETIF_F_IPV6_CSUM`.
+- `src/unsafe_boundary.rs` — extern decls + safe wrappers
+  `skb_tx_csum_opts`, `skb_rx_csum_set`, and `bridge_account_rx`.
+  TX stats are accounted inside the C completion helper before
+  `napi_consume_skb`.
+- `src/netdev.rs::ndo_start_xmit` — `opts2 = ub::skb_tx_csum_opts(skb)`
+  threaded into the descriptor write.
+- `src/napi.rs::poll` — RX path calls `skb_rx_csum_set` after
+  `skb_build_rx`, bumps `bridge_account_rx`. TX path: cshim's
+  `skb_complete_tx` handles `account_tx` internally.
+
+## Feature advertisement evidence
+
+  $ sudo ethtool -k enp5s0 | grep -E "checksumming|checksum-"
+  rx-checksumming: on
+  tx-checksumming: on
+          tx-checksum-ipv4: on
+          tx-checksum-ip-generic: off [fixed]
+          tx-checksum-ipv6: on
+          tx-checksum-fcoe-crc: off [fixed]
+          tx-checksum-sctp: off [fixed]
+
+## iperf3 baselines (10s steady-state, MTU 1500, 2.5G link)
+
+  guest → host TCP : 0.952 Gbps (1135 MB transferred, 0 retransmits)
+    docs/baseline/iperf3/iperf3_r8125_rust_guest2host_tcp_1500.json
+  host  → guest TCP: 1.246 Gbps (1486 MB transferred, 0 retransmits)
+    docs/baseline/iperf3/iperf3_r8125_rust_host2guest_tcp_1500.json
+
+  Comparison to M4-traffic baseline (before HW CSUM):
+    g→h: 0.912 Gbps → 0.952 Gbps  (+4%)
+    h→g: 1.252 Gbps → 1.246 Gbps  (within noise)
+
+  Comparison to r8169 reference on same guest:
+    r8169 g→h: 2.328 Gbps  (we are at 41% of r8169)
+    r8169 h→g: 2.326 Gbps  (we are at 54% of r8169)
+
+  HW CSUM marginal in this benchmark — the KASAN-debug guest is
+  CPU-bound on a single TCP stream regardless of CSUM offload (per-
+  packet overhead dominates over per-byte CSUM compute). The bigger
+  remaining lever is TSO+SG (see task 49) — kernel hands us a 64K
+  skb and chip segments into MSS-sized packets, dramatically
+  reducing per-packet kernel overhead. Real-world traffic typically
+  uses larger packets / TSO than this micro-benchmark.
+
+## netdev stats now correctly populated
+
+  $ ip -s link show enp5s0 | sed -n '3,8p'
+    RX:    bytes  packets errors dropped  missed mcast
+        3435059    49066      0       0       0     0
+    TX:    bytes   packets errors dropped carrier collsns
+     1227251678   814596      0       0       0      0
+
+  (Was 0/0 before this change. The TX-bytes path now reads `skb->len`
+  inside the cshim BEFORE `napi_consume_skb`, because the chip clears
+  the descriptor LEN field after TX completion and napi_consume frees
+  the skb structure.)
+
+## What's still open
+
+- TSO + SG (task 49) — the bigger throughput lever. ~200-300 LOC of
+  new code for multi-fragment descriptor walking + TSO bit setting.
+- §6.3 counter invariant CI check (task 40) — now unblocked because
+  the stats are populated; need a CI sweep that runs iperf3 and
+  asserts `tx_received == tx_consumed + tx_busy_exception +
+  tx_dropped_error` after quiesce.
+- The chip-specific PHY tuning at `rtl8125b_hw_phy_config` for
+  marginal-cable signal-integrity headroom. Not blocking on tested
+  topology.
