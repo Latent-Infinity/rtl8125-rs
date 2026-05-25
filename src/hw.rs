@@ -151,6 +151,15 @@ pub(crate) fn hw_start_8125b(regs: &Regs<'_>) -> Result<()> {
     let misc = regs.misc();
     regs.set_misc(misc & !regs::MISC_RXDV_GATED_EN);
 
+    // M4-perf phase 2 (task #49): write the TX engine's DMA burst +
+    // InterFrameGap config. r8169 calls `rtl_set_tx_config_registers`
+    // at the end of `rtl_hw_start` for this. Without it, default reset
+    // values starve the TX FIFO under TSO bursts (manifest: massive
+    // retransmits when iperf3 enables TSO). The RxConfig equivalent
+    // (RXCFG_8125B_CHIP_BITS) is already folded into RCR_M4_BASELINE
+    // and written via `set_rcr` at ndo_open time.
+    regs.set_tx_config(regs::TXCFG_M4_BASELINE);
+
     Ok(())
 }
 

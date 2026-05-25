@@ -12,17 +12,22 @@ NETDEV=src/netdev.rs
 BRIDGE=src/netdev_bridge.c
 OFFLOAD=src/netdev_bridge_offload.c
 
-csum_line=$(grep -n 'let opts2 = ub::skb_tx_csum_opts(skb)' "$NETDEV" | head -1 | cut -d: -f1)
-map_line=$(grep -n 'ub::skb_dma_map_tx' "$NETDEV" | head -1 | cut -d: -f1)
+# TX offload prep (TSO setup OR CSUM bit computation) must precede DMA
+# mapping because both paths can mutate skb data (skb_cow_head +
+# tcp_v6_gso_csum_prep for TSO; skb_checksum_help for the short-UDP
+# errata in the CSUM path). Look for either pre-DMA helper.
+csum_line=$(grep -nE 'ub::skb_tx_csum_opts\(skb\)|ub::skb_tso_setup\(skb\)' "$NETDEV" | head -1 | cut -d: -f1)
+map_line=$(grep -nE 'ub::skb_(dma_map_tx|data_dma_map)\(' "$NETDEV" | head -1 | cut -d: -f1)
 if [[ -n "$csum_line" && -n "$map_line" && "$csum_line" -lt "$map_line" ]]; then
-  ok "TX checksum preparation happens before DMA map"
+  ok "TX checksum/TSO preparation happens before DMA map"
 else
-  bad "TX checksum preparation must run before DMA map because skb_checksum_help mutates skb data"
+  bad "TX checksum/TSO preparation must run before DMA map because skb_checksum_help / tcp_v6_gso_csum_prep mutate skb data"
 fi
 
-grep -q 'dma_unmap_single(dev, handle, skb_len, DMA_TO_DEVICE)' "$BRIDGE" \
-  && ok "TX DMA unmap uses original skb length" \
-  || bad "TX DMA unmap must use skb->len, not descriptor length"
+grep -q 'dma_unmap_single(dev, handle, len, DMA_TO_DEVICE)' "$BRIDGE" \
+  && grep -q 'tx_shadow_len' "$NETDEV" \
+  && ok "TX linear DMA unmap uses shadowed map length" \
+  || bad "TX DMA unmap must use the saved DMA map length, not descriptor length"
 
 grep -q 'skb_checksum_help(skb)' "$OFFLOAD" \
   && grep -q 'R8125_MIN_UDP_PATCH_LEN' "$OFFLOAD" \
@@ -33,6 +38,12 @@ grep -q 'R8125_TX_CSUM_OPTS_DROP' "$OFFLOAD" \
   && grep -q 'TX_CSUM_OPTS_DROP' "$NETDEV" \
   && ok "checksum-help failure drops before DMA map" \
   || bad "checksum-help failure must not transmit a partially checksummed skb"
+
+grep -q 'skb_frag_dma_map(dev, frag' "$OFFLOAD" \
+  && grep -q 'dma_unmap_page(dev, handle, len, DMA_TO_DEVICE)' "$OFFLOAD" \
+  && grep -q 'tx_shadow_is_frag' "$NETDEV" \
+  && ok "SG fragment DMA map/unmap path preserves mapping type" \
+  || bad "SG fragments mapped with skb_frag_dma_map must be unmapped with dma_unmap_page"
 
 grep -q 'NETIF_F_IP_CSUM' "$BRIDGE" \
   && grep -q 'NETIF_F_IPV6_CSUM' "$BRIDGE" \

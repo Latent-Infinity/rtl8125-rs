@@ -153,6 +153,23 @@ pub(crate) const TPPOLL: usize = 0x90;
 /// `NPQ` — Normal Priority Queue kick bit (write to TPPOLL after posting TX).
 pub(crate) const TPPOLL_NPQ: u16 = 0x0001;
 
+// ── TxConfig (32-bit at 0x40) — DMA burst + InterFrameGap ────────────────
+//
+// Same register read for XID detection (upper bits encode chip version).
+// r8169 `rtl_set_tx_config_registers` writes
+// `(TX_DMA_BURST << TxDMAShift) | (IFG << TxIFGShift)` to set the TX
+// engine's PCI burst length and inter-frame gap. Without this write,
+// default reset values starve the TX FIFO under TSO bursts (manifests
+// as massive retransmits when iperf3 enables TSO).
+//   TX_DMA_BURST = 7 (unlimited) at bits 8-10 → 0x700
+//   IFG = 3 (shortest) at bits 24-25 → 0x03000000
+pub(crate) const TXCFG_DMA_SHIFT: u32 = 8;
+pub(crate) const TXCFG_IFG_SHIFT: u32 = 24;
+pub(crate) const TXCFG_DMA_BURST_UNLIMITED: u32 = 7;
+pub(crate) const TXCFG_IFG_SHORTEST: u32 = 3;
+pub(crate) const TXCFG_M4_BASELINE: u32 =
+    (TXCFG_DMA_BURST_UNLIMITED << TXCFG_DMA_SHIFT) | (TXCFG_IFG_SHORTEST << TXCFG_IFG_SHIFT);
+
 // ── RCR — Receive Configuration Register (32-bit) ────────────────────────
 pub(crate) const RCR: usize = 0x44;
 #[allow(dead_code)]
@@ -164,9 +181,24 @@ pub(crate) const RCR_ACCEPT_BROADCAST: u32 = 0x08;
 pub(crate) const RCR_ACCEPT_RUNT: u32 = 0x10;
 #[allow(dead_code)]
 pub(crate) const RCR_ACCEPT_ERR: u32 = 0x20;
-/// M4 baseline RX policy: broadcast + multicast + my-MAC (no promisc).
-pub(crate) const RCR_M4_BASELINE: u32 =
-    RCR_ACCEPT_BROADCAST | RCR_ACCEPT_MULTICAST | RCR_ACCEPT_MY_PHYS;
+
+// 8125B chip-config bits in RxConfig (high bits), per r8169 rtl_init_rxcfg
+// VER_63 case. Must be OR'd with the accept-policy bits at write time.
+// Without these the RX engine fetches descriptors too slowly under bursty
+// peer-ACK traffic.
+pub(crate) const RXCFG_DMA_BURST: u32 = 7 << 8;        // bits 8-10
+pub(crate) const RXCFG_PAUSE_SLOT_ON_8125B: u32 = 1 << 11;
+pub(crate) const RXCFG_FETCH_DFLT_8125: u32 = 8 << 27; // bits 27-29
+pub(crate) const RXCFG_8125B_CHIP_BITS: u32 =
+    RXCFG_DMA_BURST | RXCFG_PAUSE_SLOT_ON_8125B | RXCFG_FETCH_DFLT_8125;
+
+/// M4 baseline RX policy: broadcast + multicast + my-MAC (no promisc)
+/// + the 8125B chip-config bits above. r8169 writes these together so
+/// the full 32-bit RxConfig has both accept policy AND FIFO/DMA setup.
+pub(crate) const RCR_M4_BASELINE: u32 = RCR_ACCEPT_BROADCAST
+    | RCR_ACCEPT_MULTICAST
+    | RCR_ACCEPT_MY_PHYS
+    | RXCFG_8125B_CHIP_BITS;
 
 // ── CPlusCmd (16-bit, MMIO 0xE0) ─────────────────────────────────────────
 pub(crate) const CPLUSCMD: usize = 0xE0;

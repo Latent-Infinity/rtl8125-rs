@@ -52,3 +52,36 @@ Three new safe wrappers in `src/unsafe_boundary.rs`, each a one-line
 All three mutate state owned by the kernel net stack (skb fields, netdev
 stats) and are therefore mechanical FFI wrappers. No new MMIO unsafe
 was added by this milestone.
+
+## 2026-05-25 — M4-perf phase 2 (SG/TSO WIP) bump 49 → 53
+
+Six SG/TSO wrappers were added in `src/unsafe_boundary.rs`, each a
+one-line `unsafe { … }` calling a C bridge function. The obsolete
+single-buffer TX map/complete wrappers were retired after the SG path
+started tracking per-descriptor DMA mappings, so the net census moves
+49 → 53.
+
+- `skb_nr_frags(skb) -> u32` — wraps `r8125_bridge_skb_nr_frags`.
+  SAFETY: `skb` is the kernel-allocated buffer just received by xmit
+  (driver-owned exclusively at this moment).
+- `skb_data_dma_map(pdev, skb, &out_handle, &out_len)` — wraps
+  `r8125_bridge_skb_data_dma_map`. SAFETY: `pdev` alive via ARef;
+  `skb` driver-owned.
+- `skb_frag_dma_map(pdev, skb, frag_idx, &out_handle, &out_len)` —
+  wraps `r8125_bridge_skb_frag_dma_map`. SAFETY: as above; `frag_idx`
+  validated by the C side against `nr_frags`.
+- `skb_dma_unmap_frag_tx(pdev, handle, len)` — wraps
+  `r8125_bridge_skb_dma_unmap_frag_tx`. SAFETY: `handle/len` came from
+  a prior successful `skb_frag_dma_map`; this pairs the page-based map
+  helper with `dma_unmap_page`.
+- `skb_tso_setup(skb) -> Option<(u32, u32)>` — wraps
+  `r8125_bridge_skb_tso_setup`. SAFETY: as above; the C side may
+  mutate skb (skb_cow_head + tcp_v6_gso_csum_prep) on IPv6 TSO.
+- `skb_consume_tx(ndev, skb)` — wraps `r8125_bridge_skb_consume_tx`.
+  SAFETY: `ndev` alive (NetdevHandle); `skb` is the LastFrag-slot
+  pointer the NAPI reaper has just swapped out of `tx_shadow`.
+
+Note: `NETIF_F_SG` is advertised after the per-fragment DMA unmap fix
+and is covered by the task #49 SG proof. `NETIF_F_TSO | NETIF_F_TSO6`
+remain disabled in `r8125_bridge_alloc` pending a fix for the TSO
+packet-corruption issue tracked in the task #49 notes.

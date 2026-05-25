@@ -1,0 +1,129 @@
+M4-perf phase 2 (task #49) — SG/TSO investigation summary (2026-05-25)
+========================================================================
+
+## Status
+
+Historical investigation note from the first SG bring-up attempt. The
+SG packet-corruption issue described here was later fixed by
+propagating checksum/offload descriptor bits to every fragment
+descriptor; see `m4_perf_sg_proof.txt` for the passing baseline. TSO
+remains disabled and is covered by `m4_perf_tso_debug_session.txt`.
+
+## What was built
+
+Full multi-fragment + TSO TX path infrastructure. SG is now advertised;
+TSO advertisement remains disabled pending the TSO loss investigation.
+
+C bridge additions (`src/netdev_bridge_offload.c` +
+`src/netdev_bridge.h`):
+- `r8125_bridge_skb_nr_frags` — returns `skb_shinfo(skb)->nr_frags`.
+- `r8125_bridge_skb_data_dma_map` — maps `skb->data .. +skb_headlen`
+  (NOT skb->len; the difference matters for SG skbs).
+- `r8125_bridge_skb_frag_dma_map` — uses `skb_frag_dma_map` for
+  page-aware mapping of skb_shinfo()->frags[i].
+- `r8125_bridge_skb_dma_unmap_frag_tx` — pairs the page-aware fragment
+  mapping with `dma_unmap_page`.
+- `r8125_bridge_skb_tso_setup` — fills opts1 (`TD1_GTSENV4 = BIT(26)` /
+  `TD1_GTSENV6 = BIT(25)` + `transport_offset << GTTCPHO_SHIFT(18)`)
+  and opts2 (`mss << TD1_MSS_SHIFT(18)`). Calls `skb_cow_head` +
+  `tcp_v6_gso_csum_prep` for IPv6 TSO (header at
+  `<net/ip6_checksum.h>`).
+- `r8125_bridge_skb_consume_tx` — bumps stats + napi_consume_skb
+  WITHOUT dma_unmap (caller does per-descriptor unmap).
+
+Rust additions:
+- `src/unsafe_boundary.rs` — six new SG/TSO wrappers and two retired
+  obsolete single-buffer TX wrappers, net census 49→53.
+- `src/netdev.rs::NetdevState` — `tx_shadow_dma: [AtomicU64; 256]`
+  `tx_shadow_len: [AtomicU32; 256]`, and
+  `tx_shadow_is_frag: [AtomicBool; 256]` for per-descriptor unmap info.
+  (Chip clears descriptor LEN on TX completion; skb pointer is
+  invalid after napi_consume — neither source is reliable for the
+  reaper's unmap call.)
+- `src/netdev.rs::ndo_start_xmit` — restructured:
+  1. Compute TSO opts (may mutate skb) OR CSUM opts (may mutate skb
+     via skb_checksum_help for short-UDP errata)
+  2. Reserve `n_desc = 1 + nr_frags` slots (ring-full check
+     accounts for total)
+  3. Map linear head → shadow[head%RING]
+  4. Walk fragments: map frag → write descriptor at slot[head+1+i]
+     with OWN set + LastFrag on the last one
+  5. Write FirstFrag descriptor LAST at slot[head%RING] with
+     OWN|FS|csum_or_tso_opts1
+- `src/napi.rs::poll` — TX reaper does per-slot dma_unmap from
+  `shadow_dma/shadow_len`, then `skb_consume_tx` only when
+  `tx_shadow[slot]` is non-null (= LastFrag slot).
+
+## Original SG bug
+
+With `NETIF_F_SG` advertised, iperf3 cookie exchange fails:
+- Host iperf3 server: "unable to receive cookie at server: Bad file
+  descriptor"
+- Guest iperf3 client: "control socket has closed unexpectedly"
+- TCP 3-way handshake completes (so basic descriptor format works
+  for tiny ACKs), but data packets are corrupted.
+- A/B confirmed by toggling `ethtool -K enp5s0 sg off` — with SG off
+  (kernel calls `__skb_linearize`, all skbs are single-fragment),
+  iperf3 works at 932 Mbps. With SG on (kernel passes through multi-
+  frag skbs to our path), iperf3 fails.
+
+Kernel log added a debug print and confirmed the iperf3 cookie itself
+is dispatched as `len=103 headlen=66 nr_frags=1 gso_size=0` — a single
+paged-frag skb exercising our SG path. Ping (single linear skb)
+works because nr_frags=0 and our SG code becomes a no-op (loop
+iterates 0 times, just writes FirstFrag=LastFrag with OWN|FS|LS).
+
+## Hypotheses from the original debug session
+
+1. **Memory ordering** — descriptor writes for slots[1..N-1] (OWN
+   set immediately) before slot[0] (OWN+FS set last). x86 TSO
+   should make this atomic-enough but the chip may prefetch the
+   descriptors via DMA before the CPU's stores are visible. Adding
+   an explicit `smp_wmb()` between the loop and the FirstFrag
+   descriptor write would close the race if it's the root cause.
+
+2. **Legacy descriptor format incompatibility with SG** — the
+   `hw_start_8125b` MAC OCP init writes `0xeb58 &= ~bit0`, telling
+   the chip to use the 16-byte r8169-style legacy descriptor
+   format. Maybe the 8125B's legacy mode is single-descriptor
+   only, and multi-descriptor SG requires the 40-byte "new" format.
+   Counter-evidence: r8169 upstream uses the same legacy format
+   and DOES multi-descriptor SG for older 8169-family chips. So
+   this is unlikely but worth verifying.
+
+3. **Stale `tx_shadow_dma` from previous iteration** — the reaper
+   zeroes `tx_shadow_len[slot]` on consume but NOT `tx_shadow_dma`.
+   If a slot is reused before `tx_shadow_dma` is overwritten, a
+   later iteration could see stale state. But this would mostly
+   affect the reaper, not the chip's transmit. Probably not the
+   bug.
+
+4. **CSUM/TSO bit placement when multi-descriptor** — this was the
+   root cause. r8169 and Realtek propagate the opts values to every
+   descriptor, not FirstFrag only. The fixed SG path does the same.
+
+5. **Wrong CSUM transport offset for SG skbs** — for an SG skb,
+   `skb_transport_offset(skb)` returns the byte position in skb->data
+   (linear part) where the TCP header starts. If the TCP header is
+   actually in a frag (rare but possible for SG), this would be
+   wrong. For the iperf3 cookie (headlen=66 bytes = Eth+IP+TCP+
+   payload-prefix), the TCP header IS in the linear part. So this
+   isn't it either.
+
+## Current state
+
+`ndev->hw_features` in `r8125_bridge_alloc` advertises
+`NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM | NETIF_F_RXCSUM | NETIF_F_SG`.
+TSO remains off. iperf3 SG baselines are captured under
+`docs/baseline/iperf3/*_sg.json`, and CI covers the map/unmap pairing
+plus the offload-prep-before-DMA ordering.
+
+## Next step
+
+Approach the bug with a tcpdump on the host enp4s0 to capture the
+actual bytes the chip transmits — that'll show whether the
+fragments are reassembled correctly on the wire or if the chip's
+producing two malformed packets. The debug session should re-
+enable SG (NETIF_F_SG only, leave TSO off), add the `pr_info_
+ratelimited` SG-skb logger back in, and capture pcap with
+`tcpdump -w` while running a single short iperf3 test.

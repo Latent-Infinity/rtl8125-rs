@@ -69,7 +69,7 @@ struct r8125_bridge_ops {
 	 * ──────────
 	 * Pre   : open(priv) returned 0 at some point in the past.
 	 * Post  : device hardware quiescent. All TX skbs that were in flight
-	 *         have either reached `bridge_skb_complete_tx` (the normal
+	 *         have either reached `bridge_skb_consume_tx` (the normal
 	 *         path) or been `dev_kfree_skb_any`'d. All RX buffers have
 	 *         been recycled or freed. NAPI is disabled. IRQ is freed.
 	 *         Per §6.3 the `tx_received == tx_consumed + tx_busy_exception
@@ -200,29 +200,11 @@ void r8125_bridge_tx_disable(struct net_device *ndev);
  *  in `src/skb.rs` mirrors these into `TxSkb<S>` transitions.
  * ────────────────────────────────────────────────────────────────────── */
 
-/* Read-only accessors. No counter changes. */
-size_t r8125_bridge_skb_len(struct sk_buff *skb);
-const unsigned char *r8125_bridge_skb_data(struct sk_buff *skb);
-
-/*
- * DMA-map the skb's linear region for TX. Counter: tx_received++.
- *
- * Pre   : `skb` was just received from xmit() (state `Received`).
- * Post  : on success, `*out_handle` and `*out_len` are set; the driver
- *         must remember them for the matching unmap call. State
- *         transition `Received → Mapped`.
- * Return: 0 on success; -EIO or similar on DMA-mapping failure (counter
- *         is still incremented — the failure path is `tx_dropped_error`).
- */
-int r8125_bridge_skb_dma_map_tx(struct device *dev,
-				struct sk_buff *skb,
-				dma_addr_t *out_handle,
-				size_t *out_len);
-
-/* DMA-unmap. No counter change here; the matching `complete_tx` or
- * `free_error` call is the counter event. */
+/* DMA-unmap. No counter change here; skb consume/free is the counter event. */
 void r8125_bridge_skb_dma_unmap_tx(struct device *dev,
 				   dma_addr_t handle, size_t len);
+void r8125_bridge_skb_dma_unmap_frag_tx(struct device *dev,
+					dma_addr_t handle, size_t len);
 
 /*
  * Free an skb on the TX-error path (validation reject, DMA-map failure,
@@ -232,16 +214,6 @@ void r8125_bridge_skb_dma_unmap_tx(struct device *dev,
  * This is the §6.3 "(c) drop_with_error" disposition.
  */
 void r8125_bridge_skb_free_error(struct sk_buff *skb);
-
-/*
- * Complete a posted TX descriptor: DMA-unmap + `napi_consume_skb`.
- * Counter: tx_consumed++.
- *
- * This is the §6.3 step 4 — `Submitted → Completing → Empty`.
- */
-void r8125_bridge_skb_complete_tx(struct device *dev,
-				  dma_addr_t handle, size_t len,
-				  struct sk_buff *skb);
 
 /* Count a NETDEV_TX_BUSY return where the kernel retains skb ownership.
  * Call only on the documented exceptional ring-full race path. */
@@ -318,6 +290,42 @@ void r8125_bridge_skb_rx_csum_set(struct sk_buff *skb, u32 desc_opts1);
  * mutation lives here. */
 void r8125_bridge_account_tx(struct net_device *ndev, unsigned int bytes);
 void r8125_bridge_account_rx(struct net_device *ndev, unsigned int bytes);
+
+/* ──────────────────────────────────────────────────────────────────────
+ *  Scatter-gather TX + TSO (M4-perf phase 2, task #49).
+ *
+ *  For multi-fragment skbs we post one descriptor per
+ *  (linear-head + each paged frag); the chip walks them from FirstFrag
+ *  to LastFrag. The Rust hot-path doesn't see sk_buff internals — the
+ *  cshim does the introspection and DMA mapping.
+ * ────────────────────────────────────────────────────────────────────── */
+
+/* Number of paged fragments. 0 if the skb is linear-only. */
+unsigned int r8125_bridge_skb_nr_frags(struct sk_buff *skb);
+
+/* Map the LINEAR head of `skb` (skb->data .. +skb_headlen) for TX DMA.
+ * Returns 0 on success, negative errno on mapping failure. */
+int r8125_bridge_skb_data_dma_map(struct device *dev, struct sk_buff *skb,
+				  dma_addr_t *out_handle, unsigned int *out_len);
+
+/* Map paged fragment `frag_idx` (0 .. nr_frags-1) for TX DMA. Uses
+ * skb_frag_dma_map (page-aware) under the hood. */
+int r8125_bridge_skb_frag_dma_map(struct device *dev, struct sk_buff *skb,
+				  unsigned int frag_idx,
+				  dma_addr_t *out_handle, unsigned int *out_len);
+
+/* TSO descriptor-bit setup. If `skb_shinfo(skb)->gso_size != 0` and the
+ * GSO type is TCPv4 or TCPv6, fills `*opts1_bits` with
+ * `GiantSendv4|6 | (transport_offset << GTTCPHO_SHIFT)` and `*opts2_bits`
+ * with `(mss << TD1_MSS_SHIFT)` and returns true. Otherwise zeros both
+ * and returns false (caller falls back to plain CSUM bits). */
+bool r8125_bridge_skb_tso_setup(struct sk_buff *skb,
+				u32 *opts1_bits, u32 *opts2_bits);
+
+/* Consume an skb on TX completion (no DMA unmap — caller did per-
+ * descriptor unmap already). Bumps netdev->stats.tx_{packets,bytes}
+ * from skb->len and hands the skb back to NAPI for recycling. */
+void r8125_bridge_skb_consume_tx(struct net_device *ndev, struct sk_buff *skb);
 
 /* Free an skb on the RX-error path (e.g. CRC error, truncated). Counter:
  * rx_dropped_error++. */

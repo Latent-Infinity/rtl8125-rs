@@ -1,0 +1,104 @@
+M4-perf phase 2 TSO debug session findings (2026-05-25)
+==========================================================
+
+## Setup
+
+- Branch state: SG+CSUM working (945 Mbps g→h, 1.245 Gbps h→g, 0 retr).
+- TSO advertisement temporarily re-enabled for diagnostics
+  (`NETIF_F_TSO | NETIF_F_TSO6` + `netif_set_tso_max_size(64000) +
+  netif_set_tso_max_segs(64)`).
+- Host: `ethtool -K enp4s0 gro off lro off` (so tcpdump sees actual
+  wire frames, not GRO-aggregated bundles).
+
+## Symptom
+
+`iperf3 -c 10.0.0.1 -B 10.0.0.2 -t 5` reproduces a sustained ~5-7%
+retransmit rate at multiple bandwidths:
+
+| Bandwidth   | Throughput | Retransmits | Sender→Receiver delta |
+|-------------|-----------|-------------|----------------------|
+| Unlimited   | 730 Mbps  | 2088 (5s)   | ~8 Mbps lost         |
+| 100 Mbps    | 100 Mbps  | 2099 (5s)   | ~equal               |
+| 500 Mbps    | 223 Mbps  | 1993 (5s)   | receiver: 0 (dead)   |
+
+Retransmit count is independent of offered bandwidth — so it's NOT
+queue overflow under load. It's a per-packet protocol-level loss
+that scales with packet count.
+
+## Wire-level evidence (tcpdump with host GRO off)
+
+```
+20:14:07.046348 IP id 50482 length 1500 seq 37:1485 cksum 0x9cdb (correct)
+20:14:07.046399 IP id 17715 length 1500 seq 1485:2933 cksum 0x2121 (correct)
+20:14:07.046399 IP id 17716 length 1500 seq 2933:4381 cksum 0x02d5 (correct)
+20:14:07.046399 IP id 17717 length 1500 seq 4381:5829 cksum 0xa4eb (correct)
+... 17 consecutive 1448-byte frames ...
+```
+
+The chip IS performing TSO correctly:
+- Frames are exactly MTU-sized (1500-byte IP, 1448-byte TCP payload).
+- TCP CSUMs validate as `(correct)` to tcpdump.
+- TCP sequence numbers are sequential without gaps.
+- IP IDs are non-monotonic in a curious pattern (50482, then 17715..
+  17718, then 50487, then 17720..17723 — looks like the chip
+  generates each super-skb's first segment with a different ID
+  source than the subsequent segments, but that shouldn't cause
+  TCP-level loss).
+
+## Hypotheses tested
+
+1. **Memory ordering / DMA coherence race** — Added explicit
+   `core::sync::atomic::fence(Ordering::Release)` between fragment
+   descriptor writes and the FirstFrag descriptor write (mirroring
+   Realtek vendor's `wmb()`). **No effect** — same 5351 retr / 5s.
+
+2. **Bandwidth-induced queue overflow** — Tested at 100 Mbps,
+   500 Mbps, unlimited. Retr count was ~constant per second
+   regardless of bandwidth. **Rules out queue overflow as
+   the cause**.
+
+3. **igc (host driver) RX errors** — `ethtool -S enp4s0` showed
+   `rx_crc_errors: 0, rx_missed_errors: 0, rx_long/short_length:
+   0, rx_align_errors: 0`. **Host receives all frames cleanly.**
+
+## What's left to investigate (next debug session)
+
+1. **TSO IRQ-moderation / coalescing** — r8169 sets
+   `rtl_set_eee_txidle_timer(tp)` and writes various IRQ-related
+   MAC OCP registers during `rtl_hw_start`. We don't. With TSO,
+   the chip emits dozens of segments per skb; without proper IRQ
+   coalescing the NAPI poll path might race with new TX submissions
+   and lose some completions.
+
+2. **MAC OCP register we haven't set** — There are still tuning
+   writes in `rtl_hw_start_8125_common` we skipped (the 0xc140 /
+   0xc142 / 0xd3e2 / 0xd3e4 / 0xe860 / 0xe614 / 0xe63e / 0xc0b4 /
+   0xeb6a / 0xeb50 / 0xe056 / 0xe040 / 0xea1c / 0xe0c0 / 0xe052 /
+   0xd430 etc. set). We set MAC_OCP_NEW_TX_DESC bit 0 = 0 and
+   MISC_RXDV_GATED_EN = 0, but not the rest. Some of these may
+   be needed specifically for TSO segmentation to work cleanly
+   at line rate. Worth porting the full sequence and re-testing.
+
+3. **TCP timestamp / SACK interaction** — The retransmits could
+   be SACK-triggered (the kernel thinks segments are lost based on
+   SACK gaps from the host). Need to inspect host TCP layer
+   counters (`netstat -s | grep -i 'retrans\|reord\|sack'`) to
+   see if it's actually losing packets or just reordering.
+
+4. **bytecount + BQL accounting** — Realtek vendor calls
+   `netif_tx_sent_queue(bytecount)` to drive BQL flow control.
+   Without it, the kernel may send TSO super-skbs faster than the
+   chip can absorb. This is throughput control, not loss — but
+   under back-pressure the kernel might give up and "retry".
+
+## Current state (committed)
+
+`ndev->hw_features = NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM | NETIF_F_RXCSUM
+| NETIF_F_SG`. TSO advertisement OFF. SG+CSUM baseline preserved:
+
+  g→h TCP 1500 single-stream: 0.933 Gbps, 0 retransmits.
+
+TSO code (`r8125_bridge_skb_tso_setup`, `tso_opts1` propagation
+in `ndo_start_xmit`) remains in tree. To re-enable for next debug
+attempt: uncomment the `NETIF_F_TSO | NETIF_F_TSO6` lines in
+`r8125_bridge_alloc` and the `netif_set_tso_max_*` calls.

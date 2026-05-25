@@ -115,18 +115,29 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	ndev->min_mtu = ETH_MIN_MTU;
 	ndev->max_mtu = ETH_DATA_LEN;
 
-	/* M4-perf: advertise HW checksum offload for TCP/UDP over both
-	 * IPv4 and IPv6, plus the kernel-side RX-csum acknowledgement.
-	 * The Rust ndo_start_xmit path ORs the correct opts2 bits in via
-	 * r8125_bridge_skb_tx_csum_opts(); the NAPI RX path calls
-	 * r8125_bridge_skb_rx_csum_set(). Without these features the
-	 * kernel does all checksumming in software (the M4-traffic
-	 * baseline), capping single-stream throughput around 1 Gbps in
-	 * the KASAN-debug guest. SG/TSO/GSO come next. */
+	/* M4-perf: HW offload feature advertisement.
+	 *  - NETIF_F_IP_CSUM / IPV6_CSUM: chip computes IP/TCP/UDP checksum
+	 *    (task #48; opts2 bits set by r8125_bridge_skb_tx_csum_opts).
+	 *  - NETIF_F_RXCSUM: chip validates incoming checksums (task #48;
+	 *    r8125_bridge_skb_rx_csum_set sets skb->ip_summed when valid).
+	 *  - NETIF_F_SG: kernel may hand us multi-fragment skbs that we
+	 *    post as N descriptors per logical packet (task #49). Required
+	 *    for TSO.
+	 *  - NETIF_F_TSO / NETIF_F_TSO6: chip performs TCP segmentation —
+	 *    we receive a single up-to-64K skb and the chip emits MSS-sized
+	 *    frames on the wire (task #49). Bits set by
+	 *    r8125_bridge_skb_tso_setup.
+	 *
+	 * Without these features the kernel software-segments and software-
+	 * checksums everything, which caps single-stream throughput at
+	 * ~1 Gbps in the KASAN-debug guest (per-packet overhead bound).
+	 * With SG+TSO the chip handles ~64K logical sends in one batch.
+	 * Current surface: CSUM+SG live; TSO flag off pending the
+	 * investigation in m4_perf_tso_debug_session.txt. */
 	ndev->hw_features = NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
-			    NETIF_F_RXCSUM;
+			    NETIF_F_RXCSUM | NETIF_F_SG;
 	ndev->features = ndev->hw_features;
-	ndev->vlan_features = NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM;
+	ndev->vlan_features = NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM | NETIF_F_SG;
 
 	b = netdev_priv(ndev);
 	b->ndev = ndev;
@@ -235,36 +246,6 @@ EXPORT_SYMBOL_GPL(r8125_bridge_napi);
 
 /* ── sk_buff helpers + counter side-effects (§6.3) ─────────────────── */
 
-size_t r8125_bridge_skb_len(struct sk_buff *skb)
-{
-	return skb->len;
-}
-EXPORT_SYMBOL_GPL(r8125_bridge_skb_len);
-
-const unsigned char *r8125_bridge_skb_data(struct sk_buff *skb)
-{
-	return skb->data;
-}
-EXPORT_SYMBOL_GPL(r8125_bridge_skb_data);
-
-int r8125_bridge_skb_dma_map_tx(struct device *dev, struct sk_buff *skb,
-				dma_addr_t *out_handle, size_t *out_len)
-{
-	struct net_device *ndev = skb->dev;
-	struct r8125_bridge *b = ndev ? netdev_priv(ndev) : NULL;
-	dma_addr_t h;
-
-	h = dma_map_single(dev, skb->data, skb->len, DMA_TO_DEVICE);
-	if (b)
-		WRITE_ONCE(b->tx_received, READ_ONCE(b->tx_received) + 1);
-	if (dma_mapping_error(dev, h))
-		return -EIO;
-	*out_handle = h;
-	*out_len = skb->len;
-	return 0;
-}
-EXPORT_SYMBOL_GPL(r8125_bridge_skb_dma_map_tx);
-
 void r8125_bridge_skb_dma_unmap_tx(struct device *dev, dma_addr_t handle,
 				   size_t len)
 {
@@ -283,30 +264,6 @@ void r8125_bridge_skb_free_error(struct sk_buff *skb)
 	dev_kfree_skb_any(skb);
 }
 EXPORT_SYMBOL_GPL(r8125_bridge_skb_free_error);
-
-void r8125_bridge_skb_complete_tx(struct device *dev, dma_addr_t handle,
-				  size_t len, struct sk_buff *skb)
-{
-	struct net_device *ndev = skb->dev;
-	struct r8125_bridge *b = ndev ? netdev_priv(ndev) : NULL;
-	unsigned int skb_len = skb->len;
-
-	(void)len;
-	/* Use the original skb length for unmap. Some sub-revisions clear the
-	 * descriptor length field after TX completion, and Rust passes that
-	 * descriptor field as `len`; the DMA mapping was made over skb->len. */
-	dma_unmap_single(dev, handle, skb_len, DMA_TO_DEVICE);
-	if (b)
-		WRITE_ONCE(b->tx_consumed, READ_ONCE(b->tx_consumed) + 1);
-	/* Account stats BEFORE napi_consume_skb — once napi consumes the
-	 * skb the pointer is stale. We use `skb->len` (the original packet
-	 * size at xmit) rather than the descriptor's len field because the
-	 * chip clears that field after TX completion on some sub-revisions. */
-	if (ndev)
-		r8125_bridge_account_tx(ndev, skb_len);
-	napi_consume_skb(skb, 1);
-}
-EXPORT_SYMBOL_GPL(r8125_bridge_skb_complete_tx);
 
 void r8125_bridge_tx_busy_exception(struct net_device *ndev)
 {

@@ -15,6 +15,7 @@
 
 #include "netdev_bridge_internal.h"
 
+#include <linux/dma-mapping.h>
 #include <linux/etherdevice.h>
 #include <linux/if_vlan.h>
 #include <linux/ip.h>
@@ -23,6 +24,7 @@
 #include <linux/skbuff.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
+#include <net/ip6_checksum.h>
 
 /* TX descriptor opts2 bits (8125 family). */
 #define R8125_TD1_IPV6_CS	BIT(28)
@@ -142,3 +144,121 @@ void r8125_bridge_account_rx(struct net_device *ndev, unsigned int bytes)
 	WRITE_ONCE(ndev->stats.rx_bytes,   READ_ONCE(ndev->stats.rx_bytes)   + bytes);
 }
 EXPORT_SYMBOL_GPL(r8125_bridge_account_rx);
+
+/* ── Scatter-gather + TSO (M4-perf phase 2, task 49) ─────────────────── */
+
+/* TX descriptor opts1 bits used only by the TSO path. Same prefix
+ * scheme as the CSUM opts2 bits above. Realtek vendor + r8169 agree
+ * on these values (r8125_n.c GiantSendv4/v6 vs rtl_tx_desc_bit_1
+ * TD1_GTSENV4/V6). */
+#define R8125_TD1_GTSENV6	BIT(25)
+#define R8125_TD1_GTSENV4	BIT(26)
+#define R8125_GTTCPHO_SHIFT	18
+#define R8125_GTTCPHO_MAX	0x7fU
+#define R8125_TD1_MSS_SHIFT	18	/* opts2 MSS position (11 bits) */
+
+unsigned int r8125_bridge_skb_nr_frags(struct sk_buff *skb)
+{
+	return (unsigned int)skb_shinfo(skb)->nr_frags;
+}
+EXPORT_SYMBOL_GPL(r8125_bridge_skb_nr_frags);
+
+int r8125_bridge_skb_data_dma_map(struct device *dev, struct sk_buff *skb,
+				  dma_addr_t *out_handle, unsigned int *out_len)
+{
+	struct net_device *ndev = skb->dev;
+	struct r8125_bridge *b = ndev ? netdev_priv(ndev) : NULL;
+	unsigned int len = skb_headlen(skb);
+	dma_addr_t h;
+
+	h = dma_map_single(dev, skb->data, len, DMA_TO_DEVICE);
+	if (b)
+		WRITE_ONCE(b->tx_received, READ_ONCE(b->tx_received) + 1);
+	if (dma_mapping_error(dev, h))
+		return -EIO;
+	*out_handle = h;
+	*out_len = len;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(r8125_bridge_skb_data_dma_map);
+
+void r8125_bridge_skb_dma_unmap_frag_tx(struct device *dev, dma_addr_t handle,
+					size_t len)
+{
+	dma_unmap_page(dev, handle, len, DMA_TO_DEVICE);
+}
+EXPORT_SYMBOL_GPL(r8125_bridge_skb_dma_unmap_frag_tx);
+
+int r8125_bridge_skb_frag_dma_map(struct device *dev, struct sk_buff *skb,
+				  unsigned int frag_idx,
+				  dma_addr_t *out_handle, unsigned int *out_len)
+{
+	const skb_frag_t *frag;
+	unsigned int len;
+	dma_addr_t h;
+
+	if (frag_idx >= skb_shinfo(skb)->nr_frags)
+		return -EINVAL;
+	frag = &skb_shinfo(skb)->frags[frag_idx];
+	len = skb_frag_size(frag);
+	h = skb_frag_dma_map(dev, frag, 0, len, DMA_TO_DEVICE);
+	if (dma_mapping_error(dev, h))
+		return -EIO;
+	*out_handle = h;
+	*out_len = len;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(r8125_bridge_skb_frag_dma_map);
+
+bool r8125_bridge_skb_tso_setup(struct sk_buff *skb,
+				u32 *opts1_bits, u32 *opts2_bits)
+{
+	struct skb_shared_info *shinfo = skb_shinfo(skb);
+	unsigned int mss = shinfo->gso_size;
+	unsigned int trans_off;
+
+	*opts1_bits = 0;
+	*opts2_bits = 0;
+
+	if (mss == 0)
+		return false;
+
+	trans_off = skb_transport_offset(skb);
+	if (trans_off > R8125_GTTCPHO_MAX)
+		return false;	/* header too far in; chip can't reach it */
+
+	if (shinfo->gso_type & SKB_GSO_TCPV4) {
+		*opts1_bits |= R8125_TD1_GTSENV4;
+	} else if (shinfo->gso_type & SKB_GSO_TCPV6) {
+		/* Prep pseudo-header CSUM for chip-segmented v6 frames. */
+		if (skb_cow_head(skb, 0))
+			return false;
+		tcp_v6_gso_csum_prep(skb);
+		*opts1_bits |= R8125_TD1_GTSENV6;
+	} else {
+		/* Other GSO types (UDP frag, GRE, etc.) — chip can't TSO,
+		 * the kernel will fall back to software segmentation. */
+		return false;
+	}
+
+	*opts1_bits |= (u32)trans_off << R8125_GTTCPHO_SHIFT;
+	*opts2_bits |= (u32)mss << R8125_TD1_MSS_SHIFT;
+	return true;
+}
+EXPORT_SYMBOL_GPL(r8125_bridge_skb_tso_setup);
+
+void r8125_bridge_skb_consume_tx(struct net_device *ndev, struct sk_buff *skb)
+{
+	struct r8125_bridge *b = ndev ? netdev_priv(ndev) : NULL;
+
+	/* Account BEFORE napi_consume_skb — once consumed the pointer is
+	 * stale. The byte count comes from skb->len (the full logical-
+	 * packet size including all paged frags), not from any single
+	 * descriptor's LEN field (chip clears those on completion). */
+	if (b)
+		WRITE_ONCE(b->tx_consumed, READ_ONCE(b->tx_consumed) + 1);
+	if (ndev)
+		r8125_bridge_account_tx(ndev, skb->len);
+	napi_consume_skb(skb, 1);
+}
+EXPORT_SYMBOL_GPL(r8125_bridge_skb_consume_tx);

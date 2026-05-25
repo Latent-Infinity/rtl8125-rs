@@ -1,0 +1,107 @@
+M4-perf phase 2 SG + CSUM — proof of multi-fragment TX path (2026-05-25)
+==========================================================================
+
+## What this delivers
+
+Scatter-gather TX path live and traffic-tested. The kernel now passes
+multi-fragment skbs to the driver (not just `__skb_linearize`d ones),
+and the chip walks the descriptor chain to transmit each packet as a
+single logical frame.
+
+## Root cause of the SG corruption bug
+
+`opts2` (CSUM bits) and `tso_opts1` (GTSEN bits, when TSO is active)
+must be propagated to **every** fragment descriptor — they're not
+first-only. My initial implementation zeroed `opts2` on fragments,
+causing the chip to miscompute the checksum over multi-descriptor
+packets. The symptom was iperf3 cookie corruption: TCP 3-way
+handshake completes (linear-only ACKs work), but the cookie payload
+(SG skb: linear=66 headers + frag=37 cookie data) is rejected by the
+host with `unable to receive cookie at server: Bad file descriptor`.
+
+Cross-source verification:
+- Upstream r8169 `rtl8169_tx_map` at `r8169_main.c:4321-4351`:
+  `txd->opts2 = cpu_to_le32(opts[1])` is called for every descriptor
+  (head + each frag), with the same `opts[]` array carrying CSUM/MSS
+  bits.
+- Realtek vendor `rtl8125_xmit_frags` at `r8125_n.c:19475-19483`:
+  same per-descriptor propagation, with an explicit `wmb()` between
+  opts2 and opts1 writes (we don't need it on x86 TSO — the field
+  order in `Descriptor` puts addr/opts2 before opts1 inside the
+  16-byte struct that `write_volatile` emits as one or two store
+  instructions, all retired before the chip can prefetch).
+
+## Additional chip-config fixes in the same pass
+
+The final reviewed SG path also tracks each TX descriptor's mapping
+type. Linear heads are unmapped with `dma_unmap_single`; paged frags
+from `skb_frag_dma_map` are unmapped with `dma_unmap_page`. The same
+shadow state is used in normal NAPI completion, DMA-map error unwind,
+and ndo_stop teardown.
+
+r8169 writes two registers during `rtl_hw_start` that we never wrote:
+
+1. **TxConfig (0x40)**: `(TX_DMA_BURST=7 << 8) | (IFG=3 << 24) = 0x03000700`.
+   Without this the TX engine uses default reset values that starve
+   the FIFO under bursty traffic. New `Regs::set_tx_config` in
+   `src/mmio.rs`, written at the end of `hw_start_8125b` in `src/hw.rs`.
+
+2. **RxConfig (0x44)**: for VER_63 (RTL8125B), r8169 writes
+   `RX_FETCH_DFLT_8125 | RX_DMA_BURST | RX_PAUSE_SLOT_ON | accept_bits`
+   = `(8 << 27) | (7 << 8) | (1 << 11) | 0x0E = 0x40000F0E`. We were
+   writing just `0x0E` (accept bits). The high chip-config bits are
+   now folded into `RCR_M4_BASELINE` so the existing `set_rcr` call
+   picks them up.
+
+Combined effect: g→h iperf3 went from 920 Mbps (SG only, default
+TxConfig) to 941-944 Mbps with the corrected chip config.
+
+## Final iperf3 baselines (SG + CSUM, MTU 1500, 2.5G link)
+
+  guest → host TCP single-stream: 0.945 Gbps (~2 retransmits)
+    docs/baseline/iperf3/iperf3_r8125_rust_guest2host_tcp_1500_sg.json
+  host  → guest TCP single-stream: 1.245 Gbps (0 retransmits)
+    docs/baseline/iperf3/iperf3_r8125_rust_host2guest_tcp_1500_sg.json
+
+Compare to r8169 reference (same guest):
+  r8169 g→h TCP 1500: 2.328 Gbps
+  r8169 h→g TCP 1500: 2.326 Gbps
+
+We're at ~41% of r8169 g→h, 54% h→g. The remaining gap is mostly
+TSO (the kernel is software-segmenting our 1500-MTU TCP into MSS-
+sized packets on the CPU; with TSO, the chip would do it). TSO is
+implemented but disabled — see below.
+
+## netdev->stats correctly populated (no regression)
+
+  ip -s link show enp5s0:
+    RX:  bytes packets errors dropped missed mcast
+      3352886   47891    0     0      0      0
+    TX:  bytes  packets  errors dropped carrier collsns
+      1230814933 816906   0     0      0      0
+
+## TSO status (still partial — code in tree, feature flag off)
+
+TSO infrastructure is implemented:
+- `src/netdev_bridge_offload.c::r8125_bridge_skb_tso_setup` sets
+  `GTSENV4 / GTSENV6` + transport_offset in opts1, MSS in opts2.
+- IPv6 path calls `tcp_v6_gso_csum_prep` for the pseudo-header.
+- Rust `ndo_start_xmit` propagates `tso_opts1` to every descriptor.
+
+With `NETIF_F_TSO | NETIF_F_TSO6` advertised, iperf3 sustained
+~600 Mbps with ~10% retransmit rate — the chip emits TSO super-skb
+segments but the host's TCP layer rejects some of them. Remaining
+hypotheses tracked in `docs/baseline/m4_perf_sg_tso_investigation.txt`:
+
+- The chip may need additional MAC OCP register set for TSO
+  segmentation (the LSO Patch is for 8125A only — our chip is
+  8125B — but maybe there's a different per-revision TSO setup).
+- Per-segment sequence number / CSUM issue in the chip's TSO
+  engine for our MAC config.
+- VLAN handling (we don't extract / re-insert the VLAN tag).
+
+For now `ndev->hw_features` advertises `IP_CSUM | IPV6_CSUM |
+RXCSUM | SG` only. The TSO feature bits and `netif_set_tso_max_*`
+calls are commented out in `r8125_bridge_alloc` pending the next
+debug iteration. The TSO code path stays in tree; re-enable with
+a single-line uncomment.

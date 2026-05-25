@@ -42,6 +42,13 @@ impl<'a> Regs<'a> {
         self.bar.read32(regs::TX_CONFIG)
     }
 
+    /// Write `TxConfig` — DMA burst + InterFrameGap (M4-perf phase 2).
+    /// Mirrors r8169 `rtl_set_tx_config_registers`. Required at open
+    /// time for TSO to operate without TX FIFO starvation.
+    pub(crate) fn set_tx_config(&self, value: u32) {
+        self.bar.write32(value, regs::TX_CONFIG);
+    }
+
     /// Read `ChipCmd` (offset 0x37, 1-byte).
     pub(crate) fn chip_cmd(&self) -> u8 {
         self.bar.read8(regs::CHIP_CMD)

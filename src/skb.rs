@@ -5,9 +5,10 @@
 //!
 //! TX and RX disposition for M4-full's first cut is handled inline in
 //! `src/netdev.rs` / `src/napi.rs` using the safe cshim helpers
-//! (`bridge_skb_dma_map_tx` / `bridge_skb_complete_tx` /
-//! `bridge_skb_free_error` / `bridge_skb_build_rx` /
-//! `bridge_skb_deliver_rx` / `bridge_skb_drop_rx`). The cshim does the
+//! (`bridge_skb_data_dma_map` / `bridge_skb_frag_dma_map` /
+//! `bridge_skb_consume_tx` / `bridge_skb_free_error` /
+//! `bridge_skb_build_rx` / `bridge_skb_deliver_rx` /
+//! `bridge_skb_drop_rx`). The cshim does the
 //! `dev_kfree_skb_any` / `napi_consume_skb` / `napi_gro_receive` calls and
 //! the §6.3 counter increments, so the Rust side cannot accidentally leak
 //! an skb to the wrong disposition — every helper enforces exactly one

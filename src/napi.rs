@@ -93,14 +93,30 @@ pub(crate) fn poll(state: &NetdevState, budget: c_int) -> c_int {
             // Hardware still owns this slot — stop here.
             break;
         }
+        // M4-perf phase 2 (SG): every descriptor in a logical packet has
+        // its own DMA mapping that must be unmapped here. The skb pointer
+        // is in the LastFrag slot only; intermediate frags get null.
+        let map_addr = state.tx_shadow_dma[slot].load(Ordering::Acquire);
+        let map_len = state.tx_shadow_len[slot].load(Ordering::Acquire) as usize;
+        if map_len > 0 {
+            if state.tx_shadow_is_frag[slot].swap(false, Ordering::AcqRel) {
+                ub::skb_dma_unmap_frag_tx(&state.pdev, map_addr, map_len);
+            } else {
+                ub::skb_dma_unmap_tx(&state.pdev, map_addr, map_len);
+            }
+            // Mark slot's mapping as consumed so a follow-on read can't
+            // see stale state if the shadow is reused before the next
+            // xmit overwrites it.
+            state.tx_shadow_len[slot].store(0, Ordering::Release);
+        }
         let skb = state.tx_shadow[slot].swap(ptr::null_mut(), Ordering::AcqRel);
         if !skb.is_null() {
-            let len = (desc.opts1 & regs::DESC_LEN_MASK) as usize;
-            // skb_complete_tx unmaps DMA, accounts stats (via skb->len —
-            // the chip may clear the descriptor's LEN field after TX
-            // completion so we can't rely on it for the byte count),
-            // then napi_consume_skb.
-            ub::skb_complete_tx(&state.pdev, desc.addr, len, skb);
+            // LastFrag of a logical packet — drain stats from skb->len
+            // (the kernel-side total including all paged frags) and
+            // hand the skb back to NAPI for recycling. The DMA unmap
+            // for THIS slot already happened above; for SG packets the
+            // intermediate slots' unmaps happened in earlier loop iters.
+            ub::skb_consume_tx(state.ndev.load(Ordering::Acquire), skb);
         }
         // Clear the descriptor (preserve EOR if last slot).
         let mut opts1 = 0u32;

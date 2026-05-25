@@ -211,6 +211,9 @@ impl pci::Driver for R8125Driver {
                             rx_dma: rx_ring.dma_handle(),
                             rx_bufs,
                             tx_shadow: core::array::from_fn(|_| AtomicPtr::new(core::ptr::null_mut())),
+                            tx_shadow_dma: core::array::from_fn(|_| core::sync::atomic::AtomicU64::new(0)),
+                            tx_shadow_len: core::array::from_fn(|_| core::sync::atomic::AtomicU32::new(0)),
+                            tx_shadow_is_frag: core::array::from_fn(|_| core::sync::atomic::AtomicBool::new(false)),
                             tx_head: crate::netdev::CachePadded::new(
                                 core::sync::atomic::AtomicUsize::new(0),
                             ),

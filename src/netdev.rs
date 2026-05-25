@@ -20,8 +20,9 @@
 
 use core::ffi::{c_int, c_void};
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 // AtomicU32 also serves the new NetdevState::ocp_base field below.
+// AtomicU64/U32 shadow the per-descriptor DMA mapping (handle/len) for SG.
 
 /// Cache-line padded wrapper. Per `docs/RUST_STANDARDS.md` §15.2, atomics
 /// mutated from independent contexts (here: `tx_head` from xmit, `tx_tail`
@@ -139,9 +140,21 @@ pub(crate) struct NetdevState {
     /// `unsafe_boundary::rx_buf_slice(...)`.
     pub(crate) rx_bufs: CoherentAllocation<RxBuffer>,
 
-    /// One AtomicPtr per TX slot — non-null while the slot owns the skb.
-    /// `xmit` stores; NAPI poll reaper consumes via `bridge_skb_complete_tx`.
+    /// One AtomicPtr per TX slot. For SG (multi-fragment) skbs only the
+    /// LastFrag descriptor's slot holds the skb pointer; intermediate
+    /// fragment slots store null. `xmit` stores; NAPI poll reaper consumes
+    /// via `bridge_skb_consume_tx` only when the slot's pointer is non-null.
     pub(crate) tx_shadow: [AtomicPtr<bindings::sk_buff>; RING_LEN],
+
+    /// Per-descriptor DMA mapping shadow — the chip clears the descriptor's
+    /// LEN field on TX completion (per r8169 vendor errata, also seen on
+    /// 8125B), and `napi_consume_skb` invalidates the skb pointer, so we
+    /// can't recover (handle, len) from either source at unmap time. SG
+    /// makes this worse because each fragment is mapped separately and
+    /// must be unmapped separately.
+    pub(crate) tx_shadow_dma: [AtomicU64; RING_LEN],
+    pub(crate) tx_shadow_len: [AtomicU32; RING_LEN],
+    pub(crate) tx_shadow_is_frag: [AtomicBool; RING_LEN],
 
     /// Producer index (advanced by `ndo_start_xmit`). Cache-padded per
     /// RUST_STANDARDS.md §15.2 — written by xmit, read by NAPI poll.
@@ -437,10 +450,18 @@ fn ndo_stop(state: &NetdevState) {
     // Release the IRQ (kernel synchronises).
     ub::free_irq(state.irq_num, state as *const NetdevState as *mut c_void);
 
-    // Reap any in-flight TX skbs the hardware never completed (some may be
-    // OWN-set at the device side; we drop them safely).
-    for slot in state.tx_shadow.iter() {
-        let skb = slot.swap(ptr::null_mut(), Ordering::AcqRel);
+    // Reap any in-flight TX mappings/skbs the hardware never completed.
+    for i in 0..RING_LEN {
+        let len = state.tx_shadow_len[i].swap(0, Ordering::AcqRel) as usize;
+        if len > 0 {
+            let handle = state.tx_shadow_dma[i].load(Ordering::Acquire);
+            if state.tx_shadow_is_frag[i].swap(false, Ordering::AcqRel) {
+                ub::skb_dma_unmap_frag_tx(&state.pdev, handle, len);
+            } else {
+                ub::skb_dma_unmap_tx(&state.pdev, handle, len);
+            }
+        }
+        let skb = state.tx_shadow[i].swap(ptr::null_mut(), Ordering::AcqRel);
         if !skb.is_null() {
             ub::skb_free_error(skb);
         }
@@ -460,64 +481,153 @@ fn ndo_start_xmit(state: &NetdevState, skb: *mut bindings::sk_buff) -> c_int {
     if n < 3 {
         pr_info!("r8125_rust xmit#{}: about to map+post\n", n);
     }
-    // Reserve a TX slot at tx_head. If the ring is (nearly) full, stop the
-    // queue and return BUSY as the §6.3-counted exception.
+
+    // ── Offload bit computation (must run BEFORE DMA mapping) ──────────
+    // TSO is checked first; if active, opts1 gets GTSEN bits + transport
+    // offset and opts2 gets MSS. Otherwise plain CSUM bits go in opts2.
+    // The TSO setup may mutate skb (skb_cow_head + tcp_v6_gso_csum_prep
+    // for IPv6); the CSUM path may call skb_checksum_help for the short-
+    // UDP errata. Both write through the linear data, so any subsequent
+    // DMA map sees the final bytes.
+    let (tso_opts1, first_opts2) = match ub::skb_tso_setup(skb) {
+        Some((o1, o2)) => (o1, o2),
+        None => {
+            let csum_opts2 = ub::skb_tx_csum_opts(skb);
+            if csum_opts2 == regs::TX_CSUM_OPTS_DROP {
+                ub::skb_free_error(skb);
+                return NETDEV_TX_OK;
+            }
+            (0u32, csum_opts2)
+        }
+    };
+
+    // ── Ring space reservation for the whole logical packet ─────────────
+    // n_desc = 1 head + N paged frags. We keep at least one slot empty so
+    // tx_head == tx_tail can only mean "ring empty" (not "ring full").
+    let nr_frags = ub::skb_nr_frags(skb) as usize;
+    let n_desc = 1 + nr_frags;
     let head = state.tx_head.inner.load(Ordering::Relaxed);
     let tail = state.tx_tail.inner.load(Ordering::Acquire);
     let in_flight = head.wrapping_sub(tail);
-    if in_flight >= RING_LEN - 1 {
+    if in_flight + n_desc >= RING_LEN {
         let ndev = state.ndev.load(Ordering::Acquire);
         ub::bridge_tx_stop_queue(ndev);
-        // The skb was NOT mapped / NOT stored — kernel retains ownership.
-        // Count this rare §6.3 exception explicitly.
         ub::tx_busy_exception(ndev);
         return NETDEV_TX_BUSY;
     }
 
-    // M4-perf: HW checksum offload. This must run BEFORE DMA mapping:
-    // the short-UDP errata fallback calls skb_checksum_help(), which may
-    // write the completed checksum into skb data.
-    let opts2 = ub::skb_tx_csum_opts(skb);
-    if opts2 == regs::TX_CSUM_OPTS_DROP {
+    // ── Map the linear head ────────────────────────────────────────────
+    let mut linear_handle: bindings::dma_addr_t = 0;
+    let mut linear_len: u32 = 0;
+    if ub::skb_data_dma_map(
+        &state.pdev,
+        skb,
+        &mut linear_handle,
+        &mut linear_len,
+    )
+    .is_err()
+    {
         ub::skb_free_error(skb);
         return NETDEV_TX_OK;
     }
 
-    // Map DMA; on failure, free + drop.
-    let mut dma_handle: bindings::dma_addr_t = 0;
-    let mut len: usize = 0;
-    if ub::skb_dma_map_tx(&state.pdev, skb, &mut dma_handle, &mut len).is_err() {
-        ub::skb_free_error(skb);
-        return NETDEV_TX_OK;
-    }
-    if len > regs::RX_MAX_SIZE_DEFAULT as usize {
-        ub::skb_dma_unmap_tx(&state.pdev, dma_handle, len);
-        ub::skb_free_error(skb);
-        return NETDEV_TX_OK;
+    // ── Map each paged fragment + write its descriptor ──────────────────
+    // Fragments get OWN set up-front so the chip can walk them as soon as
+    // it sees OWN on slot[0] (which we write LAST below). On failure mid-
+    // way, walk back through already-mapped slots to unmap, then free.
+    for i in 0..nr_frags {
+        let mut h: bindings::dma_addr_t = 0;
+        let mut l: u32 = 0;
+        if ub::skb_frag_dma_map(&state.pdev, skb, i as u32, &mut h, &mut l).is_err() {
+            // Unwind: unmap linear + the (i) frags we already mapped.
+            ub::skb_dma_unmap_tx(&state.pdev, linear_handle, linear_len as usize);
+            for j in 0..i {
+                let prev_slot = (head.wrapping_add(1 + j)) % RING_LEN;
+                let pa = state.tx_shadow_dma[prev_slot].load(Ordering::Acquire);
+                let pl = state.tx_shadow_len[prev_slot].load(Ordering::Acquire);
+                ub::skb_dma_unmap_frag_tx(&state.pdev, pa, pl as usize);
+                state.tx_shadow_len[prev_slot].store(0, Ordering::Release);
+                state.tx_shadow_is_frag[prev_slot].store(false, Ordering::Release);
+                state.tx_shadow[prev_slot].store(core::ptr::null_mut(), Ordering::Release);
+            }
+            ub::skb_free_error(skb);
+            return NETDEV_TX_OK;
+        }
+        let slot = (head.wrapping_add(1 + i)) % RING_LEN;
+        let is_last_frag = i + 1 == nr_frags;
+        // Per r8169 rtl8169_tx_map AND Realtek vendor rtl8125_xmit_frags:
+        // BOTH opts[0] (TSO GTSEN bits) AND opts[1] (CSUM bits / MSS) get
+        // PROPAGATED to every fragment descriptor — they're not first-
+        // only. The chip walks the chain and aggregates the bits. We
+        // previously zeroed opts2 on frags and that produced a wrong
+        // checksum on the wire (iperf3 cookie corruption).
+        let mut opts1 = regs::DESC_OWN | tso_opts1 | (l & regs::DESC_LEN_MASK);
+        if is_last_frag {
+            opts1 |= regs::DESC_TX_LS;
+        }
+        if slot == RING_LEN - 1 {
+            opts1 |= regs::DESC_EOR;
+        }
+        state.tx_shadow_dma[slot].store(h, Ordering::Release);
+        state.tx_shadow_len[slot].store(l, Ordering::Release);
+        state.tx_shadow_is_frag[slot].store(true, Ordering::Release);
+        // skb pointer lives on the LAST descriptor only; intermediate
+        // fragments stay null so the reaper only consumes the skb once.
+        state.tx_shadow[slot].store(
+            if is_last_frag { skb } else { core::ptr::null_mut() },
+            Ordering::Release,
+        );
+        ub::desc_write(
+            state.tx_desc,
+            slot,
+            Descriptor {
+                opts1,
+                opts2: first_opts2, // CSUM bits / MSS propagate to all frags
+                addr: h,
+            },
+        );
     }
 
-    let slot = head % RING_LEN;
-    let is_last = slot == RING_LEN - 1;
-    let mut opts1 =
-        regs::DESC_OWN | regs::DESC_TX_FS | regs::DESC_TX_LS | (len as u32 & regs::DESC_LEN_MASK);
-    if is_last {
-        opts1 |= regs::DESC_EOR;
+    // ── Write FirstFrag descriptor LAST — this is the commit point ─────
+    // The chip only starts walking after seeing OWN on slot[0]. By writing
+    // it last (and as a Release store via desc_write's volatile), all the
+    // subsequent slots are already populated when the chip picks up the
+    // chain. (x86 TSO; on weak-memory archs an explicit wmb() would go
+    // here — verified empirically not to help TSO under iperf3.)
+    let first_slot = head % RING_LEN;
+    let mut first_opts1 =
+        regs::DESC_OWN | regs::DESC_TX_FS | (linear_len & regs::DESC_LEN_MASK);
+    if n_desc == 1 {
+        first_opts1 |= regs::DESC_TX_LS;
     }
+    if first_slot == RING_LEN - 1 {
+        first_opts1 |= regs::DESC_EOR;
+    }
+    first_opts1 |= tso_opts1;
 
-    // Store skb pointer in the shadow BEFORE flipping OWN — so a reaper
-    // running concurrently sees the slot owned before it sees OWN clear.
-    state.tx_shadow[slot].store(skb, Ordering::Release);
+    state.tx_shadow_dma[first_slot].store(linear_handle, Ordering::Release);
+    state.tx_shadow_len[first_slot].store(linear_len, Ordering::Release);
+    state.tx_shadow_is_frag[first_slot].store(false, Ordering::Release);
+    if n_desc == 1 {
+        // Single-fragment skb — LastFrag is also the FirstFrag.
+        state.tx_shadow[first_slot].store(skb, Ordering::Release);
+    } else {
+        state.tx_shadow[first_slot].store(core::ptr::null_mut(), Ordering::Release);
+    }
     ub::desc_write(
         state.tx_desc,
-        slot,
+        first_slot,
         Descriptor {
-            opts1,
-            opts2,
-            addr: dma_handle,
+            opts1: first_opts1,
+            opts2: first_opts2,
+            addr: linear_handle,
         },
     );
 
-    state.tx_head.inner.store(head.wrapping_add(1), Ordering::Release);
+    state
+        .tx_head
+        .inner
+        .store(head.wrapping_add(n_desc), Ordering::Release);
     state.regs().tx_poll();
 
     NETDEV_TX_OK

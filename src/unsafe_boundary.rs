@@ -148,22 +148,15 @@ extern "C" {
     fn r8125_bridge_tx_disable(ndev: *mut bindings::net_device);
     fn r8125_bridge_carrier_off(ndev: *mut bindings::net_device);
 
-    fn r8125_bridge_skb_dma_map_tx(
-        dev: *mut bindings::device,
-        skb: *mut bindings::sk_buff,
-        out_handle: *mut bindings::dma_addr_t,
-        out_len: *mut usize,
-    ) -> c_int;
     fn r8125_bridge_skb_dma_unmap_tx(
         dev: *mut bindings::device,
         handle: bindings::dma_addr_t,
         len: usize,
     );
-    fn r8125_bridge_skb_complete_tx(
+    fn r8125_bridge_skb_dma_unmap_frag_tx(
         dev: *mut bindings::device,
         handle: bindings::dma_addr_t,
         len: usize,
-        skb: *mut bindings::sk_buff,
     );
     fn r8125_bridge_tx_busy_exception(ndev: *mut bindings::net_device);
     fn r8125_bridge_skb_build_rx(
@@ -181,6 +174,31 @@ extern "C" {
     fn r8125_bridge_skb_tx_csum_opts(skb: *mut bindings::sk_buff) -> u32;
     fn r8125_bridge_skb_rx_csum_set(skb: *mut bindings::sk_buff, desc_opts1: u32);
     fn r8125_bridge_account_rx(ndev: *mut bindings::net_device, bytes: u32);
+
+    // ── Scatter-gather + TSO (M4-perf phase 2, task 49) ─────────────────
+    fn r8125_bridge_skb_nr_frags(skb: *mut bindings::sk_buff) -> u32;
+    fn r8125_bridge_skb_data_dma_map(
+        dev: *mut bindings::device,
+        skb: *mut bindings::sk_buff,
+        out_handle: *mut bindings::dma_addr_t,
+        out_len: *mut u32,
+    ) -> c_int;
+    fn r8125_bridge_skb_frag_dma_map(
+        dev: *mut bindings::device,
+        skb: *mut bindings::sk_buff,
+        frag_idx: u32,
+        out_handle: *mut bindings::dma_addr_t,
+        out_len: *mut u32,
+    ) -> c_int;
+    fn r8125_bridge_skb_tso_setup(
+        skb: *mut bindings::sk_buff,
+        out_opts1: *mut u32,
+        out_opts2: *mut u32,
+    ) -> bool;
+    fn r8125_bridge_skb_consume_tx(
+        ndev: *mut bindings::net_device,
+        skb: *mut bindings::sk_buff,
+    );
 
     // ── PHY plumbing (M4-traffic) ────────────────────────────────────────
     fn r8125_bridge_phy_register(
@@ -383,40 +401,24 @@ pub(crate) fn rx_buf_ptr(
 
 // ── sk_buff helpers — safe wrappers, counters live inside the cshim ──────
 
-pub(crate) fn skb_dma_map_tx(
-    pdev: &kernel::sync::aref::ARef<pci::Device>,
-    skb: *mut bindings::sk_buff,
-    out_handle: &mut bindings::dma_addr_t,
-    out_len: &mut usize,
-) -> Result<()> {
-    // SAFETY: dev comes from pdev (alive via ARef); skb is a kernel-allocated
-    // pointer we just received from ndo_start_xmit; out pointers point at
-    // local stack slots.
-    let dev = bridge_dma_device(pdev);
-    let rc = unsafe { r8125_bridge_skb_dma_map_tx(dev, skb, out_handle as *mut _, out_len as *mut _) };
-    to_result(rc)
-}
-
 pub(crate) fn skb_dma_unmap_tx(
     pdev: &kernel::sync::aref::ARef<pci::Device>,
     handle: bindings::dma_addr_t,
     len: usize,
 ) {
     let dev = bridge_dma_device(pdev);
-    // SAFETY: handle/len came from a prior successful skb_dma_map_tx.
+    // SAFETY: handle/len came from a prior successful skb_data_dma_map.
     unsafe { r8125_bridge_skb_dma_unmap_tx(dev, handle, len) };
 }
 
-pub(crate) fn skb_complete_tx(
+pub(crate) fn skb_dma_unmap_frag_tx(
     pdev: &kernel::sync::aref::ARef<pci::Device>,
     handle: bindings::dma_addr_t,
     len: usize,
-    skb: *mut bindings::sk_buff,
 ) {
     let dev = bridge_dma_device(pdev);
-    // SAFETY: skb was stored by ndo_start_xmit; handle/len from the same
-    // map call. Cshim consumes via napi_consume_skb.
-    unsafe { r8125_bridge_skb_complete_tx(dev, handle, len, skb) };
+    // SAFETY: handle/len came from a prior successful skb_frag_dma_map.
+    unsafe { r8125_bridge_skb_dma_unmap_frag_tx(dev, handle, len) };
 }
 
 pub(crate) fn tx_busy_exception(ndev: *mut bindings::net_device) {
@@ -640,6 +642,99 @@ pub(crate) fn skb_rx_csum_set(skb: *mut bindings::sk_buff, desc_opts1: u32) {
 pub(crate) fn bridge_account_rx(ndev: *mut bindings::net_device, bytes: u32) {
     // SAFETY: see fn-level contract.
     unsafe { r8125_bridge_account_rx(ndev, bytes) };
+}
+
+// ── Scatter-gather + TSO safe wrappers (M4-perf phase 2, task 49) ───────
+
+/// Number of paged fragments in `skb` (0 if linear-only). The Rust TX
+/// path uses this to decide how many descriptors to post.
+///
+/// # SAFETY: `skb` is the kernel-allocated buffer just received from
+/// ndo_start_xmit — alive and driver-owned at this moment.
+pub(crate) fn skb_nr_frags(skb: *mut bindings::sk_buff) -> u32 {
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_skb_nr_frags(skb) }
+}
+
+/// DMA-map the LINEAR head of `skb`. Returns the mapping length on
+/// success or `Err(EIO)` on mapping failure.
+///
+/// # SAFETY: `pdev` is alive (NetdevState holds an ARef); `skb` is
+/// just-received from xmit (driver-owned).
+pub(crate) fn skb_data_dma_map(
+    pdev: &kernel::sync::aref::ARef<pci::Device>,
+    skb: *mut bindings::sk_buff,
+    out_handle: &mut bindings::dma_addr_t,
+    out_len: &mut u32,
+) -> Result<()> {
+    let dev = bridge_dma_device(pdev);
+    // SAFETY: see fn-level contract.
+    let rc = unsafe {
+        r8125_bridge_skb_data_dma_map(dev, skb, out_handle as *mut _, out_len as *mut _)
+    };
+    to_result(rc)
+}
+
+/// DMA-map paged fragment `frag_idx` (0..nr_frags-1) of `skb`.
+///
+/// # SAFETY: as `skb_data_dma_map`. `frag_idx` must be < `nr_frags`
+/// — the C side validates and returns -EINVAL otherwise.
+pub(crate) fn skb_frag_dma_map(
+    pdev: &kernel::sync::aref::ARef<pci::Device>,
+    skb: *mut bindings::sk_buff,
+    frag_idx: u32,
+    out_handle: &mut bindings::dma_addr_t,
+    out_len: &mut u32,
+) -> Result<()> {
+    let dev = bridge_dma_device(pdev);
+    // SAFETY: see fn-level contract.
+    let rc = unsafe {
+        r8125_bridge_skb_frag_dma_map(
+            dev,
+            skb,
+            frag_idx,
+            out_handle as *mut _,
+            out_len as *mut _,
+        )
+    };
+    to_result(rc)
+}
+
+/// Consume a TX-completed skb. Bumps netdev stats from `skb->len` and
+/// hands the skb to NAPI for recycling. Does NOT unmap DMA — the caller
+/// already did per-descriptor unmap in the SG-aware reaper loop.
+///
+/// # SAFETY: `ndev` is the registered net_device (alive while
+/// NetdevHandle lives); `skb` was just removed from `tx_shadow` and is
+/// driver-owned exclusively at this point.
+pub(crate) fn skb_consume_tx(
+    ndev: *mut bindings::net_device,
+    skb: *mut bindings::sk_buff,
+) {
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_skb_consume_tx(ndev, skb) };
+}
+
+/// TSO descriptor-bit setup. Returns `Some((opts1_bits, opts2_bits))`
+/// if the skb is a TCPv4/v6 GSO super-skb, `None` otherwise (caller
+/// uses plain CSUM bits instead).
+///
+/// # SAFETY: `skb` is the kernel-allocated buffer just received from
+/// ndo_start_xmit. The C side may mutate `skb` (calls `skb_cow_head`
+/// + `tcp_v6_gso_csum_prep` for IPv6 TSO), but only on skbs the driver
+/// owns exclusively.
+pub(crate) fn skb_tso_setup(skb: *mut bindings::sk_buff) -> Option<(u32, u32)> {
+    let mut opts1 = 0u32;
+    let mut opts2 = 0u32;
+    // SAFETY: see fn-level contract.
+    let active = unsafe {
+        r8125_bridge_skb_tso_setup(skb, &mut opts1 as *mut _, &mut opts2 as *mut _)
+    };
+    if active {
+        Some((opts1, opts2))
+    } else {
+        None
+    }
 }
 
 // ── PHY plumbing safe wrappers (M4-traffic) ──────────────────────────────
