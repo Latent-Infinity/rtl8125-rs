@@ -151,6 +151,18 @@ impl<'a> Regs<'a> {
         self.bar.read8(0x6C)
     }
 
+    // ── Cfg9346 (8-bit at 0x50) — unlock the config registers ──────────
+
+    /// Unlock Config1/2/5 (Cfg9346 = 0xC0). Must be balanced with `lock_config_regs`.
+    pub(crate) fn unlock_config_regs(&self) {
+        self.bar.write8(regs::CFG9346_UNLOCK, regs::CFG9346);
+    }
+
+    /// Re-lock Config1/2/5 (Cfg9346 = 0x00).
+    pub(crate) fn lock_config_regs(&self) {
+        self.bar.write8(regs::CFG9346_LOCK, regs::CFG9346);
+    }
+
     // ── Config1 (8-bit at 0x52) ─────────────────────────────────────────
 
     pub(crate) fn config1(&self) -> u8 {
@@ -159,6 +171,38 @@ impl<'a> Regs<'a> {
 
     pub(crate) fn set_config1(&self, value: u8) {
         self.bar.write8(value, regs::CONFIG1);
+    }
+
+    // ── Config3 (8-bit at 0x54) — L2/L3 readiness ───────────────────────
+
+    pub(crate) fn config3(&self) -> u8 {
+        self.bar.read8(regs::CONFIG3)
+    }
+
+    pub(crate) fn set_config3(&self, value: u8) {
+        self.bar.write8(value, regs::CONFIG3);
+    }
+
+    // ── Config5 (8-bit at 0x56) — ASPM enable ───────────────────────────
+
+    pub(crate) fn config5(&self) -> u8 {
+        self.bar.read8(regs::CONFIG5)
+    }
+
+    pub(crate) fn set_config5(&self, value: u8) {
+        self.bar.write8(value, regs::CONFIG5);
+    }
+
+    // ── 8125 multi-queue / RSS disable (M4-perf phase 2 / TSO) ─────────
+
+    /// `RSS_CTRL_8125` (32-bit at 0x4500). Write 0 to disable.
+    pub(crate) fn set_rss_ctrl_8125(&self, value: u32) {
+        self.bar.write32(value, regs::RSS_CTRL_8125);
+    }
+
+    /// `Q_NUM_CTRL_8125` (16-bit at 0x4800). Write 0 = single queue.
+    pub(crate) fn set_q_num_ctrl_8125(&self, value: u16) {
+        self.bar.write16(value, regs::Q_NUM_CTRL_8125);
     }
 
     // ── Generic small-region accessors used by hw_start_8125b ───────────

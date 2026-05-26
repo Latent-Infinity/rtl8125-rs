@@ -91,16 +91,52 @@ fn wait_mac_ocp_e00e_clear(regs: &Regs<'_>) -> Result<()> {
 /// (RTL8125B). This is the minimum MAC OCP / MMIO init sequence required
 /// for the 8125B's TX and RX engines to actually move packets — without
 /// it, ChipCmd RX|TX enable appears to take effect but the engines are
-/// silent. We deliberately skip the optional pieces (RSS, PCIe state
-/// transitions, ASPM clkreq tuning) — those become M5 work.
+/// silent. The M4-perf follow-up also carries r8169's single-queue and
+/// PCIe power-state setup so the chip is in the same baseline state before
+/// SG/TSO experiments.
 ///
 /// Sequence in source-of-truth order so cross-referencing with r8169 is
 /// trivial. Every line is a direct port from r8169_main.c
 /// `rtl_hw_start_8125_common` (line ~3855) with VER_63-specific branches.
 pub(crate) fn hw_start_8125b(regs: &Regs<'_>) -> Result<()> {
+    // Unlock Config1/2/3/5 (Cfg9346 = 0xC0). r8169 wraps the whole hw_start
+    // sequence in unlock/lock so writes to PM/ASPM/EEE registers stick.
+    // Without this, Config* writes silently no-op and the chip's PCIe link
+    // can drop into L1/L2 between TX bursts.
+    regs.unlock_config_regs();
+    let result = hw_start_8125b_unlocked(regs);
+    regs.lock_config_regs();
+    result
+}
+
+fn hw_start_8125b_unlocked(regs: &Regs<'_>) -> Result<()> {
+    // rtl_pcie_state_l2l3_disable: clear Config3 Rdy_to_L23 bit.
+    // r8169 calls this first in `rtl_hw_start_8125_common`. Workaround
+    // for PCI reset behavior in L2/L3 power states.
+    let cfg3 = regs.config3();
+    regs.set_config3(cfg3 & !regs::CONFIG3_RDY_TO_L23);
+
+    // r8169 anonymous tuning write at top of rtl_hw_start_8125_common.
+    regs.write_u16_at(regs::MMIO_0X382, regs::MMIO_0X382_VAL);
+
+    // r8169 disables multi-queue RSS for 8125B — our descriptor ring
+    // only programs TNPDS for queue 0, so other queues would have
+    // garbage state. Disable to keep traffic on queue 0.
+    regs.set_rss_ctrl_8125(0);
+    regs.set_q_num_ctrl_8125(0);
+
     // Config1 (8-bit at 0x52): clear bit 4 — "PM enable" override per r8169.
     let cfg1 = regs.config1();
     regs.set_config1(cfg1 & !0x10);
+
+    // M4-perf phase 2 / TSO: disable ASPM in Config5 (clear ASPM_en bit 0).
+    // r8169 `rtl_hw_aspm_clkreq_enable(false)` clears this before TX bring-
+    // up so the PCIe link doesn't enter L1 during transmit bursts. Pair
+    // with the L1-exit-trigger OCP write below — together they keep the
+    // chip's TX FIFO and PCIe link awake when TSO is generating MSS-
+    // sized segments at line rate.
+    let cfg5 = regs.config5();
+    regs.set_config5(cfg5 & !regs::CONFIG5_ASPM_EN);
 
     // r8168_mac_ocp_modify(0xd40a, 0x0010, 0x0000) — disable UPS
     regs.mac_ocp_modify(0xD40A, 0x0010, 0x0000);
@@ -159,6 +195,17 @@ pub(crate) fn hw_start_8125b(regs: &Regs<'_>) -> Result<()> {
     // (RXCFG_8125B_CHIP_BITS) is already folded into RCR_M4_BASELINE
     // and written via `set_rcr` at ndo_open time.
     regs.set_tx_config(regs::TXCFG_M4_BASELINE);
+
+    // r8169 `rtl_enable_exit_l1` for VER_40..LAST: set OCP 0xC0AC bits
+    // 7-12 (txpla, pktavi, xadm, txdma_poll, ltr_msg, rxdv). This keeps
+    // our power-state setup aligned with r8169; TSO remains disabled
+    // because the 2026-05-26 debug pass showed these writes alone do not
+    // eliminate the retransmit issue.
+    regs.mac_ocp_modify(
+        regs::MAC_OCP_L1_EXIT_TRIGGERS,
+        0,
+        regs::MAC_OCP_L1_EXIT_TRIGGERS_MASK,
+    );
 
     Ok(())
 }

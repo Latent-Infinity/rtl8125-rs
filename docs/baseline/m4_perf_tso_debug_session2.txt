@@ -1,0 +1,121 @@
+M4-perf phase 2 TSO debug session #2 (2026-05-26)
+====================================================
+
+Followup to `m4_perf_tso_debug_session.txt` (2026-05-25). The first
+session ruled out memory ordering, queue overflow, and host RX errors
+but didn't isolate the ~5-7% TSO retransmit rate. This session ported
+all remaining chip-init register writes from r8169's
+`rtl_hw_start_8125_common` and `rtl_hw_aspm_clkreq_enable(false)`.
+
+## Init writes added this session
+
+All in `src/hw.rs::hw_start_8125b` (wrapped in `unlock_config_regs` /
+`lock_config_regs` per r8169 convention):
+
+1. **`Cfg9346` unlock/lock** (`src/regs.rs::CFG9346 / CFG9346_UNLOCK /
+   CFG9346_LOCK`): wrap the whole `hw_start_8125b` body so Config1/3/5
+   writes actually stick. Previously those writes silently no-op'd.
+
+2. **`Config3` Rdy_to_L23 clear** (bit 1): r8169
+   `rtl_pcie_state_l2l3_disable` workaround for "PCI reset during L2/L3
+   state".
+
+3. **`Config5` ASPM_en clear** (bit 0): r8169
+   `rtl_hw_aspm_clkreq_enable(false)` — keeps the PCIe link out of L1
+   during TX bursts.
+
+4. **MMIO 0x382 = 0x221b**: r8169 anonymous-tuning write at the top of
+   `rtl_hw_start_8125_common`.
+
+5. **`RSS_CTRL_8125 = 0` (0x4500)**: disable multi-queue RSS so all RX
+   lands on queue 0 (our single-queue setup).
+
+6. **`Q_NUM_CTRL_8125 = 0` (0x4800)**: explicit single-queue mode.
+
+7. **OCP `0xC0AC` `|= 0x1F80`**: r8169 `rtl_enable_exit_l1` for
+   VER_40..LAST — enables L1-exit triggers (txpla, pktavi, xadm,
+   txdma_poll, ltr_msg, rxdv). The chip wakes the PCIe link out of L1
+   when any of those events fires.
+
+## Result
+
+**TSO ADVERTISEMENT WITH ALL THESE: still fails.** iperf3 sustains
+~600-800 Mbps with ~5-7% retransmit rate when TSO is on — same envelope
+as before the chip-init additions. SG+CSUM (TSO off) hit 946 Mbps with
+0 retransmits, confirming no regression.
+
+## Things tried that did NOT help
+
+- **Memory fence between fragment writes and FirstFrag commit**:
+  `core::sync::atomic::fence(Ordering::Release)` between the loop and
+  the FirstFrag descriptor write in `ndo_start_xmit`. No change.
+
+- **Field-by-field descriptor writes (`desc_write_tx`)**: Mirroring
+  Realtek vendor's explicit ordering `addr → opts2 → wmb → opts1`.
+  This actually BROKE SG+CSUM that previously worked. Reverted —
+  whole-struct `write_volatile` on x86 is correct for this chip.
+
+- **All chip-init writes above**: ASPM disable, L1-exit triggers,
+  L2/L3 disable, RSS/QNum disable, MMIO 0x382 tuning. None moved
+  the TSO retransmit needle.
+
+## Vendor self-acknowledged TSO issues
+
+`references/realtek-r8125-official/src/r8125_n.c:17453-17454` carries
+this comment in a feature-gating switch:
+
+> "There has been a number of reports that using SG/TSO results in
+>  tx timeouts. However for a lot of people SG/TSO works fine."
+
+So even Realtek's own vendor driver flags SG/TSO as finicky on some
+configurations. Our setup may be one of those.
+
+## Hypotheses NOT yet tested
+
+1. **PCIe EPHY init** (`rtl_ephy_init(tp, e_info_8125b)` in
+   `rtl_hw_start_8125b`). Six writes through EPHYAR (0x80) tuning the
+   PCIe SERDES signal integrity. Could affect TSO segment integrity
+   on the wire — but our captured frames show correct CSUMs and seq
+   numbers, so this seems unlikely.
+
+2. **`rtl_set_def_aspm_entry_latency`**: ASPM latency tuning via PCI
+   config space. Kernel-Rust `pci::Device::config_space` has limited
+   write support; deferred to cshim.
+
+3. **`EnableTxNoClose` (vendor only)**: Realtek vendor uses a TDPTR
+   doorbell mechanism instead of the legacy NPQ bit. Maybe required
+   for TSO to land cleanly at line rate. Significant rewrite of the
+   TX doorbell path.
+
+4. **`bytecount` for BQL**: r8169 calls
+   `netif_tx_sent_queue(bytecount = skb->len + (gso_segs - 1) *
+   hdr_len)` to feed the kernel's BQL. Without it, the kernel may
+   queue TSO super-skbs faster than the chip can absorb. M5 work.
+
+5. **PHY-side rtl8125b_hw_phy_config**: ~50 PHY OCP writes that the
+   dedicated Realtek PHY driver does. Verify the dedicated driver
+   actually probed successfully (we previously confirmed it did via
+   the "PHY attached: Realtek Internal NBASE-T PHY" log).
+
+## State (committed-ready)
+
+- `ndev->hw_features = NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
+  NETIF_F_RXCSUM | NETIF_F_SG`. TSO flag off.
+- All new chip-init writes are in tree and benefit SG+CSUM too
+  (no regression — 946 Mbps single-stream g→h, 0 retransmits).
+- TSO code path (`r8125_bridge_skb_tso_setup` + `tso_opts1`
+  propagation in `ndo_start_xmit`) remains in tree, dormant.
+- To re-enable TSO for next debug session: uncomment the
+  `NETIF_F_TSO | NETIF_F_TSO6` lines + `netif_set_tso_max_*`
+  calls in `r8125_bridge_alloc`.
+
+## Recommended next attempt
+
+The remaining most-likely cause is the PCIe EPHY init. If that
+doesn't help, the TxNoClose TDPTR doorbell mechanism is the next
+substantial port. Beyond that, this may require Realtek-specific
+documentation we don't have. Suggest holding TSO at the SG+CSUM
+baseline (946 Mbps) and prioritizing M5 polish items (per-CPU
+counter sharding, Clippy gates, §6.3 counter invariant CI check)
+which deliver real ergonomic improvements without the TSO rabbit
+hole.

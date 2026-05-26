@@ -376,7 +376,13 @@ pub(crate) fn desc_read(ring: *mut Descriptor, idx: usize) -> Descriptor {
     unsafe { core::ptr::read_volatile(ring.add(idx)) }
 }
 
-/// Write one hardware descriptor at `ring[idx]` (volatile).
+/// Write one hardware descriptor at `ring[idx]` (volatile, whole-struct).
+/// Empirically verified to work for both RX descriptors and TX descriptors
+/// (including SG fragment chains). The 2026-05-26 TSO debug session tried
+/// field-by-field writes with `addr → opts2 → fence → opts1` ordering
+/// (mirroring Realtek vendor `rtl8125_xmit_frags`'s explicit `wmb()`) and
+/// it regressed the previously working SG+CSUM path. The whole-struct
+/// `write_volatile` on x86 commits the descriptor in a way the chip accepts.
 pub(crate) fn desc_write(ring: *mut Descriptor, idx: usize, value: Descriptor) {
     // SAFETY: as `desc_read`. The volatile pairs with the device's MMIO
     // read of the descriptor after we kick TX (or after hardware re-reads

@@ -17,6 +17,12 @@ echo
 echo "== checksum/stat offload path =="
 bash "$CI/check_offload_path.sh" || rc=1
 echo
+echo "== build wrapper / BTF path =="
+bash "$CI/check_build_makefile.sh" || rc=1
+echo
+echo "== RTL8125B hardware init parity =="
+bash "$CI/check_hw_init.sh" || rc=1
+echo
 echo "== deferred to guest CI (need validated kernel toolchain — §15 #3/#4/#5) =="
 cat <<'EOF'
   - make CLIPPY=1            (kernel-build Clippy; NOT cargo clippy — plan §6.1/§11)

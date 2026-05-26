@@ -81,10 +81,63 @@ pub(crate) const INT_CFG1: usize = 0x7A;
 pub(crate) const COALESCE_TABLE_8125B_START: usize = 0xA00;
 pub(crate) const COALESCE_TABLE_8125B_END: usize = 0xA80;
 
+// ── Configuration-register lock (Cfg9346 at 0x50, 8-bit) ────────────────
+//
+// r8169 unlocks the config registers (Config1/Config2/Config5 at 0x52/0x53/
+// 0x56) at the top of `rtl_hw_start` and re-locks at the end. Without the
+// unlock, writes to those registers — including the ASPM disable in
+// Config5 and Config1 PM-bit clear — silently no-op. M4-perf phase 2
+// found that this missing unlock contributes to TSO segment loss because
+// ASPM stays enabled and the PCIe link enters L1 power-save between
+// super-skb bursts.
+pub(crate) const CFG9346: usize = 0x50;
+pub(crate) const CFG9346_LOCK: u8 = 0x00;
+pub(crate) const CFG9346_UNLOCK: u8 = 0xC0;
+
 // ── Config1 (8-bit at 0x52) ──────────────────────────────────────────────
 /// Various per-board PM / wake / LED config. r8169 clears bit 4 in
 /// rtl_hw_start_8125_common as part of "disable UPS".
 pub(crate) const CONFIG1: usize = 0x52;
+
+// ── Config3 (8-bit at 0x54) — L2/L3 readiness ────────────────────────────
+/// r8169 `rtl_pcie_state_l2l3_disable` clears `Rdy_to_L23 (BIT(1))` in
+/// Config3 as a workaround "when PCI reset occurs during L2/L3 state".
+/// Required by all 8125 hw_start paths.
+pub(crate) const CONFIG3: usize = 0x54;
+pub(crate) const CONFIG3_RDY_TO_L23: u8 = 0x02;
+
+// ── Config5 (8-bit at 0x56) — ASPM enable bit ────────────────────────────
+/// r8169 `rtl_hw_aspm_clkreq_enable(false)` clears `ASPM_en (BIT(0))` in
+/// Config5 before TX bring-up so the PCIe link doesn't enter L1 during
+/// transmit bursts. Must be done while Cfg9346 is unlocked.
+pub(crate) const CONFIG5: usize = 0x56;
+pub(crate) const CONFIG5_ASPM_EN: u8 = 0x01;
+
+// ── RSS + per-queue config (8125-only, 32-bit / 16-bit) ──────────────────
+/// `RSS_CTRL_8125` (0x4500, 32-bit) — multi-queue receive-side-scaling.
+/// r8169 writes 0 to fully disable RSS so all RX lands on queue 0 (our
+/// single-queue setup). Default chip state may have RSS partially
+/// enabled, sending segments to non-existent queues.
+pub(crate) const RSS_CTRL_8125: usize = 0x4500;
+/// `Q_NUM_CTRL_8125` (0x4800, 16-bit) — number of TX/RX queues. r8169
+/// writes 0 (single queue). Without this, the chip may try to use
+/// multiple TX queues despite us only programming queue 0's TNPDS.
+pub(crate) const Q_NUM_CTRL_8125: usize = 0x4800;
+/// Anonymous tuning register at 0x382 (16-bit) — r8169 writes 0x221b at
+/// the top of `rtl_hw_start_8125_common`. Function unclear from the
+/// source comment; included for parity.
+pub(crate) const MMIO_0X382: usize = 0x0382;
+pub(crate) const MMIO_0X382_VAL: u16 = 0x221b;
+
+// ── L1-exit triggers (OCP 0xC0AC) ────────────────────────────────────────
+/// r8169 `rtl_enable_exit_l1` for MAC_VER_40..LAST writes
+/// `r8168_mac_ocp_modify(0xc0ac, 0, 0x1f80)` — enables bits 7-12 (txpla,
+/// pktavi, xadm, txdma_poll, ltr_msg, rxdv) so the chip wakes the PCIe
+/// link out of L1 when any of those events fires. Kept for r8169 parity;
+/// TSO remains disabled because this write alone did not resolve the TSO
+/// retransmit issue in the 2026-05-26 debug pass.
+pub(crate) const MAC_OCP_L1_EXIT_TRIGGERS: u32 = 0xC0AC;
+pub(crate) const MAC_OCP_L1_EXIT_TRIGGERS_MASK: u16 = 0x1F80;
 
 // ── MAC OCP — internal MAC register-set access (8125 family) ─────────────
 //
