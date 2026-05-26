@@ -1,89 +1,157 @@
-# rtl8125-rs — AI-assisted Rust driver for the Realtek RTL8125 (2.5 GbE)
+# rtl8125-rs
 
-**Status: M4-full development — M1/M2/M3/M4-skeleton are complete, M0b physical-link baseline is captured, and peer-driven M4-full packet-path work is active.** See [`docs/SESSION_RESUME.md`](docs/SESSION_RESUME.md) and [`src/README.md`](src/README.md) for the current handoff.
+Experimental Rust-for-Linux driver for Realtek RTL8125 2.5 GbE network
+controllers.
 
-License: **GPL-2.0** (matches the Linux kernel — see `LICENSE`).
+This repository is an out-of-tree Linux kernel module. It explores how much of
+an RTL8125 driver can live in Rust today while still using small C bridge code
+for kernel networking APIs that are not yet exposed through stable Rust
+abstractions.
 
-This repository implements the engineering plan in
-[`docs/RTL8125_Rust_Driver_Implementation_Plan.md`](docs/RTL8125_Rust_Driver_Implementation_Plan.md)
-(v3.4). Read that document first; it is authoritative. This README only states
-what a reader must know before touching anything.
+License: GPL-2.0. See `LICENSE`.
 
-## What this is, stated honestly (plan §5.3)
+## Scope
 
-This is **not** a "fully safe Rust driver". It is a layered prototype:
+`rtl8125-rs` targets Realtek RTL8125-class PCIe Ethernet controllers, with the
+current validation work focused on RTL8125B hardware.
 
-- A Rust core (`src/`) that owns PCI probe through descriptor-ring ownership,
-  gated behind `#![deny(unsafe_code)]` at the crate root, with exactly one
-  module — `src/unsafe_boundary.rs` — permitted to locally `#![allow(unsafe_code)]`
-  (enforced by `.unsafe-allowlist` + CI).
-- Small, audited C shim files (`src/netdev_bridge*.{c,h}`; primary
-  `netdev_bridge.c` target < 400 LOC) bridging
-  the Rust core to `net_device` / NAPI / `sk_buff` **until** the upstream Rust
-  netdev abstractions stabilize. The shim's value is the documented `sk_buff`
-  ownership contract (plan §6.3), not its source.
+The driver includes:
 
-The C shim is disclosed here, in code comments, and in any future RFC.
-Misrepresenting the safety guarantee is worse than acknowledging the shim.
+- Rust PCI probe, device state, register access wrappers, DMA/ring ownership,
+  TX/RX paths, NAPI polling, PHY setup, checksum offload, scatter-gather, and
+  TSO support.
+- A small C bridge for `net_device`, NAPI, `sk_buff`, PHY/MDIO, ethtool stats,
+  and other kernel networking interfaces that Rust-for-Linux does not yet
+  expose directly.
+- Static CI scripts that enforce the unsafe boundary, C bridge ownership
+  contracts, counter accounting, cache-padding conventions, Clippy cleanliness,
+  and NAPI queue/IRQ invariants.
+- Hardware-oriented validation harnesses for counter invariants, packet
+  mutation, module unload under traffic, FLR cycles, ASPM idle soak, active
+  traffic soak, and syzkaller control-plane fuzzing.
 
-## Build model (plan §6.1 — read before you `cargo` anything)
+This is not production driver software. Treat it as a research and engineering
+prototype for Rust kernel-driver development on RTL8125 hardware.
 
-There is **no `Cargo.toml`, no `rust-toolchain.toml`, no `cargo build`** in the
-critical path. This is an out-of-tree kernel Rust module:
+## Safety Model
 
-- Built via the kernel build system: `make -C $KDIR M=$PWD`.
-- Lints via `make CLIPPY=1` — **not** `cargo clippy`.
-- `rust-project.json` is *generated* for rust-analyzer; it is not a source of truth.
-- **Toolchain authority is the kernel tree, not this project.** The accepted
-  `rustc` / LLVM / `bindgen` versions are whatever
-  `make LLVM=1 rustavailable` against the selected kernel tree accepts.
-  (On the current dev box this is rustc **1.93.1** / LLVM **21**, even though
-  userspace `cargo` is 1.95.0 — see `docs/VALIDATION_REPORT.md`.)
+The Rust crate root denies unsafe code. Unsafe operations are concentrated in
+`src/unsafe_boundary.rs`, which is the only Rust source file allowed to opt into
+`unsafe_code`; this is enforced by `.unsafe-allowlist` and CI.
 
-## Repository layout
+The C bridge is intentional and part of the safety model. It provides a narrow,
+audited boundary around kernel networking objects that Rust currently cannot
+represent directly, especially `struct net_device`, `struct napi_struct`, and
+`struct sk_buff`. The ownership contract for that bridge is documented in
+`src/netdev_bridge.h`.
+
+The project does not claim to be a fully safe Rust driver. The goal is to keep
+unsafe code and C interop explicit, reviewable, and mechanically checked.
+
+## Build
+
+This project does not use Cargo.
+
+Build it through Kbuild from the repository root:
+
+```sh
+make
+```
+
+Clean generated module artifacts:
+
+```sh
+make clean
+```
+
+Run the kernel Clippy path:
+
+```sh
+make CLIPPY=1
+```
+
+The selected kernel tree is the toolchain authority. On the current validation
+setup, the Makefile defaults to:
+
+- `RUSTC=rustc-1.93`
+- `BINDGEN=bindgen`
+- `CLIPPY_DRIVER=/usr/lib/rust-1.93/bin/clippy-driver`
+
+Do not use `cargo build` or `cargo clippy`; there is no `Cargo.toml`, and Cargo
+cannot build this kernel module.
+
+## Quality Gates
+
+Run the local static and build checks with:
+
+```sh
+bash ci/run_checks.sh
+```
+
+The CI scripts check, among other things:
+
+- the unsafe allowlist and non-increasing unsafe census
+- raw MMIO containment
+- C bridge lifecycle and ownership invariants
+- checksum, scatter-gather, and TSO path structure
+- BTF build wiring
+- RTL8125B initialization parity checks
+- per-CPU disposition counter infrastructure
+- cache-padding conventions for cross-context atomics
+- NAPI budget, IRQ masking, and TX queue hysteresis
+- kernel-build Clippy warnings
+
+Hardware-required tests live in `ci/` as runnable harnesses but are not part of
+the default static check set because they require the validated RTL8125 test
+host or guest.
+
+## Repository Layout
 
 | Path | Purpose |
 |---|---|
-| `docs/RTL8125_Rust_Driver_Implementation_Plan.md` | The authoritative plan (v3.4) |
-| `docs/VALIDATION_REPORT.md` | Plan claims vs. observed reality on the dev box |
-| `docs/M1_ENTRY_CRITERIA.md` | The §15 checklist gating M1; M1 is blocked until all pass |
-| `docs/M0a_TO_M1_RUNBOOK.md` | **Step-by-step operator runbook** to clear every M1 gate (start here to get unblocked) |
-| `docs/RTL8125B_TSO_NOTES.md` | TSO investigation log: why TSO advertisement is off today, what's been tried across three debug sessions, untried hypotheses ranked for the next attempt |
-| `docs/baseline/` | M0a pre-link fact-discovery artifacts; M0b physical-link baseline (plan §7 M0a/M0b) |
-| `docs/perf/` | M6 before/after performance numbers (plan §7 M6) |
-| `src/` | Rust core plus the co-located C bridge required by kbuild's composite-module layout |
-| `cshim/` | C bridge rationale; source lives in `src/netdev_bridge*.{c,h}` |
-| `tools/` | `fetch_references.sh`, `bind_vfio.sh`, `unbind_vfio.sh`, `capture_m0_baseline.sh` |
-| `ci/` | Mechanical-enforcement checks (plan §9.4) |
-| `references/` | **Gitignored.** GPL reference sources, fetched not copied (plan §9.3) |
+| `src/` | Rust driver core plus C bridge files used by the composite Kbuild module |
+| `src/netdev_bridge.h` | Canonical C bridge ownership and `sk_buff` contract |
+| `src/unsafe_boundary.rs` | The single Rust unsafe boundary module |
+| `ci/` | Static checks and hardware validation harnesses |
+| `docs/` | Design notes, standards, validation reports, and milestone close-out docs |
+| `docs/RUST_STANDARDS.md` | Project-specific Rust quality and performance rubric |
+| `docs/RTL8125_Rust_Driver_Implementation_Plan.md` | Original implementation plan |
+| `docs/baseline/` | Captured validation artifacts and performance baselines |
+| `tools/` | Reference-fetching and VFIO helper scripts |
+| `references/` | Gitignored reference checkouts; fetched locally, not vendored |
 
-## References are read, never copied (plan §9.3)
+## References and Provenance
 
-`references/` is **gitignored**. Run `tools/fetch_references.sh` to populate it
-with pinned upstream checkouts of `r8169`, the Realtek out-of-tree `r8125`, the
-`ewaldc` rewrite, the Rust-for-Linux tree, and the Ubuntu kernel source. These
-are **reference material for understanding only**. Concepts are paraphrased and
-re-implemented from datasheet/behavior primaries; GPL source is not copied. See
-`references/PROVENANCE.md`.
+Reference source trees are fetched into `references/`, which is intentionally
+gitignored. Use:
 
-## AI agent policy (plan §9.2 — non-negotiable)
+```sh
+tools/fetch_references.sh
+```
 
-Agents accelerate this project; they do not author it. An AI agent never adds
-`Signed-off-by:`. The human submitter holds full DCO responsibility. An optional
-`Assisted-by:` trailer follows the kernel's documented format and never stands
-alone. CI enforces this.
+Those trees are for reading and comparison only. They are not vendored into this
+repository. See `references/PROVENANCE.md` after fetching.
 
-## Hardware target
+## Hardware Notes
 
-Realtek RTL8125 2.5 GbE — resolved as **RTL8125B, XID `0x641`, rev `0x05`, fw
-`rtl8125b-2_0.0.2`** (plan §3.1 / §16 Q1). On the development host (Minisforum
-MS-A2) the device is at PCI **`0000:03:00.0`** `[10ec:8125]`, alone in IOMMU
-group 18 (isolation-safe). The plan's `07:00.0` is illustrative only; the real
-address is wired into `tools/bind_vfio.sh` / `unbind_vfio.sh`.
+The current validation target is RTL8125B, observed as XID `0x641`, PCI device
+ID `[10ec:8125]`, revision `0x05`.
 
-A faulty driver is contained in a VFIO-isolated guest. The intended host
-lifeline is the Intel I226-V — **but on this unit that is not yet realized**:
-host management is currently on Wi-Fi, the I226-V is down, and the box runs
-Kubernetes. Before any destructive M0b step the operator MUST pin host
-management to the I226-V and isolate the RTL8125 test segment from the
-Kubernetes/host L2 domain (plan §1.2 / §8.1).
+Validation has been done in a VFIO-isolated guest on a debug kernel with Rust
+support and kernel debugging options enabled. Hardware-specific paths,
+especially PHY, ASPM, FLR, and traffic soak tests, should be rerun on any new
+platform before treating results as representative.
+
+## Development Notes
+
+- Keep hot paths allocation-free and statically dispatched.
+- Keep `napi::poll`, `netdev::ndo_start_xmit`, and IRQ handling aligned with
+  `docs/RUST_STANDARDS.md`.
+- Keep new unsafe Rust inside `src/unsafe_boundary.rs` unless the allowlist and
+  safety model are deliberately updated.
+- Update CI checks when adding a new invariant that can be enforced
+  mechanically.
+- Do not commit generated module artifacts or fetched reference sources.
+
+Milestone status and historical validation notes belong in `docs/`, not in this
+README.

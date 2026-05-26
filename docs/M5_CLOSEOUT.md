@@ -106,18 +106,35 @@ The driver is at upstream r8169 parity for single-stream throughput.
 These items have **all runnable code + harnesses** in tree; they need
 wall-clock chip time:
 
-1. **24-hour active soak** (`SOAK_HOURS=24 ci/check_active_soak.sh`)
+1. **48-hour chained ASPM idle soak** — STARTED 2026-05-26 05:46:47 UTC
+   as systemd transient unit `r8125-aspm-both.service`. Runs two 24h
+   phases back-to-back:
+   - Phase 1: `force_aspm=0` (production default) — validates 24h
+     idle without ASPM L1.x entries
+   - Phase 2: `force_aspm=1` (test-only) — validates the historical
+     L1.x lockup gate with ASPM L1 forcibly enabled via module param
+
+   Estimated completion: **2026-05-28 ~06:00 UTC** (48 hours from
+   start). Check progress with:
+   ```
+   ssh -i ~/.ssh/agent/rtl8125_guest_codex operator@192.168.122.174 \
+       'sudo systemctl status r8125-aspm-both --no-pager; tail -20 /tmp/r8125_aspm_both.log'
+   ```
+   The script aborts phase 2 if phase 1 fails. Exit code captured in
+   the systemd unit's `ExecMainStatus`.
+
+2. **24-hour active soak** (`SOAK_HOURS=24 ci/check_active_soak.sh`)
    — sustained 100 Mbps mixed traffic with all kernel-debug knobs
    armed. Pass: zero KASAN/lockdep/kmemleak/DMA-API warnings.
-
-2. **24-hour ASPM idle soak** (`SOAK_HOURS=24 ci/check_aspm_idle_soak.sh`)
-   — the historical L1.x lockup gate. Pass: chip transmits a packet
-   after 24h idle. Sample dmesg every 5 min for early indicators.
+   Run after the ASPM chain completes (mutually exclusive with idle).
 
 3. **10× FLR cycles** (`CYCLES=10 ci/check_flr_cycle.sh`) — closest
    suspend/resume proxy available without kernel-Rust PCI PM (see
-   `docs/M5_PM_GAP.md`). Pass: 10/10 successful re-probes with
-   post-cycle ping.
+   `docs/M5_PM_GAP.md`). **NOTE**: the validated MS-A2 RTL8125B
+   reports `FLReset-` in lspci — the chip doesn't support FLR. The
+   harness exits with a clean message in that case. Use the
+   `device/remove` + `bus/rescan` + `driver_override` cycle as an
+   alternative; 3/3 cycles validated in M5 prep.
 
 4. **syzkaller 4h** — config in `ci/syzkaller_config.txt`. Operator
    sets up the syzkaller VM, points it at our driver, runs for 4h.

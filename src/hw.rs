@@ -135,8 +135,15 @@ fn hw_start_8125b_unlocked(regs: &Regs<'_>) -> Result<()> {
     // with the L1-exit-trigger OCP write below — together they keep the
     // chip's TX FIFO and PCIe link awake when TSO is generating MSS-
     // sized segments at line rate.
-    let cfg5 = regs.config5();
-    regs.set_config5(cfg5 & !regs::CONFIG5_ASPM_EN);
+    //
+    // M5 ASPM-soak override: `force_aspm` module-param skips this clear
+    // so the chip can enter L1.x during the historical L1.x lockup
+    // soak. Production must keep this disabled (TSO depends on it).
+    let force_aspm = *crate::module_parameters::force_aspm.value() != 0;
+    if !force_aspm {
+        let cfg5 = regs.config5();
+        regs.set_config5(cfg5 & !regs::CONFIG5_ASPM_EN);
+    }
 
     // r8168_mac_ocp_modify(0xd40a, 0x0010, 0x0000) — disable UPS
     regs.mac_ocp_modify(0xD40A, 0x0010, 0x0000);

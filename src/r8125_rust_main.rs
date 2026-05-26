@@ -74,5 +74,18 @@ kernel::module_pci_driver! {
             default: 0,
             description: "Force the reset poll to time out (testing only)",
         },
+        // M5 ASPM-soak knob: when non-zero, hw_start_8125b skips the
+        // Config5 ASPM_en clear so the PCIe link can enter L1.x during
+        // idle. Required to exercise the historical RTL8125 L1.x
+        // lockup gate (plan §7 M5).
+        //
+        // Default 0 (ASPM disabled — matches r8169
+        // rtl_hw_aspm_clkreq_enable(false) and keeps TSO reliable per
+        // docs/RTL8125B_TSO_NOTES.md). DO NOT set this in production:
+        // TSO retransmits return when ASPM is on.
+        force_aspm: u8 {
+            default: 0,
+            description: "Leave ASPM enabled (test-only, breaks TSO)",
+        },
     },
 }
