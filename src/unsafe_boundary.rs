@@ -377,12 +377,13 @@ pub(crate) fn desc_read(ring: *mut Descriptor, idx: usize) -> Descriptor {
 }
 
 /// Write one hardware descriptor at `ring[idx]` (volatile, whole-struct).
-/// Empirically verified to work for both RX descriptors and TX descriptors
-/// (including SG fragment chains). The 2026-05-26 TSO debug session tried
-/// field-by-field writes with `addr → opts2 → fence → opts1` ordering
-/// (mirroring Realtek vendor `rtl8125_xmit_frags`'s explicit `wmb()`) and
-/// it regressed the previously working SG+CSUM path. The whole-struct
-/// `write_volatile` on x86 commits the descriptor in a way the chip accepts.
+/// Used for **all** TX descriptors (head + fragments) and RX descriptors.
+/// The TX path writes fragment descriptors before the FirstFrag descriptor,
+/// so the chip only sees OWN|FS after the rest of the chain is populated.
+/// An explicit addr→opts2→fence→opts1 split (to match r8169's `dma_wmb()`
+/// discipline) was implemented and A/B-tested on 2026-05-26; it did not
+/// improve TSO once the segment-count cap landed. See
+/// `docs/RTL8125B_TSO_NOTES.md`.
 pub(crate) fn desc_write(ring: *mut Descriptor, idx: usize, value: Descriptor) {
     // SAFETY: as `desc_read`. The volatile pairs with the device's MMIO
     // read of the descriptor after we kick TX (or after hardware re-reads

@@ -83,5 +83,6 @@ started tracking per-descriptor DMA mappings, so the net census moves
 
 Note: `NETIF_F_SG` is advertised after the per-fragment DMA unmap fix
 and is covered by the task #49 SG proof. `NETIF_F_TSO | NETIF_F_TSO6`
-remain disabled in `r8125_bridge_alloc` pending a fix for the TSO
-packet-corruption issue tracked in the task #49 notes.
+are now advertised with the RTL8125B-specific `netif_set_tso_max_segs`
+cap documented in `docs/RTL8125B_TSO_NOTES.md`. This did not require
+additional unsafe wrappers.

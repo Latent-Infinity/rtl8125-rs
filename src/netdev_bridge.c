@@ -132,12 +132,37 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	 * checksums everything, which caps single-stream throughput at
 	 * ~1 Gbps in the KASAN-debug guest (per-packet overhead bound).
 	 * With SG+TSO the chip handles ~64K logical sends in one batch.
-	 * Current surface: CSUM+SG live; TSO flag off pending the
-	 * investigation in m4_perf_tso_debug_session.txt. */
+	 *
+	 * TSO chip limits — RTL8125B-specific empirical caps (see
+	 * docs/RTL8125B_TSO_NOTES.md for the full bisection log):
+	 *
+	 *   netif_set_tso_max_segs(ndev, 10)
+	 *
+	 *   The chip's LSO engine reliably segments super-skbs of up to 11
+	 *   MSS-worth of payload; at 12+ segments per super-skb it stalls
+	 *   the TX queue and drops segments wholesale (verified by bisection
+	 *   2026-05-26 across max_segs = 2..16; 11 works, 12 hangs the TX
+	 *   queue, 16 produces a ~65 Mbps glide-down with ~530 retransmits
+	 *   per 6-second iperf3 run). r8169 mainline and Realtek vendor
+	 *   both publish 64 — that limit is wrong for this chip in practice.
+	 *   We use 10 for safety margin under the measured 11-segment
+	 *   threshold; line rate (2.35 Gbps in our KVM/VFIO/KASAN-debug
+	 *   setup, matching the r8169 reference) is already saturated at
+	 *   8 segments so the cap does not bottleneck throughput.
+	 *
+	 *   netif_set_tso_max_size(ndev, 64000)
+	 *
+	 *   Matches r8169 mainline RTL_GSO_MAX_SIZE_V2 / Realtek LSO_64K;
+	 *   the segment cap above is the binding constraint, not the size. */
 	ndev->hw_features = NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
-			    NETIF_F_RXCSUM | NETIF_F_SG;
+			    NETIF_F_RXCSUM | NETIF_F_SG |
+			    NETIF_F_TSO | NETIF_F_TSO6;
 	ndev->features = ndev->hw_features;
-	ndev->vlan_features = NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM | NETIF_F_SG;
+	ndev->vlan_features = NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
+			      NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6;
+
+	netif_set_tso_max_size(ndev, 64000);
+	netif_set_tso_max_segs(ndev, 10);
 
 	b = netdev_priv(ndev);
 	b->ndev = ndev;

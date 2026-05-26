@@ -198,9 +198,8 @@ fn hw_start_8125b_unlocked(regs: &Regs<'_>) -> Result<()> {
 
     // r8169 `rtl_enable_exit_l1` for VER_40..LAST: set OCP 0xC0AC bits
     // 7-12 (txpla, pktavi, xadm, txdma_poll, ltr_msg, rxdv). This keeps
-    // our power-state setup aligned with r8169; TSO remains disabled
-    // because the 2026-05-26 debug pass showed these writes alone do not
-    // eliminate the retransmit issue.
+    // our power-state setup aligned with r8169; TSO still also requires
+    // the RTL8125B-specific max-segs cap in netdev_bridge.c.
     regs.mac_ocp_modify(
         regs::MAC_OCP_L1_EXIT_TRIGGERS,
         0,

@@ -119,3 +119,90 @@ baseline (946 Mbps) and prioritizing M5 polish items (per-CPU
 counter sharding, Clippy gates, §6.3 counter invariant CI check)
 which deliver real ergonomic improvements without the TSO rabbit
 hole.
+
+## 2026-05-26 PM addendum: `netif_set_tso_max_*` test
+
+The C-source review (this file's "Hypotheses NOT yet tested" #4,
+plus a deeper review of r8169 mainline `r8169_main.c:5732-5735`)
+identified that we were missing `netif_set_tso_max_size(64000)` +
+`netif_set_tso_max_segs(64)` — matching r8169's RTL_GSO_MAX_SIZE_V2 /
+RTL_GSO_MAX_SEGS_V2 (lines 643-644) and Realtek vendor's LSO_64K /
+NIC_MAX_PHYS_BUF_COUNT_LSO2 (lines 17498-17499).
+
+Hypothesis: without these limits the kernel would hand the driver
+TSO super-skbs sized by the system-wide GSO defaults (>64K, >64
+segments), exceeding the chip's internal LSO buffer.
+
+Test: re-enabled NETIF_F_TSO + NETIF_F_TSO6 in hw_features, added
+the two `netif_set_tso_max_*` calls right after, built, synced
+to guest, ran iperf3.
+
+Result: **NOT fixed.** Output showed declining throughput and
+eventual TX-queue stall:
+
+```
+[  5]   0.00-3.00   sec   654 Mbits/sec  2760 Retr
+[  5]   3.00-6.00   sec   481 Mbits/sec  1992 Retr
+[  5]   6.00-9.00   sec   423 Mbits/sec  1942 Retr
+[  5]   9.00-12.00  sec   0.00 bits/sec — stalled
+iperf3: error - control socket has closed unexpectedly
+```
+
+Reverted. SG+CSUM baseline confirmed clean at 960 Mbps after
+revert (slightly better than pre-test, suggesting unrelated noise
+in the 946 baseline measurement).
+
+The `netif_set_tso_max_*` hypothesis was wrong **at the published
+value of 64**. Counter-evidence on file: r8169 mainline does enable
+TSO on this exact chip and does NOT use the Realtek-vendor TxNoClose
+mechanism (`r8169_main.c` contains zero references to `no_close`,
+`SW_TAIL`, `HW_CLO`), so the bug must be in some other axis.
+
+## 2026-05-26 PM session 4: ROOT CAUSE FOUND
+
+Implemented the head-only two-phase descriptor commit hypothesis
+(`src/unsafe_boundary.rs::desc_commit_head_tx`) — did not fix.
+TSO still showed declining bitrate + TX queue stall at max_segs=64.
+
+Pivoted to bisecting `netif_set_tso_max_segs`:
+
+  max_segs=2  → 1.19 Gbps,    0 retr  ✓
+  max_segs=4  → 2.24 Gbps,    0 retr  ✓
+  max_segs=8  → 2.35 Gbps,    0 retr  ✓ line rate
+  max_segs=9  → 2.34 Gbps,    0 retr  ✓
+  max_segs=10 → 2.35 Gbps,    0 retr  ✓
+  max_segs=11 → 2.35 Gbps,    0 retr  ✓ last working
+  max_segs=12 → TX queue hangs        ✗
+  max_segs=13 → TX queue hangs        ✗
+  max_segs=14 → 696 Mbps, 4962 retr   ✗
+  max_segs=15 → TX queue hangs        ✗
+  max_segs=16 → 65.5 Mbps,  532 retr  ✗
+  max_segs=32 → instant stall         ✗
+  max_segs=64 → instant stall         ✗
+
+Reproducible threshold at 11→12. The chip's LSO engine cannot
+segment more than 11 MSS-worth of TCP per super-skb on the
+validated MS-A2 stepping. **Both r8169 mainline (64) and Realtek
+vendor (64) publish the wrong number for this chip revision.**
+
+Shipped `netif_set_tso_max_segs(ndev, 10)` for one-segment safety
+margin. Final result: 60-second sustained iperf3 at 2.35 Gbits/sec
+with **0 retransmits**, matching the r8169 reference (2.33 Gbps).
+
+Subsequent A/B test removed the head-only two-phase commit
+(`desc_commit_head_tx`) — TSO continues to work at full line rate
+with the whole-struct `desc_write` for the FirstFrag. The two-phase
+commit was a theoretically-motivated but unnecessary change;
+reverted to keep the code surface minimal.
+
+## Final state in tree
+
+  src/netdev_bridge.c:
+      ndev->hw_features |= NETIF_F_TSO | NETIF_F_TSO6;
+      ndev->vlan_features |= NETIF_F_TSO | NETIF_F_TSO6;
+      netif_set_tso_max_size(ndev, 64000);
+      netif_set_tso_max_segs(ndev, 10);   /* THE FIX */
+
+Session 2 chip-init parity writes remain (they benefit SG+CSUM too).
+Session 1 / Session 3 field-ordered descriptor write code was
+removed. Full investigation log: docs/RTL8125B_TSO_NOTES.md.

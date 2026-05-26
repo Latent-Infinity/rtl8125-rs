@@ -80,7 +80,13 @@ implemented but disabled — see below.
     TX:  bytes  packets  errors dropped carrier collsns
       1230814933 816906   0     0      0      0
 
-## TSO status (still partial — code in tree, feature flag off)
+## TSO status (historical note)
+
+Update 2026-05-26: TSO is now enabled with the RTL8125B-specific
+`netif_set_tso_max_segs(ndev, 10)` cap. The passing TSO proof and
+root-cause notes live in `docs/RTL8125B_TSO_NOTES.md`. The rest of
+this section records the earlier failing state before the segment-cap
+bisection.
 
 TSO infrastructure is implemented:
 - `src/netdev_bridge_offload.c::r8125_bridge_skb_tso_setup` sets
@@ -100,8 +106,6 @@ hypotheses tracked in `docs/baseline/m4_perf_sg_tso_investigation.txt`:
   engine for our MAC config.
 - VLAN handling (we don't extract / re-insert the VLAN tag).
 
-For now `ndev->hw_features` advertises `IP_CSUM | IPV6_CSUM |
-RXCSUM | SG` only. The TSO feature bits and `netif_set_tso_max_*`
-calls are commented out in `r8125_bridge_alloc` pending the next
-debug iteration. The TSO code path stays in tree; re-enable with
-a single-line uncomment.
+At this point in the investigation `ndev->hw_features` advertised
+`IP_CSUM | IPV6_CSUM | RXCSUM | SG` only, with TSO left for the next
+debug iteration.

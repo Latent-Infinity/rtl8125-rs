@@ -589,11 +589,16 @@ fn ndo_start_xmit(state: &NetdevState, skb: *mut bindings::sk_buff) -> c_int {
     }
 
     // ── Write FirstFrag descriptor LAST — this is the commit point ─────
-    // The chip only starts walking after seeing OWN on slot[0]. By writing
-    // it last (and as a Release store via desc_write's volatile), all the
-    // subsequent slots are already populated when the chip picks up the
-    // chain. (x86 TSO; on weak-memory archs an explicit wmb() would go
-    // here — verified empirically not to help TSO under iperf3.)
+    //
+    // The chip only starts walking once it sees OWN|FS on slot[0]. By
+    // writing the head LAST (after all fragment descriptors), the chip
+    // observes a fully-populated chain when it picks up the head.
+    // Whole-struct volatile commit (`ub::desc_write`) is sufficient on
+    // x86: TSO ordering + PCIe ordering ensure the descriptor commits
+    // atomically from the chip's perspective. An A/B test on
+    // 2026-05-26 confirmed an explicit two-phase commit
+    // (addr→opts2→fence→opts1) was not required after the real TSO
+    // fix landed (max_segs=10 cap in netdev_bridge.c).
     let first_slot = head % RING_LEN;
     let mut first_opts1 =
         regs::DESC_OWN | regs::DESC_TX_FS | (linear_len & regs::DESC_LEN_MASK);

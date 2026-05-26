@@ -134,8 +134,8 @@ pub(crate) const MMIO_0X382_VAL: u16 = 0x221b;
 /// `r8168_mac_ocp_modify(0xc0ac, 0, 0x1f80)` — enables bits 7-12 (txpla,
 /// pktavi, xadm, txdma_poll, ltr_msg, rxdv) so the chip wakes the PCIe
 /// link out of L1 when any of those events fires. Kept for r8169 parity;
-/// TSO remains disabled because this write alone did not resolve the TSO
-/// retransmit issue in the 2026-05-26 debug pass.
+/// TSO still also requires the RTL8125B-specific max-segs cap in
+/// `netdev_bridge.c`.
 pub(crate) const MAC_OCP_L1_EXIT_TRIGGERS: u32 = 0xC0AC;
 pub(crate) const MAC_OCP_L1_EXIT_TRIGGERS_MASK: u16 = 0x1F80;
 

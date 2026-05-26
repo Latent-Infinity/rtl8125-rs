@@ -51,4 +51,11 @@ grep -q 'NETIF_F_IP_CSUM' "$BRIDGE" \
   && ok "netdev advertises checksum features wired by the offload helper" \
   || bad "checksum feature advertisement missing"
 
+grep -q 'NETIF_F_TSO' "$BRIDGE" \
+  && grep -q 'NETIF_F_TSO6' "$BRIDGE" \
+  && grep -q 'netif_set_tso_max_size(ndev, 64000)' "$BRIDGE" \
+  && grep -q 'netif_set_tso_max_segs(ndev, 10)' "$BRIDGE" \
+  && ok "TSO advertisement is paired with RTL8125B max-size/max-segs caps" \
+  || bad "TSO must be advertised only with the validated RTL8125B segment cap"
+
 exit $fail

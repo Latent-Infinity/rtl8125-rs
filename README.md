@@ -48,6 +48,7 @@ critical path. This is an out-of-tree kernel Rust module:
 | `docs/VALIDATION_REPORT.md` | Plan claims vs. observed reality on the dev box |
 | `docs/M1_ENTRY_CRITERIA.md` | The §15 checklist gating M1; M1 is blocked until all pass |
 | `docs/M0a_TO_M1_RUNBOOK.md` | **Step-by-step operator runbook** to clear every M1 gate (start here to get unblocked) |
+| `docs/RTL8125B_TSO_NOTES.md` | TSO investigation log: why TSO advertisement is off today, what's been tried across three debug sessions, untried hypotheses ranked for the next attempt |
 | `docs/baseline/` | M0a pre-link fact-discovery artifacts; M0b physical-link baseline (plan §7 M0a/M0b) |
 | `docs/perf/` | M6 before/after performance numbers (plan §7 M6) |
 | `src/` | Rust core plus the co-located C bridge required by kbuild's composite-module layout |
