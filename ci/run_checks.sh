@@ -32,6 +32,12 @@ echo
 echo "== M5 NAPI contract (poll budget, IRQ masking, queue hysteresis) =="
 bash "$CI/check_napi_contract.sh" || rc=1
 echo
+echo "== M6 design gates (skip vacuously until impl lands) =="
+bash "$CI/check_msix_static.sh" || rc=1
+bash "$CI/check_isr_v2_paired.sh" || rc=1
+bash "$CI/check_rx_pool_pages.sh" || rc=1
+bash "$CI/check_jumbo_mtu_chip.sh" || rc=1
+echo
 echo "== §18 kernel-build Clippy gate =="
 bash "$CI/check_clippy.sh" || rc=1
 echo
