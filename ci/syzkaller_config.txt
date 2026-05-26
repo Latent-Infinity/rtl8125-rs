@@ -1,0 +1,66 @@
+# syzkaller config sketch for r8125_rust — plan §7 M5 fuzz gate.
+#
+# Full syzkaller run is operator-time work; this file documents the
+# config the operator should use. syzkaller is launched against a
+# guest with the validated debug kernel (KASAN + lockdep + kmemleak
+# + DMA_API_DEBUG) and the r8125_rust module loaded.
+#
+# Scope caveat (plan §7 M5):
+#   "KCOV does not collect soft/hard interrupt coverage by default,
+#    so NAPI and IRQ paths are not fully covered by syzkaller alone."
+# This is fine — the packet-mutation harness covers the data path,
+# and the active soak covers the IRQ + NAPI hot paths under stress.
+# syzkaller specifically exercises the control plane.
+
+{
+  "target": "linux/amd64",
+  "http": "127.0.0.1:56741",
+  "workdir": "/var/syzkaller/workdir",
+  "kernel_obj": "/path/to/kbuild/linux-7.0.0",
+  "image": "/path/to/syzkaller-debian.img",
+  "sshkey": "/path/to/syzkaller-id_rsa",
+  "syzkaller": "/path/to/syzkaller",
+  "procs": 4,
+  "type": "qemu",
+  "vm": {
+    "count": 2,
+    "kernel": "/path/to/bzImage",
+    "cpu": 2,
+    "mem": 4096,
+    "qemu_args": "-enable-kvm -device vfio-pci,host=0000:03:00.0"
+  },
+  "enable_syscalls": [
+    "openat$tun",
+    "ioctl$ifreq*",
+    "ioctl$sock_ifreq*",
+    "ioctl$ETHTOOL*",
+    "socket$inet",
+    "socket$inet6",
+    "socket$inet_tcp",
+    "socket$inet_udp",
+    "socket$packet",
+    "bind",
+    "connect",
+    "sendto",
+    "sendmsg",
+    "recvfrom",
+    "recvmsg",
+    "setsockopt$inet*",
+    "getsockopt$inet*",
+    "syz_genetlink_get_family_id",
+    "sendmsg$nl_route",
+    "sendmsg$nl_generic"
+  ]
+}
+
+# Recommended run length: 4 hours.
+# Pass criteria (plan §7 M5):
+#   - No KASAN / UBSAN / lockdep / kmemleak reports during the run
+#   - No kernel panics
+#   - No `BUG:` lines in the harvested console log
+#   - Driver remains loaded and the interface remains carrier-up
+#
+# The control-plane focus (ethtool, netlink, ifreq, socket options)
+# is appropriate for this driver — most attack surface is in the
+# control path. The data path is covered by `ci/check_packet_mutation.sh`
+# and the 24-hour active soak.

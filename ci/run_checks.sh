@@ -29,6 +29,9 @@ echo
 echo "== §15.2 cache-padding convention =="
 bash "$CI/check_cache_padding.sh" || rc=1
 echo
+echo "== M5 NAPI contract (poll budget, IRQ masking, queue hysteresis) =="
+bash "$CI/check_napi_contract.sh" || rc=1
+echo
 echo "== §18 kernel-build Clippy gate =="
 bash "$CI/check_clippy.sh" || rc=1
 echo

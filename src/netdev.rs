@@ -90,6 +90,30 @@ use crate::unsafe_boundary::{self as ub, BridgeOps};
 const NETDEV_TX_OK: c_int = 0;
 const NETDEV_TX_BUSY: c_int = 0x10;
 
+/// Stop the TX queue preemptively when fewer than this many descriptor
+/// slots remain free. Pairs with `napi::TX_START_THRS` (= 64) so the
+/// reaper only wakes us after enough slots have drained — without this
+/// hysteresis the kernel-queue state churns on every reaped descriptor
+/// and `tx_busy_exception` spikes under load. 32 leaves ample headroom
+/// for any single LSO super-skb (we cap `tso_max_segs = 10`, so the
+/// max chain is 11 descriptors).
+const TX_STOP_THRS: usize = 32;
+
+/// Stop the TX queue, then recheck the producer/consumer indices to cover
+/// the race where NAPI freed descriptors just before or during the stop.
+/// If the queue has already crossed the wake threshold, wake it immediately
+/// so we do not strand the queue stopped with no future completion to wake it.
+fn stop_tx_queue_with_recheck(state: &NetdevState, head: usize) {
+    let ndev = state.ndev.load(Ordering::Acquire);
+    ub::bridge_tx_stop_queue(ndev);
+
+    let tail_now = state.tx_tail.inner.load(Ordering::Acquire);
+    let in_flight_now = head.wrapping_sub(tail_now);
+    if RING_LEN - in_flight_now > crate::napi::TX_START_THRS {
+        ub::bridge_tx_wake_queue(ndev);
+    }
+}
+
 /// RX buffer size — single Ethernet frame at 1500 MTU plus generous slack.
 /// `RxBuffer` is what we hand to hardware; descriptors carry the DMA addr
 /// of one of these slots and the buffer length.
@@ -524,9 +548,13 @@ fn ndo_start_xmit(state: &NetdevState, skb: *mut bindings::sk_buff) -> c_int {
     let tail = state.tx_tail.inner.load(Ordering::Acquire);
     let in_flight = head.wrapping_sub(tail);
     if in_flight + n_desc >= RING_LEN {
+        // Hard stop — ring genuinely doesn't have room. This is the
+        // safety net; the preemptive stop further down should make
+        // this branch rare. If we hit it we report TX_BUSY so the
+        // kernel re-queues the skb without dropping it.
         let ndev = state.ndev.load(Ordering::Acquire);
-        ub::bridge_tx_stop_queue(ndev);
         ub::tx_busy_exception(ndev);
+        stop_tx_queue_with_recheck(state, head);
         return NETDEV_TX_BUSY;
     }
 
@@ -643,10 +671,22 @@ fn ndo_start_xmit(state: &NetdevState, skb: *mut bindings::sk_buff) -> c_int {
         },
     );
 
-    state
-        .tx_head
-        .inner
-        .store(head.wrapping_add(n_desc), Ordering::Release);
+    // Update tx_head BEFORE touching the queue-state helper — the NAPI
+    // reaper reads tx_head (via `in_flight`) to decide when to wake the
+    // queue back up, so the stop+head ordering must be Release-Acquire
+    // sync'd. Then check whether to preemptively stop the queue: if
+    // free slots after THIS xmit are under TX_STOP_THRS, the next xmit
+    // would likely BUSY, so we stop now and let the reaper wake us.
+    let new_head = head.wrapping_add(n_desc);
+    state.tx_head.inner.store(new_head, Ordering::Release);
+    let in_flight_after = new_head.wrapping_sub(tail);
+    let free_after = RING_LEN - in_flight_after;
+    if free_after < TX_STOP_THRS {
+        // Matches the r8169 `netif_subqueue_maybe_stop` SMP-race
+        // discipline: stop, then recheck the consumer index and wake
+        // immediately if the reaper already freed enough descriptors.
+        stop_tx_queue_with_recheck(state, new_head);
+    }
     state.regs().tx_poll();
 
     NETDEV_TX_OK

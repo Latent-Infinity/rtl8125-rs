@@ -1,5 +1,32 @@
 // SPDX-License-Identifier: GPL-2.0
-//! NAPI poll body — plan §7 M4.
+//! NAPI poll body — plan §7 M4 (initial), §7 M5 (hardening).
+//!
+//! ## NAPI contract this body must satisfy (plan §7 M5)
+//!
+//! 1. **`budget == 0`** is an explicit "TX cleanup only" call:
+//!    the kernel uses it to drain TX completions without consuming RX
+//!    quota. We MUST NOT run the RX loop, MUST NOT call any
+//!    skb-build/page-pool/XDP API, and MUST NOT call
+//!    `napi_complete_done`. We may still run the TX reaper.
+//! 2. **Exactly-budget consumed** (`work_done == budget`): return
+//!    `budget` *without* calling `napi_complete_done`. The kernel
+//!    re-polls us so we keep IRQs masked. Returning `work_done <
+//!    budget` is the only path that calls `napi_complete_done` (and
+//!    only that path re-arms our IMR).
+//! 3. **IRQ-masking discipline**: the IRQ handler masked our IMR
+//!    before scheduling NAPI; we re-arm it ONLY when we call
+//!    `napi_complete_done` (case 2 above's negation), so IRQs stay
+//!    masked across the entire scheduled poll cycle.
+//! 4. **Queue stop/wake**: ring indices are updated BEFORE we touch
+//!    `netif_tx_wake_queue` (or `_stop_queue` in xmit). Wake only
+//!    fires when free slots cross the start-threshold (hysteresis)
+//!    so we don't ping-pong with the producer.
+//! 5. **TX completion exactly once**: each slot's skb pointer is
+//!    consumed via `AtomicPtr::swap(null)` — the swap returns the
+//!    prior value atomically, so a concurrent caller would observe
+//!    `null` and skip the consume.
+//!
+//! `ci/check_napi_contract.sh` enforces these invariants statically.
 
 use core::ffi::c_int;
 use core::ptr;
@@ -11,16 +38,30 @@ use crate::ring::{Descriptor, RING_LEN};
 #[allow(clippy::unsafe_removed_from_name)]
 use crate::unsafe_boundary as ub;
 
-/// Called from the cshim's `bridge_napi_poll` (which itself is the kernel's
-/// NAPI poll callback). `budget` bounds how many RX frames may pass to the
+/// Wake the TX queue only when at least this many descriptors are free.
+/// Pairs with `TX_STOP_THRS` in `netdev.rs::ndo_start_xmit` to provide
+/// hysteresis: stop when free slots drop below STOP_THRS, wake only
+/// when they climb back past START_THRS. Without hysteresis the queue
+/// oscillates between stopped and woken on every reaped descriptor,
+/// wasting kernel queue-state churn. 2× the stop threshold matches
+/// r8169's `R8169_TX_START_THRS = 2 * R8169_TX_STOP_THRS` discipline.
+pub(crate) const TX_START_THRS: usize = 64;
+
+/// Called from the cshim's `bridge_napi_poll` (which is the kernel's NAPI
+/// poll callback). `budget` bounds how many RX frames may pass to the
 /// stack in this round; we also reap as many TX completions as available.
 ///
-/// Returns `work_done` in `[0, budget]`. If `work_done < budget`, we call
-/// `bridge_napi_complete_done` so the kernel re-arms IRQs at its end, and
-/// we re-arm our `IMR` bits at ours.
+/// Returns `work_done` in `[0, budget]`. See the module docstring for
+/// the §6.3 / §7-M5 contract this function must satisfy.
 pub(crate) fn poll(state: &NetdevState, budget: c_int) -> c_int {
     crate::netdev::note_napi_poll();
-    let budget_u = if budget < 0 { 0 } else { budget as usize };
+    // `budget == 0` is the explicit "TX-cleanup only" path (plan §7 M5).
+    // The kernel uses it during netpoll / netconsole and during certain
+    // shutdown sequences. We skip the RX loop entirely (no skb-build,
+    // no GRO, no page-pool touches) and DO NOT call napi_complete_done
+    // at the bottom — the `work_done < budget` check naturally fails
+    // because budget is 0 and work_done starts at 0.
+    let budget_u = if budget <= 0 { 0 } else { budget as usize };
     let mut work_done = 0usize;
 
     // ── RX completion path ───────────────────────────────────────────────
@@ -137,19 +178,38 @@ pub(crate) fn poll(state: &NetdevState, budget: c_int) -> c_int {
         reaped += 1;
     }
     if reaped > 0 {
+        // Update tx_tail BEFORE waking the queue — kernel xmit code re-
+        // reads tx_tail (indirectly through `in_flight`) to decide whether
+        // to start posting again. Stale tail with woken queue means an
+        // immediate NETDEV_TX_BUSY.
         state.tx_tail.inner.store(tx_tail, Ordering::Release);
-        // Wake the kernel TX path in case xmit had stopped the queue.
-        let ndev = state.ndev.load(Ordering::Acquire);
-        ub::bridge_tx_wake_queue(ndev);
+        let in_flight = tx_head.wrapping_sub(tx_tail);
+        let free = RING_LEN - in_flight;
+        // Wake only when we've drained past the start threshold. This is
+        // the wake-side half of the hysteresis (xmit stops the queue at
+        // `TX_STOP_THRS`); without it we'd thrash kernel queue state on
+        // every single reaped descriptor.
+        if free > TX_START_THRS {
+            let ndev = state.ndev.load(Ordering::Acquire);
+            ub::bridge_tx_wake_queue(ndev);
+        }
     }
 
     let work_done = work_done as c_int;
     if work_done < budget {
-        // Tell NAPI we're done; kernel re-enables IRQs at its end. We
-        // re-arm our IMR so the next event triggers an IRQ.
+        // `work_done < budget` covers two cases:
+        //   - We did real work but cleared the ring (work_done in
+        //     [0, budget)) — tell NAPI we're done so it re-enables IRQs.
+        //   - `budget == 0` (TX-cleanup-only path): we never bumped
+        //     work_done, so 0 < 0 is FALSE and we skip this whole branch
+        //     per the §7 M5 contract. The condition correctly guards
+        //     against the bug class "called napi_complete_done with
+        //     budget=0" which races with concurrent IRQs.
         let ndev = state.ndev.load(Ordering::Acquire);
         ub::bridge_napi_complete_done(ndev, work_done);
         state.regs().set_imr(regs::INTR_M4_BASELINE);
     }
+    // If `work_done == budget`, return without complete_done so the
+    // kernel re-polls us — IRQs stay masked across the re-poll.
     work_done
 }
