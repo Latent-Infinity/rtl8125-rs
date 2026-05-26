@@ -225,7 +225,7 @@ impl<'a> Regs<'a> {
     // value on the next read of OCPDR.
 
     pub(crate) fn mac_ocp_write(&self, reg: u32, data: u16) {
-        let cmd = regs::OCPAR_FLAG | ((reg & 0xFFFF) << 15) | (data as u32);
+        let cmd = regs::OCPAR_FLAG | ((reg & 0xFFFF) << 15) | u32::from(data);
         self.bar.write32(cmd, regs::OCPDR);
     }
 
@@ -265,7 +265,7 @@ impl<'a> Regs<'a> {
         data: u16,
     ) -> kernel::error::Result<()> {
         // OCPAR_FLAG | (ocp_addr << 15) | data
-        let cmd = regs::OCPAR_FLAG | ((ocp_addr & 0xFFFF) << 15) | (data as u32);
+        let cmd = regs::OCPAR_FLAG | ((ocp_addr & 0xFFFF) << 15) | u32::from(data);
         self.bar.write32(cmd, regs::GPHY_OCP);
         let step = Delta::from_micros(10);
         for _ in 0..25 {
@@ -302,7 +302,7 @@ impl<'a> Regs<'a> {
         } else {
             reg
         };
-        self.gphy_ocp_read(ocp_base + (reg_adj as u32) * 2)
+        self.gphy_ocp_read(ocp_base + u32::from(reg_adj) * 2)
     }
 
     /// MDIO-style PHY write — same page logic as `mdio_read`.
@@ -317,7 +317,7 @@ impl<'a> Regs<'a> {
         } else {
             reg
         };
-        self.gphy_ocp_write(ocp_base + (reg_adj as u32) * 2, val)
+        self.gphy_ocp_write(ocp_base + u32::from(reg_adj) * 2, val)
     }
 
     /// Zero the per-MAC_VER_63 interrupt-coalescing table:

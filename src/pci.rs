@@ -154,7 +154,7 @@ impl pci::Driver for R8125Driver {
                         info.mac_version
                     );
 
-                    hw::reset(&regs, inject_timeout).map_err(|e| {
+                    hw::reset(&regs, inject_timeout).inspect_err(|_e| {
                         let cmd = regs.chip_cmd();
                         dev_err!(
                             pdev,
@@ -162,7 +162,6 @@ impl pci::Driver for R8125Driver {
                             inject_timeout,
                             cmd
                         );
-                        e
                     })?;
                     dev_info!(pdev, "RTL8125 reset OK\n");
 

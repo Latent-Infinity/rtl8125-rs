@@ -146,7 +146,7 @@ impl<const N: usize> Ring<N> {
     /// M4 hot path to read/write descriptors via the `desc_read` /
     /// `desc_write` helpers in `unsafe_boundary`.
     pub(crate) fn desc_ptr_mut(&self) -> *mut Descriptor {
-        self.desc.start_ptr() as *mut Descriptor
+        self.desc.start_ptr().cast_mut()
     }
 
     /// Number of hardware-visible descriptors (= `N`).

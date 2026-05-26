@@ -51,6 +51,6 @@ pub(crate) fn log_aspm(pdev: &pci::Device<kernel::device::Bound>) {
         pdev,
         "ASPM: PCI Status=0x{:04x} CAP_LIST={} — cap-list walk + policy deferred to M4 cshim (kernel::pci has no fallible config read and no ASPM API yet; see plan §13 / src/pm.rs)\n",
         status,
-        cap_list as u8
+        u8::from(cap_list)
     );
 }

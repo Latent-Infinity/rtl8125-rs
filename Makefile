@@ -15,6 +15,7 @@
 KDIR    ?= /lib/modules/$(shell uname -r)/build
 RUSTC   ?= rustc-1.93
 BINDGEN ?= bindgen
+CLIPPY_DRIVER ?= /usr/lib/rust-1.93/bin/clippy-driver
 ifeq ($(origin CC),default)
 CC      := x86_64-linux-gnu-gcc
 endif
@@ -25,7 +26,7 @@ PAHOLE_FLAGS ?= --lang_exclude=Rust
 RESOLVE_BTFIDS ?= $(KDIR)/tools/bpf/resolve_btfids/resolve_btfids
 
 all default modules:
-	$(MAKE) -C $(KDIR) M=$(CURDIR)/src RUSTC=$(RUSTC) BINDGEN=$(BINDGEN) CC=$(CC) CONFIG_DEBUG_INFO_BTF_MODULES= modules
+	$(MAKE) -C $(KDIR) M=$(CURDIR)/src RUSTC=$(RUSTC) BINDGEN=$(BINDGEN) CLIPPY_DRIVER=$(CLIPPY_DRIVER) CC=$(CC) CONFIG_DEBUG_INFO_BTF_MODULES= modules
 	@$(MAKE) --no-print-directory btf
 
 clean:

@@ -37,7 +37,7 @@ pub(crate) fn page_select_write(state: &NetdevState, val: u16) {
     let new_base = if val == 0 {
         regs::OCP_STD_PHY_BASE
     } else {
-        (val as u32) << 4
+        u32::from(val) << 4
     };
     state.ocp_base.store(new_base, Ordering::Release);
 }

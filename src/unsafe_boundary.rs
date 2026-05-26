@@ -245,11 +245,14 @@ unsafe impl Send for NetdevHandle {}
 // the only context that mutates rx_tail / tx_tail; xmit is the only one
 // that mutates tx_head. Sharing across threads is therefore safe.
 unsafe impl Send for NetdevState {}
+// SAFETY: same reasoning as the `Send` impl above; all cross-context
+// mutation goes through atomics or device-owned coherent memory.
 unsafe impl Sync for NetdevState {}
 
 // SAFETY: `RxBuffer` is `#[repr(C, align(64))]` containing only `[u8; N]`.
 // Every bit pattern is a valid RxBuffer; no uninitialized padding.
 unsafe impl AsBytes for RxBuffer {}
+// SAFETY: same layout and bit-validity argument as `AsBytes`.
 unsafe impl FromBytes for RxBuffer {}
 
 // ── Safe wrappers — M4-full hot path ──────────────────────────────────────
@@ -259,9 +262,9 @@ unsafe impl FromBytes for RxBuffer {}
 /// for `ndo_open`'s convenience.
 pub(crate) fn pci_set_master(_pdev: &kernel::sync::aref::ARef<pci::Device>) {
     // ARef<pci::Device> derefs to pci::Device<Normal>; set_master needs Core.
+    let raw = pci_dev_raw_from_aref(_pdev);
     // SAFETY: The bound pci_dev is alive (ARef keeps a refcount); pci_set_master
     // takes a *mut pci_dev and is sound to call any time the device exists.
-    let raw = pci_dev_raw_from_aref(_pdev);
     unsafe { bindings::pci_set_master(raw) };
 }
 
@@ -273,7 +276,7 @@ fn pci_dev_raw_from_aref(
     let p: &pci::Device = pdev;
     let opaque: &Opaque<bindings::pci_dev> =
         // SAFETY: same repr-transparent argument as `pci_dev_raw`.
-        unsafe { &*(p as *const pci::Device as *const Opaque<bindings::pci_dev>) };
+        unsafe { &*core::ptr::from_ref(p).cast::<Opaque<bindings::pci_dev>>() };
     opaque.get()
 }
 
@@ -292,7 +295,7 @@ pub(crate) fn request_irq(
             Some(handler),
             None,
             bindings::IRQF_SHARED as usize,
-            c"r8125_rust".as_ptr() as *const u8,
+            c"r8125_rust".as_ptr().cast::<u8>(),
             cookie,
         )
     };
@@ -403,7 +406,7 @@ pub(crate) fn rx_buf_ptr(
     let start = bufs.start_ptr();
     // SAFETY: idx < count() guaranteed by caller (NAPI walks 0..RING_LEN).
     let slot_ptr = unsafe { start.add(idx) };
-    slot_ptr as *const c_void
+    slot_ptr.cast::<c_void>()
 }
 
 // ── sk_buff helpers — safe wrappers, counters live inside the cshim ──────
@@ -529,7 +532,7 @@ pub(crate) fn pci_dev_raw<Ctx: device::DeviceContext>(
     // SAFETY: pci::Device<Ctx> is repr(transparent) over
     // Opaque<bindings::pci_dev> (PhantomData is zero-sized).
     let opaque: &Opaque<bindings::pci_dev> =
-        unsafe { &*(pdev as *const pci::Device<Ctx> as *const Opaque<bindings::pci_dev>) };
+        unsafe { &*core::ptr::from_ref(pdev).cast::<Opaque<bindings::pci_dev>>() };
     opaque.get()
 }
 
@@ -677,7 +680,12 @@ pub(crate) fn skb_data_dma_map(
     let dev = bridge_dma_device(pdev);
     // SAFETY: see fn-level contract.
     let rc = unsafe {
-        r8125_bridge_skb_data_dma_map(dev, skb, out_handle as *mut _, out_len as *mut _)
+        r8125_bridge_skb_data_dma_map(
+            dev,
+            skb,
+            core::ptr::from_mut(out_handle),
+            core::ptr::from_mut(out_len),
+        )
     };
     to_result(rc)
 }
@@ -700,8 +708,8 @@ pub(crate) fn skb_frag_dma_map(
             dev,
             skb,
             frag_idx,
-            out_handle as *mut _,
-            out_len as *mut _,
+            core::ptr::from_mut(out_handle),
+            core::ptr::from_mut(out_len),
         )
     };
     to_result(rc)
@@ -729,13 +737,18 @@ pub(crate) fn skb_consume_tx(
 /// # SAFETY: `skb` is the kernel-allocated buffer just received from
 /// ndo_start_xmit. The C side may mutate `skb` (calls `skb_cow_head`
 /// + `tcp_v6_gso_csum_prep` for IPv6 TSO), but only on skbs the driver
+///
 /// owns exclusively.
 pub(crate) fn skb_tso_setup(skb: *mut bindings::sk_buff) -> Option<(u32, u32)> {
     let mut opts1 = 0u32;
     let mut opts2 = 0u32;
     // SAFETY: see fn-level contract.
     let active = unsafe {
-        r8125_bridge_skb_tso_setup(skb, &mut opts1 as *mut _, &mut opts2 as *mut _)
+        r8125_bridge_skb_tso_setup(
+            skb,
+            core::ptr::from_mut(&mut opts1),
+            core::ptr::from_mut(&mut opts2),
+        )
     };
     if active {
         Some((opts1, opts2))
@@ -834,10 +847,10 @@ pub(crate) extern "C" fn r8125_rust_mdio_read(
     let reg = phyreg as u8;
 
     if reg == crate::regs::MII_PAGE_SELECT {
-        return crate::phy::page_select_read(state) as c_int;
+        return c_int::from(crate::phy::page_select_read(state));
     }
     match crate::phy::mdio_read(state, reg) {
-        Ok(v) => v as c_int,
+        Ok(v) => c_int::from(v),
         Err(e) => errno_to_c_int(e),
     }
 }
@@ -885,7 +898,7 @@ pub(crate) extern "C" fn r8125_rust_mdio_read_c45(
     if devad == crate::regs::MDIO_MMD_VEND2 && phyreg > crate::regs::MDIO_STAT2 {
         let state = state_from_cookie(cookie);
         match state.regs().gphy_ocp_read(phyreg as u32) {
-            Ok(v) => v as c_int,
+            Ok(v) => c_int::from(v),
             Err(e) => errno_to_c_int(e),
         }
     } else {

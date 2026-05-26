@@ -15,4 +15,4 @@ obj-m += r8125_rust.o
 # triggers a kbuild circular-dep warning and silently drops the Rust .o
 # from the final link. Same trick samples/rust/rust_print uses.
 r8125_rust-y := r8125_rust_main.o netdev_bridge.o netdev_bridge_phy.o \
-                netdev_bridge_offload.o
+                netdev_bridge_offload.o netdev_bridge_ethtool.o

@@ -247,6 +247,7 @@ pub(crate) const RXCFG_8125B_CHIP_BITS: u32 =
 
 /// M4 baseline RX policy: broadcast + multicast + my-MAC (no promisc)
 /// + the 8125B chip-config bits above. r8169 writes these together so
+///
 /// the full 32-bit RxConfig has both accept policy AND FIFO/DMA setup.
 pub(crate) const RCR_M4_BASELINE: u32 = RCR_ACCEPT_BROADCAST
     | RCR_ACCEPT_MULTICAST

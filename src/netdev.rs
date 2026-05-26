@@ -27,6 +27,7 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsiz
 /// Cache-line padded wrapper. Per `docs/RUST_STANDARDS.md` §15.2, atomics
 /// mutated from independent contexts (here: `tx_head` from xmit, `tx_tail`
 /// + `rx_tail` from NAPI poll) must not share a cache line — false sharing
+///
 /// would serialise the contexts under load. 64 B is the L1 line on x86_64
 /// and aarch64 baseline; PowerPC uses 128 but isn't a deployment target.
 /// Kernel-Rust has no `crossbeam::utils::CachePadded`, so this is the
@@ -348,7 +349,7 @@ fn ndo_open(state: &NetdevState) -> Result<()> {
     // because the new kernel-Rust pci::Device::request_irq returns a pin-init
     // type that's awkward to store in a non-pin NetdevState. The unsafe call
     // is wrapped in `ub::request_irq` with a SAFETY block.
-    let cookie_ptr = state as *const NetdevState as *mut c_void;
+    let cookie_ptr = core::ptr::from_ref(state).cast_mut().cast::<c_void>();
     ub::request_irq(state.irq_num, raw_irq_handler, cookie_ptr)?;
 
     // PHY step 1 — connect + soft reset + resume. On the 8125B's
@@ -360,7 +361,10 @@ fn ndo_open(state: &NetdevState) -> Result<()> {
     // rtl_reset_work → rtl_hw_start).
     let ndev = state.ndev.load(Ordering::Acquire);
     if let Err(e) = ub::bridge_phy_connect_and_reset(ndev) {
-        ub::free_irq(state.irq_num, state as *const NetdevState as *mut c_void);
+        ub::free_irq(
+            state.irq_num,
+            core::ptr::from_ref(state).cast_mut().cast::<c_void>(),
+        );
         return Err(e);
     }
 
@@ -400,7 +404,10 @@ fn ndo_open(state: &NetdevState) -> Result<()> {
         regs.set_imr(0);
         regs.set_chip_cmd(0);
         ub::bridge_phy_stop(ndev);
-        ub::free_irq(state.irq_num, state as *const NetdevState as *mut c_void);
+        ub::free_irq(
+            state.irq_num,
+            core::ptr::from_ref(state).cast_mut().cast::<c_void>(),
+        );
         return Err(e);
     }
     ub::bridge_tx_wake_queue(ndev);
@@ -448,7 +455,10 @@ fn ndo_stop(state: &NetdevState) {
     regs.ack_isr(0xFFFF_FFFF);
 
     // Release the IRQ (kernel synchronises).
-    ub::free_irq(state.irq_num, state as *const NetdevState as *mut c_void);
+    ub::free_irq(
+        state.irq_num,
+        core::ptr::from_ref(state).cast_mut().cast::<c_void>(),
+    );
 
     // Reap any in-flight TX mappings/skbs the hardware never completed.
     for i in 0..RING_LEN {
@@ -672,7 +682,7 @@ impl NetdevHandle {
         mac: &[u8; 6],
     ) -> Result<Self> {
         let cookie = ub::kbox_into_raw(state);
-        let ndev = match ub::bridge_alloc(pdev, cookie as *mut c_void, &ACTIVE_OPS, mac) {
+        let ndev = match ub::bridge_alloc(pdev, cookie.cast::<c_void>(), &ACTIVE_OPS, mac) {
             Ok(p) => p,
             Err(e) => {
                 ub::kbox_drop_from_raw(cookie);

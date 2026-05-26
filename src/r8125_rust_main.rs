@@ -40,6 +40,7 @@
 //! `samples/rust/rust_print` uses (`rust_print_main.rs` + `rust_print_events.c`
 //! → `rust_print.ko`).
 #![deny(unsafe_code)]
+#![allow(clippy::unnecessary_safety_comment)]
 
 mod dma;
 mod hw;

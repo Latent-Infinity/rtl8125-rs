@@ -107,6 +107,7 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 
 	SET_NETDEV_DEV(ndev, &pdev->dev);
 	ndev->netdev_ops = &bridge_ops;
+	ndev->ethtool_ops = &r8125_bridge_ethtool_ops;
 	ndev->needs_free_netdev = false; /* we free explicitly */
 	eth_hw_addr_set(ndev, mac);
 

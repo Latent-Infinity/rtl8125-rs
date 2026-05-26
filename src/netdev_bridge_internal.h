@@ -31,4 +31,9 @@ struct r8125_bridge {
 	u64 rx_dropped_error;
 };
 
+/* ethtool ops table; defined in netdev_bridge_ethtool.c. Exposes the
+ * §6.3 counters via `ethtool -S` so the runtime invariant check
+ * (`ci/check_counter_invariant.sh`) can read them from userspace. */
+extern const struct ethtool_ops r8125_bridge_ethtool_ops;
+
 #endif /* _R8125_NETDEV_BRIDGE_INTERNAL_H */

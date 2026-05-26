@@ -8,6 +8,7 @@ use core::sync::atomic::Ordering;
 use crate::netdev::{NetdevState, RX_BUF_LEN};
 use crate::regs;
 use crate::ring::{Descriptor, RING_LEN};
+#[allow(clippy::unsafe_removed_from_name)]
 use crate::unsafe_boundary as ub;
 
 /// Called from the cshim's `bridge_napi_poll` (which itself is the kernel's

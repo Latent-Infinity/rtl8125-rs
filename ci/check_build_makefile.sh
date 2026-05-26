@@ -15,6 +15,11 @@ grep -q 'CC      := x86_64-linux-gnu-gcc' "$MAKEFILE" \
   && ok "Makefile defaults to kernel-recorded GCC triplet without blocking overrides" \
   || bad "Makefile must avoid Kbuild compiler mismatch warning while preserving explicit CC overrides"
 
+grep -q 'CLIPPY_DRIVER ?= /usr/lib/rust-1.93/bin/clippy-driver' "$MAKEFILE" \
+  && grep -q 'CLIPPY_DRIVER=$(CLIPPY_DRIVER)' "$MAKEFILE" \
+  && ok "Makefile pins kernel Clippy to the Rust 1.93 toolchain" \
+  || bad "Makefile must pass the Rust 1.93 clippy-driver to Kbuild"
+
 grep -q 'CONFIG_DEBUG_INFO_BTF_MODULES= modules' "$MAKEFILE" \
   && grep -q 'scripts/gen-btf.sh' "$MAKEFILE" \
   && grep -q -- '--btf_base "$(BTF_BASE)"' "$MAKEFILE" \

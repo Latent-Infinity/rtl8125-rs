@@ -23,11 +23,15 @@ echo
 echo "== RTL8125B hardware init parity =="
 bash "$CI/check_hw_init.sh" || rc=1
 echo
+echo "== §6.3 disposition-counter infrastructure (static) =="
+bash "$CI/check_counter_infrastructure.sh" || rc=1
+echo
 echo "== deferred to guest CI (need validated kernel toolchain — §15 #3/#4/#5) =="
 cat <<'EOF'
   - make CLIPPY=1            (kernel-build Clippy; NOT cargo clippy — plan §6.1/§11)
   - make -C $KDIR M=$PWD     (empty Rust module builds — §15 #14)
   - KASAN/KCSAN/lockdep/kmemleak/DMA_API_DEBUG guest soak (M1/M3/M5 gates)
+  - ci/check_counter_invariant.sh (runtime §6.3 invariant — needs chip)
 These are stubbed, not skipped: enable in CI after the debug+Rust guest kernel
 exists (see docs/VALIDATION_REPORT.md finding 2).
 EOF
