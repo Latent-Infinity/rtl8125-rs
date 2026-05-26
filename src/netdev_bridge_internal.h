@@ -9,8 +9,15 @@
 #include <linux/mii.h>
 #include <linux/netdevice.h>
 #include <linux/pci.h>
+#include <linux/percpu.h>
 #include <linux/phy.h>
 
+/* §6.3 disposition counters live in per-CPU storage so the hot-path
+ * `this_cpu_inc()` is a single decorated INC instruction with no cache-
+ * line bouncing between TX context (xmit / process) and reaper context
+ * (NAPI / softirq). See RUST_STANDARDS.md §15.2 and docs/M4_CLOSEOUT.md.
+ * `r8125_bridge_counters_snapshot` sums across CPUs for the userspace
+ * `ethtool -S` surface. */
 struct r8125_bridge {
 	struct net_device *ndev;
 	struct pci_dev *pdev;
@@ -23,17 +30,23 @@ struct r8125_bridge {
 	struct r8125_bridge_mdio_ops mdio_ops;
 	bool phy_connected;
 
-	u64 tx_received;
-	u64 tx_consumed;
-	u64 tx_busy_exception;
-	u64 tx_dropped_error;
-	u64 rx_handed_to_stack;
-	u64 rx_dropped_error;
+	u64 __percpu *tx_received;
+	u64 __percpu *tx_consumed;
+	u64 __percpu *tx_busy_exception;
+	u64 __percpu *tx_dropped_error;
+	u64 __percpu *rx_handed_to_stack;
+	u64 __percpu *rx_dropped_error;
 };
 
 /* ethtool ops table; defined in netdev_bridge_ethtool.c. Exposes the
  * §6.3 counters via `ethtool -S` so the runtime invariant check
  * (`ci/check_counter_invariant.sh`) can read them from userspace. */
 extern const struct ethtool_ops r8125_bridge_ethtool_ops;
+
+/* §6.3 percpu counter lifecycle helpers, defined in
+ * netdev_bridge_counters.c. Called from r8125_bridge_alloc /
+ * r8125_bridge_{free,unregister_and_free} only; never on a hot path. */
+int  r8125_bridge_counters_alloc(struct r8125_bridge *b);
+void r8125_bridge_counters_free(struct r8125_bridge *b);
 
 #endif /* _R8125_NETDEV_BRIDGE_INTERNAL_H */

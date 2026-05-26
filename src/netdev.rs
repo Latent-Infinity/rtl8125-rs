@@ -121,6 +121,8 @@ pub(crate) struct NetdevState {
     /// Set by `NetdevHandle::new_with_state` after `bridge_alloc` returns.
     /// Read by `ndo_open`/`stop`/etc. when they need to call back into
     /// the cshim (`carrier_on`, `tx_wake_queue`, `napi_schedule`, …).
+    // NOT-PADDED: set-once at probe, then read-only from every other
+    // context — no concurrent writer means no false-sharing pressure.
     pub(crate) ndev: AtomicPtr<bindings::net_device>,
 
     /// IRQ number (`pdev->irq`). Captured at probe; passed to
@@ -171,6 +173,8 @@ pub(crate) struct NetdevState {
     /// MDIO writes to MII reg 0x1F switch pages; subsequent MII reads/writes
     /// use this base. Single-context (process), but atomic for the &self
     /// access pattern.
+    // NOT-PADDED: PHY-config slow path; mutated only from process
+    // context (MDIO bus callbacks), no hot-path contention.
     pub(crate) ocp_base: AtomicU32,
 }
 

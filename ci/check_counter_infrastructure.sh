@@ -33,22 +33,23 @@ INTERNAL="$ROOT/src/netdev_bridge_internal.h"
 BRIDGE_C="$ROOT/src/netdev_bridge.c"
 OFFLOAD_C="$ROOT/src/netdev_bridge_offload.c"
 ETHTOOL_C="$ROOT/src/netdev_bridge_ethtool.c"
+COUNTERS_C="$ROOT/src/netdev_bridge_counters.c"
 BRIDGE_H="$ROOT/src/netdev_bridge.h"
 
 for c in "${COUNTERS[@]}"; do
-	# 1. struct field present
-	if ! grep -qE "^\s*u64\s+$c;" "$INTERNAL"; then
-		red "missing u64 $c; field in struct r8125_bridge ($INTERNAL)"
+	# 1. struct field present as percpu pointer (post-#45 storage shape).
+	if ! grep -qE "^\s*u64\s+__percpu\s+\*$c;" "$INTERNAL"; then
+		red "missing 'u64 __percpu *$c;' field in struct r8125_bridge ($INTERNAL)"
 		continue
 	fi
-	# 2. at least one WRITE_ONCE increment site in either bridge .c
-	if ! grep -qE "WRITE_ONCE\(b->$c\b" "$BRIDGE_C" "$OFFLOAD_C"; then
-		red "no WRITE_ONCE(b->$c, ...) increment site found"
+	# 2. at least one this_cpu_inc increment site in either bridge .c
+	if ! grep -qE "this_cpu_inc\(\*b->$c\)" "$BRIDGE_C" "$OFFLOAD_C"; then
+		red "no this_cpu_inc(*b->$c) increment site found"
 		continue
 	fi
-	# 3. counter exposed by snapshot function
-	if ! grep -qE "out->$c\s*=\s*READ_ONCE\(b->$c\)" "$BRIDGE_C"; then
-		red "$c not copied into r8125_bridge_counters in snapshot"
+	# 3. counter exposed by snapshot function via bridge_counter_sum
+	if ! grep -qE "out->$c\s*=\s*bridge_counter_sum\(b->$c\)" "$COUNTERS_C"; then
+		red "$c not summed into r8125_bridge_counters in snapshot"
 		continue
 	fi
 	# 4. counter exposed by ethtool -S
@@ -56,8 +57,40 @@ for c in "${COUNTERS[@]}"; do
 		red "$c not advertised via ethtool -S (missing from bridge_ethtool_strings)"
 		continue
 	fi
-	grn "§6.3 counter $c: field + increment + snapshot + ethtool"
+	grn "§6.3 counter $c: percpu field + this_cpu_inc + sum-snapshot + ethtool"
 done
+
+# bridge_counter_sum must walk all possible CPUs so the snapshot reflects
+# every increment, not just the calling CPU's slot. Use awk to scan the
+# function body — single-line greps miss multi-line C control flow.
+if awk '/static u64 bridge_counter_sum/,/^}/' "$COUNTERS_C" | \
+	grep -qE "for_each_possible_cpu"; then
+	grn "bridge_counter_sum walks all possible CPUs"
+else
+	red "bridge_counter_sum does not iterate for_each_possible_cpu"
+fi
+
+# Lifecycle helpers must exist and call free_percpu for each counter.
+if grep -qE "^int\s+r8125_bridge_counters_alloc\(" "$COUNTERS_C" && \
+   grep -qE "^void\s+r8125_bridge_counters_free\(" "$COUNTERS_C"; then
+	grn "percpu lifecycle helpers r8125_bridge_counters_alloc/free defined"
+else
+	red "missing r8125_bridge_counters_alloc/free lifecycle helpers"
+fi
+free_count=$(awk '/^void r8125_bridge_counters_free/,/^}/' "$COUNTERS_C" | \
+	grep -cE "free_percpu\(b->")
+if [[ "$free_count" -lt 6 ]]; then
+	red "r8125_bridge_counters_free calls free_percpu only $free_count times (expected 6)"
+else
+	grn "r8125_bridge_counters_free releases all 6 percpu counters"
+fi
+# Lifecycle helpers must be wired into both alloc + both free paths.
+if grep -q "r8125_bridge_counters_alloc(" "$BRIDGE_C" && \
+   [[ "$(grep -c 'r8125_bridge_counters_free(' "$BRIDGE_C")" -ge 2 ]]; then
+	grn "counters_alloc + counters_free wired into bridge lifecycle"
+else
+	red "counters_alloc/free not wired into r8125_bridge_alloc + both free paths"
+fi
 
 # Cross-check: the ethtool string table length matches the counter count
 nstrings=$(awk '/bridge_ethtool_strings\[\]\[ETH_GSTRING_LEN\]/,/^};/' "$ETHTOOL_C" | grep -c '^\s*"')

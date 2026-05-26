@@ -91,20 +91,33 @@ The following code paths are HOT and demand strict standards adherence:
    - Minimum work: read+ack ISR, mask further IRQs, schedule NAPI.
    - Currently follows this discipline.
 
-Counters in `src/netdev_bridge.c` (`tx_received`, `tx_consumed`, …) are
-currently single `u64` with `READ_ONCE`/`WRITE_ONCE`. Section 15.2 calls
-for **per-core sharding with cache padding** to avoid false sharing under
-load — **TODO M5 refactor**, possibly via percpu counters.
+Counters in `src/netdev_bridge_counters.c` (`tx_received`,
+`tx_consumed`, `tx_busy_exception`, `tx_dropped_error`,
+`rx_handed_to_stack`, `rx_dropped_error`) are sharded per-CPU via
+`u64 __percpu *` storage with `this_cpu_inc(*b->X)` on the hot path
+(a single decorated INC on x86 with no cache-line bouncing). The
+ethtool / snapshot reader sums across `for_each_possible_cpu` —
+acceptable cost for a non-hot-path readout. Lifecycle helpers
+`r8125_bridge_counters_alloc` / `_free` allocate and free all six
+counters in lockstep; the wiring is enforced by
+`ci/check_counter_infrastructure.sh`.
 
 ### Mandatory enforcement (Section 18) — what CI already does
 
 - `ci/check_unsafe_allowlist.sh` enforces the unsafe-allowlist + crate-root
   `#![deny(unsafe_code)]` + non-increasing census + raw-MMIO containment.
 - `ci/check_dco_assistedby.sh` enforces the §9.2 DCO / Assisted-by policy.
-- **TODO**: add a Clippy gate with the configuration from Section 18 once
-  the kernel-Rust build's Clippy support is wired in.
-- **TODO**: cache-padding lint or convention check for atomics in
-  cross-context structs (NetdevState specifically).
+- `ci/check_clippy.sh` runs `make CLIPPY=1` (the kernel-Rust build's
+  in-tree Clippy — **not** `cargo clippy`) and fails on any
+  `warning:`-prefixed lint. Skips cleanly when the validated
+  toolchain (rustc-1.93 + clippy-driver-1.93) is absent.
+- `ci/check_cache_padding.sh` enforces that non-array `Atomic*` fields
+  in cross-context structs (currently `NetdevState`) are wrapped in
+  `CachePadded<...>` or carry an explicit `// NOT-PADDED:` annotation
+  on a nearby comment line documenting why padding is unnecessary.
+- `ci/check_counter_infrastructure.sh` enforces that the six §6.3
+  disposition counters are wired through storage, increments,
+  snapshot, and `ethtool -S`.
 
 ### When in doubt
 

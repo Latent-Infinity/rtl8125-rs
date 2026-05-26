@@ -173,7 +173,7 @@ int r8125_bridge_skb_data_dma_map(struct device *dev, struct sk_buff *skb,
 
 	h = dma_map_single(dev, skb->data, len, DMA_TO_DEVICE);
 	if (b)
-		WRITE_ONCE(b->tx_received, READ_ONCE(b->tx_received) + 1);
+		this_cpu_inc(*b->tx_received);
 	if (dma_mapping_error(dev, h))
 		return -EIO;
 	*out_handle = h;
@@ -256,7 +256,7 @@ void r8125_bridge_skb_consume_tx(struct net_device *ndev, struct sk_buff *skb)
 	 * packet size including all paged frags), not from any single
 	 * descriptor's LEN field (chip clears those on completion). */
 	if (b)
-		WRITE_ONCE(b->tx_consumed, READ_ONCE(b->tx_consumed) + 1);
+		this_cpu_inc(*b->tx_consumed);
 	if (ndev)
 		r8125_bridge_account_tx(ndev, skb->len);
 	napi_consume_skb(skb, 1);

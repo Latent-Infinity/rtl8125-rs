@@ -171,6 +171,11 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	b->priv = priv;
 	b->ops = *ops;
 
+	if (r8125_bridge_counters_alloc(b)) {
+		free_netdev(ndev);
+		return NULL;
+	}
+
 	netif_napi_add_weight(ndev, &b->napi, bridge_napi_poll,
 			      BRIDGE_NAPI_WEIGHT);
 	return ndev;
@@ -182,6 +187,7 @@ void r8125_bridge_free(struct net_device *ndev)
 	struct r8125_bridge *b = netdev_priv(ndev);
 
 	netif_napi_del(&b->napi);
+	r8125_bridge_counters_free(b);
 	free_netdev(ndev);
 }
 EXPORT_SYMBOL_GPL(r8125_bridge_free);
@@ -210,6 +216,7 @@ void r8125_bridge_unregister_and_free(struct net_device *ndev)
 		b->phydev = NULL;
 	}
 	netif_napi_del(&b->napi);
+	r8125_bridge_counters_free(b);
 	free_netdev(ndev);
 }
 EXPORT_SYMBOL_GPL(r8125_bridge_unregister_and_free);
@@ -285,8 +292,7 @@ void r8125_bridge_skb_free_error(struct sk_buff *skb)
 	struct r8125_bridge *b = ndev ? netdev_priv(ndev) : NULL;
 
 	if (b)
-		WRITE_ONCE(b->tx_dropped_error,
-			   READ_ONCE(b->tx_dropped_error) + 1);
+		this_cpu_inc(*b->tx_dropped_error);
 	dev_kfree_skb_any(skb);
 }
 EXPORT_SYMBOL_GPL(r8125_bridge_skb_free_error);
@@ -295,8 +301,7 @@ void r8125_bridge_tx_busy_exception(struct net_device *ndev)
 {
 	struct r8125_bridge *b = netdev_priv(ndev);
 
-	WRITE_ONCE(b->tx_busy_exception,
-		   READ_ONCE(b->tx_busy_exception) + 1);
+	this_cpu_inc(*b->tx_busy_exception);
 }
 EXPORT_SYMBOL_GPL(r8125_bridge_tx_busy_exception);
 
@@ -319,7 +324,7 @@ void r8125_bridge_skb_deliver_rx(struct napi_struct *napi, struct sk_buff *skb)
 {
 	struct r8125_bridge *b = container_of(napi, struct r8125_bridge, napi);
 
-	WRITE_ONCE(b->rx_handed_to_stack, READ_ONCE(b->rx_handed_to_stack) + 1);
+	this_cpu_inc(*b->rx_handed_to_stack);
 	napi_gro_receive(napi, skb);
 }
 EXPORT_SYMBOL_GPL(r8125_bridge_skb_deliver_rx);
@@ -330,8 +335,7 @@ void r8125_bridge_skb_drop_rx(struct sk_buff *skb)
 	struct r8125_bridge *b = ndev ? netdev_priv(ndev) : NULL;
 
 	if (b)
-		WRITE_ONCE(b->rx_dropped_error,
-			   READ_ONCE(b->rx_dropped_error) + 1);
+		this_cpu_inc(*b->rx_dropped_error);
 	dev_kfree_skb_any(skb);
 }
 EXPORT_SYMBOL_GPL(r8125_bridge_skb_drop_rx);
@@ -340,23 +344,10 @@ void r8125_bridge_rx_drop_error(struct net_device *ndev)
 {
 	struct r8125_bridge *b = netdev_priv(ndev);
 
-	WRITE_ONCE(b->rx_dropped_error,
-		   READ_ONCE(b->rx_dropped_error) + 1);
+	this_cpu_inc(*b->rx_dropped_error);
 }
 EXPORT_SYMBOL_GPL(r8125_bridge_rx_drop_error);
 
-void r8125_bridge_counters_snapshot(struct net_device *ndev,
-				    struct r8125_bridge_counters *out)
-{
-	struct r8125_bridge *b = netdev_priv(ndev);
-
-	out->tx_received       = READ_ONCE(b->tx_received);
-	out->tx_consumed       = READ_ONCE(b->tx_consumed);
-	out->tx_busy_exception = READ_ONCE(b->tx_busy_exception);
-	out->tx_dropped_error  = READ_ONCE(b->tx_dropped_error);
-	out->rx_handed_to_stack = READ_ONCE(b->rx_handed_to_stack);
-	out->rx_dropped_error  = READ_ONCE(b->rx_dropped_error);
-}
-EXPORT_SYMBOL_GPL(r8125_bridge_counters_snapshot);
+/* r8125_bridge_counters_snapshot lives in netdev_bridge_counters.c. */
 
 MODULE_LICENSE("GPL v2");
