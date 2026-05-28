@@ -5,6 +5,12 @@ platform for M6+ work. The current Controller box keeps its KVM-based
 quick-iteration loop; Gateway runs the Rust driver directly on Linux for
 the soak/perf/L1.x gates that VFIO/KVM can't honestly test.
 
+Assumption for this runbook: the operator installs a minimal Ubuntu 26.04
+LTS Server image first, logs in locally once, brings up WiFi + SSH, optionally
+joins the machine to Tailscale, and then hands the machine to the agent. From
+that point forward, identity checks, toolchain setup, kernel install, driver
+builds, and long-running validation are agent-driven over SSH.
+
 This runbook is the alternate to [`M0a_TO_M1_RUNBOOK.md`](M0a_TO_M1_RUNBOOK.md).
 Where that doc gets the Controller's KVM guest going, this doc gets the
 Gateway's bare-metal environment going. Both reference the same plan
@@ -46,10 +52,10 @@ as the Controller-KVM workflow.
 
 | # | Phase | Owner | Clears |
 |---|---|---|---|
-| 1 | [Hardware identity check](#phase-1) | 🔌 operator | Gateway is an MS-A2 with the expected NICs |
-| 2 | [Ubuntu install + first boot](#phase-2) | ☢️ operator | OS in place, accessible by SSH password |
-| 3 | [WiFi management link](#phase-3) | 🔌 operator | Ethernet stays reserved for cross-traffic; SSH works over WiFi |
-| 4 | [Agent SSH key + passwordless sudo](#phase-4) | ☢️ operator | 🤖 agent can drive Gateway autonomously |
+| 1 | [Minimal Ubuntu Server bootstrap](#phase-1) | ☢️ operator | OS, WiFi management, optional Tailscale, and password SSH are available |
+| 2 | [Agent SSH key + passwordless sudo](#phase-2) | ☢️ operator + 🤖 agent | 🤖 agent can drive Gateway autonomously |
+| 3 | [Agent-run hardware identity check](#phase-3) | 🤖 agent | Gateway is an MS-A2 with the expected NICs; PCI addresses captured |
+| 4 | [Management-link hardening](#phase-4) | 🤖 agent | SSH is pinned to WiFi; Ethernet stays reserved for cross-traffic |
 | 5 | [Build + install the debug+Rust kernel](#phase-5) | 🤖 agent (operator may need to enter sudo once for kernel install) | Same kernel as Controller's KVM guest; debug knobs armed |
 | 6 | [Network topology: internal cross-traffic](#phase-6) | 🔌 operator + 🤖 agent | RTL8125B ↔ I226-V cable on Gateway, IP scheme |
 | 7 | [Driver build + smoke test](#phase-7) | 🤖 agent | First insmod on bare metal, link up, ping passes |
@@ -59,104 +65,72 @@ as the Controller-KVM workflow.
 
 ---
 
-## Phase 1 — Hardware identity check {#phase-1}
+## Phase 1 — Minimal Ubuntu Server bootstrap {#phase-1}
 
-🔌 operator · ~5 min · validates Gateway is structurally identical to Controller.
+☢️ operator · ~30 min · installs the minimal OS and creates the first
+remote-management foothold.
 
-The MS-A2 SKU should be the same on both units. Confirm:
+Install **Ubuntu 26.04 LTS Server**, not Desktop, for the dev phase. The
+server install should be as small as practical while still enabling the
+MT7922 WiFi firmware and OpenSSH.
 
-1. Power on Gateway, boot to whatever's currently installed (live USB
-   if needed), open a terminal.
-2. Run:
+1. Install Ubuntu 26.04 LTS Server to Gateway's primary disk.
+2. Create the `operator` user (or whatever username matches the
+   Controller account). Use the same UID as Controller if the installer
+   makes that practical.
+3. Enable restricted firmware / third-party firmware during install so
+   the MT7922 WiFi device works after first boot.
+4. On first boot, log in locally and install the minimal bootstrap tools:
    ```bash
-   sudo lspci -nn | grep -iE 'ethernet|network'
+   sudo apt update
+   sudo apt full-upgrade -y
+   sudo apt install -y openssh-server vim build-essential network-manager curl
    ```
-3. Expect three rows that match Controller's hardware:
-   ```
-   ##:##.# Ethernet controller [0200]: Realtek Semiconductor ...
-                       RTL8125 2.5GbE Controller [10ec:8125] (rev 05)
-   ##:##.# Ethernet controller [0200]: Intel Corporation
-                       Ethernet Controller I226-V [8086:125c] (rev 04)
-   ##:##.0 Network controller [0280]: MEDIATEK Corp. MT7922 802.11ax ...
-   ```
-   The PCI addresses (`##:##.#`) may differ between units; the **device
-   IDs** must match. (The MS-A2 also ships two X710 SFP+ ports —
-   `[8086:1572]` — these are unused for this work and may remain DOWN.)
-4. Record Gateway's specific PCI address for the RTL8125B in
-   `docs/GATEWAY_HARDWARE.md` once installation completes. The
-   address goes in the agent's automation scripts (mirrors the
-   Controller-KVM `0000:05:00.0` constant).
-
-**Acceptance**: three NICs visible with matching device IDs; one each of
-RTL8125, I226-V, MT7922.
-
----
-
-## Phase 2 — Ubuntu install + first boot {#phase-2}
-
-☢️ operator · ~30 min · puts a known OS on the disk.
-
-1. Download Ubuntu 26.04 LTS Desktop or Server installer (whichever you
-   prefer for the dev phase; Desktop is friendlier for debugging on a
-   plugged-in monitor).
-2. Install to Gateway's primary disk. Allow the installer to enable
-   third-party drivers / restricted firmware (needed for MT7922 WiFi).
-3. Create the `operator` user (or whatever username matches your
-   Controller account) with the same UID if possible — this keeps
-   ownership consistent on shared rsync targets.
-4. First boot: log in, run `sudo apt update && sudo apt full-upgrade -y`,
-   then `sudo apt install -y openssh-server vim build-essential`. Reboot.
-5. Note Gateway's IP (`ip addr show`) and confirm SSH works from
-   Controller:
-   ```bash
-   ssh operator@<gateway-ip>           # password auth, one-time
-   ```
-
-**Acceptance**: SSH-able from Controller using password.
-
----
-
-## Phase 3 — WiFi management link {#phase-3}
-
-🔌 operator · ~10 min · Ethernet stays reserved for cross-traffic.
-
-The Ethernet ports (RTL8125B + I226-V) are reserved for the driver and
-cross-traffic tests. **Management traffic (SSH, rsync, apt) goes over
-WiFi.**
-
-1. Connect Gateway's MT7922 to the operator's home/lab WiFi. Use
-   `nmcli` if no GUI is available:
+5. Bring up the MT7922 WiFi management link:
    ```bash
    nmcli dev wifi list
    nmcli dev wifi connect '<ssid>' password '<wpa-psk>'
    ```
-2. Verify:
+6. Verify basic network and SSH:
    ```bash
-   ip -br addr show wlp6s0          # or whatever the MT7922 interface is
+   ip -br addr
    ping -c 3 1.1.1.1
+   sudo systemctl enable --now ssh
    ```
-3. **Pin SSH to the WiFi interface**: edit `/etc/ssh/sshd_config` if you
-   want to be explicit about `ListenAddress <wlp-ip>`, then
-   `sudo systemctl restart ssh`. Not strictly required but reduces
-   ambiguity once the Ethernet ports come up under test loads.
-4. Record Gateway's WiFi IP and configure your operator's `~/.ssh/config`
-   on Controller:
-   ```
-   Host gateway
-       HostName <gateway-wifi-ip>
-       User operator
-       IdentityFile ~/.ssh/agent/rtl8125_gateway_codex
-       StrictHostKeyChecking accept-new
+7. From Controller, confirm password SSH works once:
+   ```bash
+   ssh operator@<gateway-wifi-ip> 'hostname; whoami; uname -a'
    ```
 
-**Acceptance**: `ssh gateway hostname` returns the right hostname over
-WiFi; Ethernet interfaces are DOWN (no carrier expected yet).
+8. **Optional but recommended: join Tailscale for stable remote access.**
+   This gives the agent a stable management address even if the WiFi DHCP
+   lease changes or Gateway moves between networks. SSH still uses normal
+   OpenSSH on port 22; it just connects to Gateway's Tailscale IP or
+   MagicDNS name. Install and authenticate:
+   ```bash
+   curl -fsSL https://tailscale.com/install.sh | sh
+   sudo tailscale up --ssh=false --hostname=gateway-rtl8125
+   tailscale status
+   tailscale ip -4
+   ```
+   Use a normal Tailscale auth flow unless the operator has a reusable
+   auth key policy. Do not enable Tailscale SSH for this workflow; keep
+   OpenSSH + the dedicated agent key as the audited control path. Tailscale
+   is only the private network path to the SSH daemon.
+9. If Tailscale is active, test from Controller:
+   ```bash
+   ssh operator@<gateway-tailnet-ip-or-name> 'hostname; whoami; uname -a'
+   ```
+
+**Acceptance**: Gateway is reachable from Controller by password SSH over
+WiFi. If Tailscale is enabled, the same OpenSSH login also works via the
+tailnet IP or MagicDNS name. Ethernet ports are not used for management.
 
 ---
 
-## Phase 4 — Agent SSH key + passwordless sudo {#phase-4}
+## Phase 2 — Agent SSH key + passwordless sudo {#phase-2}
 
-☢️ operator · ~10 min · allows 🤖 agent autonomous control.
+☢️ operator + 🤖 agent · ~10 min · allows autonomous Gateway control.
 
 The agent drives Gateway via SSH the same way it drives the
 Controller-KVM guest today (via `~/.ssh/agent/rtl8125_guest_codex`).
@@ -165,35 +139,131 @@ Mirror that pattern for Gateway.
 1. On **Controller** (where the agent runs), generate a new key pair:
    ```bash
    ssh-keygen -t ed25519 -N '' -f ~/.ssh/agent/rtl8125_gateway_codex \
-       -C 'agent@controller → gateway'
+       -C 'agent@controller-gateway'
    ```
-2. Copy the public key to Gateway:
+2. Copy the public key to Gateway using the password SSH bootstrap. Prefer
+   the Tailscale IP/name if Phase 1 enabled it; otherwise use the WiFi LAN
+   address:
    ```bash
    ssh-copy-id -i ~/.ssh/agent/rtl8125_gateway_codex.pub \
-       operator@<gateway-wifi-ip>
+       operator@<gateway-tailnet-ip-or-wifi-ip>
    ```
-3. Test the keyed SSH:
-   ```bash
-   ssh -i ~/.ssh/agent/rtl8125_gateway_codex operator@<gateway-wifi-ip> \
-       'hostname; whoami; uname -a'
+3. Add a stable SSH alias on Controller:
    ```
-4. **On Gateway**, enable passwordless sudo for the `operator` user
-   (matches Controller-KVM guest):
-   ```bash
-   echo 'operator ALL=(ALL) NOPASSWD: ALL' | \
-       sudo tee /etc/sudoers.d/99-operator-nopw
-   sudo chmod 0440 /etc/sudoers.d/99-operator-nopw
-   sudo visudo -c
+   Host gateway
+       HostName <gateway-tailnet-ip-or-wifi-ip>
+       User operator
+       IdentityFile ~/.ssh/agent/rtl8125_gateway_codex
+       StrictHostKeyChecking accept-new
    ```
-5. Test from Controller:
+   If Tailscale is enabled, use the tailnet IP or MagicDNS name here. If
+   not, use the WiFi LAN address and update it if DHCP changes.
+4. Test keyed SSH:
    ```bash
-   ssh -i ~/.ssh/agent/rtl8125_gateway_codex operator@<gateway-wifi-ip> \
-       'sudo whoami'   # should print "root" without prompting
+   ssh gateway 'hostname; whoami; uname -a'
+   ```
+5. Enable passwordless sudo on Gateway for the `operator` user
+   (matches the Controller-KVM guest):
+   ```bash
+   ssh gateway '
+       echo "operator ALL=(ALL) NOPASSWD: ALL" | \
+           sudo tee /etc/sudoers.d/99-operator-nopw
+       sudo chmod 0440 /etc/sudoers.d/99-operator-nopw
+       sudo visudo -c
+   '
+   ```
+6. Test non-interactive sudo:
+   ```bash
+   ssh gateway 'sudo -n whoami'
    ```
 
-**Acceptance**: agent can `sudo` over keyed SSH without a password prompt.
-This is the same posture used today for the Controller-KVM guest;
-necessary so the agent can `insmod`, `ip link`, write to `/sys`, etc.
+**Acceptance**: `ssh gateway 'sudo -n whoami'` prints `root` without a
+password prompt. The agent can now run the remaining setup phases.
+
+---
+
+## Phase 3 — Agent-run hardware identity check {#phase-3}
+
+🤖 agent · ~5 min · validates Gateway is structurally identical to
+Controller and records machine-specific PCI addresses.
+
+Run from Controller:
+
+```bash
+ssh gateway '
+    set -eu
+    hostname
+    whoami
+    sudo -n true
+    uname -a
+    sudo lspci -nn | grep -iE "ethernet|network"
+'
+```
+
+Expect rows matching Controller's hardware:
+
+```
+##:##.# Ethernet controller [0200]: Realtek Semiconductor ...
+                    RTL8125 2.5GbE Controller [10ec:8125] (rev 05)
+##:##.# Ethernet controller [0200]: Intel Corporation
+                    Ethernet Controller I226-V [8086:125c] (rev 04)
+##:##.0 Network controller [0280]: MEDIATEK Corp. MT7922 802.11ax ...
+```
+
+The PCI addresses (`##:##.#`) may differ between units; the **device IDs**
+must match. The MS-A2 also ships two X710 SFP+ ports (`[8086:1572]`);
+those are unused for this work and may remain DOWN.
+
+Record Gateway's specific values in `docs/GATEWAY_HARDWARE.md`:
+
+```markdown
+# Gateway hardware
+
+Captured: YYYY-MM-DD
+
+| Device | PCI address | ID | Notes |
+|---|---:|---|---|
+| RTL8125B | `0000:??:??.?` | `[10ec:8125]` | driver target |
+| I226-V | `0000:??:??.?` | `[8086:125c]` | traffic peer |
+| MT7922 | `0000:??:??.?` | `[14c3:????]` | WiFi management |
+```
+
+**Acceptance**: keyed SSH works, passwordless sudo works, NIC IDs match,
+and `docs/GATEWAY_HARDWARE.md` records Gateway's actual PCI addresses.
+
+---
+
+## Phase 4 — Management-link hardening {#phase-4}
+
+🤖 agent · ~10 min · keeps Ethernet reserved for driver traffic.
+
+Management traffic (SSH, rsync, apt) must stay on WiFi. The Ethernet
+ports (RTL8125B + I226-V) are reserved for driver and cross-traffic
+tests.
+
+1. Verify WiFi is the local management path:
+   ```bash
+   ssh gateway 'ip -br addr; ip route get 1.1.1.1'
+   ```
+2. If Tailscale is enabled, verify tailnet reachability and record the SSH
+   target address:
+   ```bash
+   ssh gateway 'tailscale status; tailscale ip -4'
+   ```
+3. Optionally pin `sshd` to the WiFi and/or Tailscale addresses by setting
+   `ListenAddress <gateway-wifi-ip>` and, if enabled,
+   `ListenAddress <gateway-tailnet-ip>` in `/etc/ssh/sshd_config`, then:
+   ```bash
+   ssh gateway 'sudo systemctl restart ssh'
+   ```
+4. Confirm the Ethernet links are not carrying management traffic before
+   the cross-cable phase:
+   ```bash
+   ssh gateway 'ip -br link'
+   ```
+
+**Acceptance**: `ssh gateway hostname` returns the right hostname over
+WiFi or Tailscale; Ethernet interfaces are DOWN (no carrier expected yet).
 
 ---
 
@@ -303,7 +373,8 @@ between the two NIC IPs once the driver is loaded.
        echo r8125_rust | sudo tee /sys/bus/pci/devices/0000:??:??.0/driver_override
    '
    ```
-   Replace `0000:??:??.0` with the actual PCI address from Phase 1.
+   Replace `0000:??:??.0` with the RTL8125B PCI address captured in
+   Phase 3.
 2. rsync the crate from Controller to Gateway:
    ```bash
    rsync -e "ssh -i ~/.ssh/agent/rtl8125_gateway_codex" \
@@ -452,7 +523,7 @@ unit.
 
 ## Agent control surface (what the agent has access to)
 
-After Phase 4 is complete, the agent on Controller can:
+After Phase 2 is complete, the agent on Controller can:
 
 ```bash
 # Run any shell on Gateway
