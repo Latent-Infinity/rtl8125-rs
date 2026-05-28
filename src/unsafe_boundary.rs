@@ -280,26 +280,88 @@ fn pci_dev_raw_from_aref(
     opaque.get()
 }
 
-/// `request_threaded_irq(handler=fn, thread_fn=NULL, IRQF_SHARED, name, cookie)`.
+/// `request_threaded_irq(handler=fn, thread_fn=NULL, flags, name, cookie)`.
+///
+/// `flags` is selected by the caller based on the IRQ delivery mode:
+///   - INTx → `IRQF_SHARED` (the pin is potentially shared with other
+///     functions on the PCIe bus / motherboard).
+///   - MSI / MSI-X → 0 (message-signaled vectors are per-device and
+///     cannot be shared; `IRQF_SHARED` would be rejected by the kernel).
 pub(crate) fn request_irq(
     irq: u32,
     handler: unsafe extern "C" fn(c_int, *mut c_void) -> bindings::irqreturn_t,
     cookie: *mut c_void,
+    flags: usize,
 ) -> Result<()> {
     // SAFETY: handler is a fixed Rust extern "C" fn; cookie outlives the IRQ
     // registration (NetdevState lives until NetdevHandle drops, which only
-    // happens after ndo_stop has free_irq'd). Shared INTx is the M4 baseline.
+    // happens after ndo_stop has free_irq'd). Flag selection is the caller's
+    // responsibility (Intx vs MSI/MSI-X — see `IrqMode` in `netdev.rs`).
     let rc = unsafe {
         bindings::request_threaded_irq(
             irq,
             Some(handler),
             None,
-            bindings::IRQF_SHARED as usize,
+            flags,
             c"r8125_rust".as_ptr().cast::<u8>(),
             cookie,
         )
     };
     to_result(rc)
+}
+
+/// `IRQF_SHARED` from `include/linux/interrupt.h` — re-exported so the
+/// non-FFI call sites in `netdev::ndo_open` don't have to touch
+/// `bindings::*` directly.
+pub(crate) const IRQF_SHARED: usize = bindings::IRQF_SHARED as usize;
+
+// ── PCI IRQ vector allocation (M6 #1 Phase A.2) ──────────────────────────
+//
+// Kernel-Rust ships safe `pci::Device<Bound>::alloc_irq_vectors` that
+// internally registers the allocation with `devres` so
+// `pci_free_irq_vectors` fires automatically at device unbind. We use it
+// from probe; the returned `IrqVector<'a>` range can be dropped after we
+// extract the IRQ number because the devres handle (not the range) owns
+// the lifetime.
+
+/// Allocate exactly one IRQ vector for `pdev`. Tries the types in
+/// `irq_types` in the kernel's preferred order (MSI-X → MSI → INTx when
+/// `IrqTypes::all()` is passed). Devres handles `pci_free_irq_vectors`
+/// at device unbind.
+///
+/// Returns `Ok(())` on success; we discard the `IrqVector` range because
+/// the chip only consumes one vector (queue 0) and we look up its kernel
+/// IRQ number separately via [`pci_irq_vector`].
+pub(crate) fn alloc_one_irq_vector(
+    pdev: &pci::Device<kernel::device::Core>,
+    irq_types: pci::IrqTypes,
+) -> Result<()> {
+    pdev.alloc_irq_vectors(1, 1, irq_types).map(|_range| ())
+}
+
+/// `pci_irq_vector(pdev, index)` — fetch the kernel IRQ number for the
+/// vector at `index`. Returns a `u32` rather than an `IrqVector` because
+/// the call sites pass the number into `request_threaded_irq`, which
+/// takes a bare `u32`.
+///
+/// # SAFETY
+///
+/// Must be called AFTER a successful `pci_alloc_irq_vectors` for `pdev`.
+/// The caller guarantees that — at probe time we do the allocation
+/// immediately before this call in the same probe function body.
+pub(crate) fn pci_irq_vector<Ctx: device::DeviceContext>(
+    pdev: &pci::Device<Ctx>,
+    index: u32,
+) -> Result<u32> {
+    let raw = pci_dev_raw(pdev);
+    // SAFETY: see fn-level contract; `raw` is valid for the lifetime of
+    // `pdev` (an `&pci::Device<Ctx>` borrow).
+    let rc = unsafe { bindings::pci_irq_vector(raw, index) };
+    if rc < 0 {
+        Err(kernel::error::Error::from_errno(rc))
+    } else {
+        Ok(rc as u32)
+    }
 }
 
 // ── NetdevState pointer-juggling helpers (keep unsafe in this file) ──────
@@ -341,14 +403,6 @@ pub(crate) fn kbox_drop_from_raw(p: *mut NetdevState) {
 pub(crate) fn state_set_ndev(p: *mut NetdevState, ndev: *mut bindings::net_device) {
     // SAFETY: see fn doc.
     unsafe { (*p).ndev.store(ndev, Ordering::Release) };
-}
-
-/// Read the IRQ number from `pci_dev->irq`.
-pub(crate) fn pci_dev_irq<Ctx: device::DeviceContext>(pdev: &pci::Device<Ctx>) -> u32 {
-    let raw = pci_dev_raw(pdev);
-    // SAFETY: pdev is a borrowed reference to a valid pci_dev; the `irq`
-    // field is a simple unsigned int populated by the kernel at probe.
-    unsafe { (*raw).irq }
 }
 
 /// Borrow `Regs` for the lifetime of a `&NetdevState`.

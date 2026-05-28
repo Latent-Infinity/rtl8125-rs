@@ -128,15 +128,15 @@ impl<'a> Regs<'a> {
         self.bar.write32(bits, regs::ISR);
     }
 
-    // ── ISR_V2 / IMR_V2 (M6 #1 scaffolding — Phase A.2 activates) ───────
+    // ── ISR_V2 / IMR_V2 (M6 #1 Phase A.2 — V2 register surface) ─────────
     //
-    // `clear_imr_v2_mask` and `ack_isr_v2` are USED in `ndo_stop` to
-    // mask both surfaces at teardown (idempotent — V2 writes are
-    // no-ops while the chip is in legacy mode). The other two methods
-    // wait for Phase A.2.
+    // The four methods below are the V2 counterparts of the legacy
+    // `isr`/`set_imr`/`ack_isr` window. `ndo_open` selects between the
+    // two via `state.irq_mode()`; `ndo_stop` writes BOTH (idempotent —
+    // V2 writes are no-ops while the chip is in legacy mode and vice
+    // versa). The IRQ handler reads one or the other depending on mode.
 
     /// Unmask the given message_id bits (write to IMR_V2_SET).
-    #[allow(dead_code)]
     pub(crate) fn set_imr_v2_mask(&self, bits: u32) {
         self.bar.write32(bits, regs::IMR_V2_SET);
     }
@@ -147,7 +147,6 @@ impl<'a> Regs<'a> {
     }
 
     /// Read which V2 message_ids have fired.
-    #[allow(dead_code)]
     pub(crate) fn isr_v2(&self) -> u32 {
         self.bar.read32(regs::ISR_V2)
     }

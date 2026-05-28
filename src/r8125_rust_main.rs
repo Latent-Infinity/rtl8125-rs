@@ -106,11 +106,14 @@ kernel::module_pci_driver! {
             default: 0,
             description: "Leave ASPM enabled (test-only, breaks TSO)",
         },
-        // M6 sub-feature #1 rollback knob. Phase A.1 keeps legacy
-        // INTx active regardless of this value because the V2 register
-        // layout only works once MSI-X/MSI vector allocation is wired.
-        // When Phase B enables V2, non-zero will force the legacy
-        // IMR/ISR path as a regression fallback.
+        // M6 sub-feature #1 rollback knob (Phase A.2 — ACTIVE).
+        // Default 0 lets probe call `pci_alloc_irq_vectors` with the
+        // MSI-X → MSI → INTx preference chain, then enable
+        // `INT_CFG0_ENABLE_8125` so the chip routes IRQs through the
+        // ISR_V2 register window. Non-zero forces probe to allocate
+        // an INTx vector only and leaves the legacy IMR/ISR window
+        // authoritative — used to A/B-test MSI-X vs INTx perf and as
+        // an escape hatch if MSI-X regresses on a deployment target.
         intx_only: u8 {
             default: 0,
             description: "Force legacy INTx ISR/IMR register layout (test rollback)",

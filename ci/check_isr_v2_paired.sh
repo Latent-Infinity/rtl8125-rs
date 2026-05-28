@@ -35,9 +35,10 @@ if ! grep -qE '\bset_imr_v2_mask\b' "$MMIO"; then
 	exit 0
 fi
 HW="$ROOT/src/hw.rs"
-if ! awk '/fn[[:space:]]+hw_start_8125b_unlocked/,/^}/' "$HW" 2>/dev/null | \
-		grep -qE 'set_int_cfg0\([^)]*INT_CFG0_ENABLE_8125'; then
-	yel "V2 surface scaffolded but chip-side activation deferred to Phase A.2 — pairing checks skipped"
+# Phase A.2 moves the activation out of hw_start_8125b into ndo_open
+# (gated on `state.irq_mode()`). Accept either location.
+if ! grep -hE 'set_int_cfg0\([^)]*INT_CFG0_ENABLE_8125' "$HW" "$NETDEV" >/dev/null 2>&1; then
+	yel "V2 surface scaffolded but chip-side activation deferred — pairing checks skipped"
 	exit 0
 fi
 

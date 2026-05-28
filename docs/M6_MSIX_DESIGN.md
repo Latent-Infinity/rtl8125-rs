@@ -127,24 +127,44 @@ until Phase A.2, and the legacy IRQ path is unchanged. Controller-KVM
 regression: 2.32 Gbps, 0 retransmits, ping 0.4 ms — baseline
 preserved exactly.
 
-**Phase A.2 — chip-side V2 enable + MSI-X allocation (PENDING).**
-Empirical finding 2026-05-28 (Controller-KVM): setting
-`INT_CFG0_ENABLE_8125` in `hw_start_8125b` while still using legacy
-INTx allocation **silently breaks IRQ delivery**. The chip stops
-asserting INTx once V2 mode is active; vendor source confirms
-(`r8125_n.c::rtl8125_alloc_irq`) that the MSI-X handler
-`rtl8125_interrupt_msix` and `HwCurrIsrVer > 1` are paired — the
-chip only signals via MSI messages in V2 mode. Therefore Phase A.2
-must land **MSI-X allocation + chip-side V2 enable in one atomic
-patch** with the `intx_only` param as the fallback. They cannot
-be split further.
+**Phase A.2 — chip-side V2 enable + MSI-X allocation (LANDED 2026-05-28).**
+The atomic patch wires `pci_alloc_irq_vectors` at probe (kernel-Rust
+`pci::Device<Bound>::alloc_irq_vectors` — devres-managed, so
+`pci_free_irq_vectors` fires at device unbind automatically), records
+the resulting `IrqMode { Intx, Msi }` on `NetdevState`, and branches
+the IRQ handler + `rearm_irq_baseline` + `ndo_open`'s
+`INT_CFG0_ENABLE_8125` write on that mode. `ndo_stop` keeps
+dual-masking both surfaces idempotently (no edit needed from A.1).
 
-Phase A.2 work list:
-- Add `pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSIX | PCI_IRQ_MSI | PCI_IRQ_INTX)` wrapper in `unsafe_boundary.rs`
-- Replace the current `request_irq(state.irq_num, ...)` call with the new vector-aware path
-- On allocation success with MSI-X or MSI: enable INT_CFG0_ENABLE_8125 in hw_start_8125b, switch raw_irq_handler + rearm_irq_baseline to V2 surface
-- On fallback to INTx OR with `intx_only=1`: keep legacy register surface (current behavior)
-- The CI engagement check `set_int_cfg0(...INT_CFG0_ENABLE_8125)` (already in tree) auto-engages the full check_msix_static.sh + check_isr_v2_paired.sh suites once Phase A.2 lands
+**Empirical finding 2026-05-28 #2 (Controller-KVM, fresh testing).**
+The first Phase A.2 cut still failed to deliver IRQs because the
+constant `INT_CFG0_ENABLE_8125` was `0x08` (BIT 3) — a misreading of
+`if_re.c:1410`'s mitigation-toggle codepath. Vendor agreement
+(`r8125.h:1825` and `if_re.h:1336 = 0x0001`) puts the V2-enable at
+**BIT 0**. After the one-bit fix, MSI-X delivery worked first try:
+
+| Path | iperf3 | ping | IRQ source | IRQ count after 5 s | TX completion |
+|---|---|---|---|---|---|
+| `intx_only=1` (regression fallback) | not run | 0 % loss, 0.4 ms | `IO-APIC 21-fasteoi r8125_rust` | 14 | 10/10 |
+| default (MSI-X) | **2.35 Gbps / 0 retr** | 0 % loss, 0.4 ms | `PCI-MSIX-0000:05:00.0 0-edge r8125_rust` | 58 098 | 122 049 / 122 050 |
+
+Rmmod is clean: `xmit_calls=122050 irq_fires=58098 napi_polls=58097`,
+unbinds clean, no kmemleak/WARN, `lsmod` confirms zero refcount.
+The Phase A.1 PCI design (vector allocation outside `ndo_open`,
+devres-managed) was kept. The two M6 design gates
+(`check_msix_static.sh` and `check_isr_v2_paired.sh`) now engage and
+PASS — total static CI is **57 PASS / 0 FAIL / 2 SKIP** (jumbo gates
+which are M6 sub-feature #2).
+
+Phase A.2 work that actually shipped:
+- `IrqMode { Intx, Msi }` enum on `NetdevState` (`AtomicU8` field) — set at probe, read by IRQ handler + `rearm_irq_baseline`
+- `unsafe_boundary::alloc_one_irq_vector` + `pci_irq_vector` wrappers around the kernel-Rust safe APIs
+- `unsafe_boundary::request_irq` now takes a `flags` parameter so `ndo_open` selects `IRQF_SHARED` for INTx and `0` for MSI/MSI-X
+- `INT_CFG0_ENABLE_8125` write moved from `hw_start_8125b` (which runs before mode is known) to `ndo_open` (gated on `state.irq_mode()`)
+- Raw IRQ handler + `napi::rearm_irq_baseline` both `match state.irq_mode()` — legacy ISR/IMR for Intx, V2 ISR/IMR for Msi
+- `pci.rs` probe tries `IrqType::MsiX | Msi` first, falls back to `IrqType::Intx` if that allocation fails (the `intx_only` param forces the fallback path)
+- `pci_dev_irq` removed (no callers; superseded by `pci_irq_vector(pdev, 0)`)
+- `INT_CFG0_ENABLE_8125` constant corrected to `0x01` with the bisection narrative inlined in `regs.rs`
 
 ## Proposed implementation path (Phase A.2 onward)
 

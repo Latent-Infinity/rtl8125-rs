@@ -32,20 +32,29 @@ use core::ffi::c_int;
 use core::ptr;
 use core::sync::atomic::Ordering;
 
-use crate::netdev::{NetdevState, RX_BUF_LEN};
+use crate::netdev::{IrqMode, NetdevState, RX_BUF_LEN};
 use crate::regs;
 use crate::ring::{Descriptor, RING_LEN};
 #[allow(clippy::unsafe_removed_from_name)]
 use crate::unsafe_boundary as ub;
 
-/// Re-arm the chip's interrupt sources to `INTR_M4_BASELINE`.
-/// Centralized here so the three call sites (ndo_open initial
-/// unmask, the IRQ handler, and napi_complete_done) read the same
-/// surface choice. M6 #1 Phase A.2 will branch this on the V2 vs
-/// legacy register layout based on whether MSI-X allocation
-/// succeeded; until then we always use legacy.
+/// Re-arm the chip's interrupt sources to the baseline mask. Branches on
+/// the probe-chosen [`IrqMode`]:
+///
+///   * `Intx` → write `INTR_M4_BASELINE` to legacy `IMR` (0x38).
+///   * `Msi`  → write `INTR_V2_M4_BASELINE` to `IMR_V2_SET` (0x0D0C);
+///     bits in this register are unmask-set semantics, so the same write
+///     re-arms after each NAPI cycle without first clearing.
+///
+/// Centralized here so the three call sites (ndo_open initial unmask,
+/// the IRQ handler tail, and napi_complete_done) read the same surface
+/// choice — keeping the IMR/IMR_V2 selection in one place keeps the
+/// invariant from drifting as the V2 surface gets used elsewhere.
 pub(crate) fn rearm_irq_baseline(state: &NetdevState) {
-    state.regs().set_imr(regs::INTR_M4_BASELINE);
+    match state.irq_mode() {
+        IrqMode::Intx => state.regs().set_imr(regs::INTR_M4_BASELINE),
+        IrqMode::Msi => state.regs().set_imr_v2_mask(regs::INTR_V2_M4_BASELINE),
+    }
 }
 
 /// Wake the TX queue only when at least this many descriptors are free.

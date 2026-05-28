@@ -38,6 +38,7 @@ echo
 echo "== M6 design gates (skip vacuously until impl lands) =="
 bash "$CI/check_msix_static.sh" || rc=1
 bash "$CI/check_isr_v2_paired.sh" || rc=1
+bash "$CI/check_irq_mode_contract.sh" || rc=1
 bash "$CI/check_rx_pool_pages.sh" || rc=1
 bash "$CI/check_jumbo_mtu_chip.sh" || rc=1
 echo

@@ -20,9 +20,13 @@
 
 use core::ffi::{c_int, c_void};
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 // AtomicU32 also serves the new NetdevState::ocp_base field below.
 // AtomicU64/U32 shadow the per-descriptor DMA mapping (handle/len) for SG.
+// AtomicU8 carries the (probe-time-determined) IRQ delivery mode for the
+// IRQ handler + NAPI re-arm branch (M6 #1 Phase A.2).
 
 /// Cache-line padded wrapper. Per `docs/RUST_STANDARDS.md` §15.2, atomics
 /// mutated from independent contexts (here: `tx_head` from xmit, `tx_tail`
@@ -130,6 +134,37 @@ pub(crate) struct RxBuffer {
 // Compile-time check: 2048 * 256 = 512 KiB total RX-pool footprint.
 const _: () = assert!(core::mem::size_of::<RxBuffer>() == RX_BUF_LEN);
 
+/// IRQ delivery mode chosen at probe by `pci_alloc_irq_vectors`. Drives the
+/// per-fire branch in `raw_irq_handler` and the surface selection in
+/// `napi::rearm_irq_baseline`. Encoded as `u8` so it round-trips through
+/// `AtomicU8` (kernel-Rust has no `AtomicEnum`).
+///
+/// MSI and MSI-X share the same V2 ISR/IMR register layout on this chip —
+/// the chip's `INT_CFG0_ENABLE_8125` bit governs delivery layout only; the
+/// PCIe message-based vs pin-asserted side is invisible to the V2 register
+/// surface — so we don't distinguish them. The `intx_only` module param
+/// short-circuits allocation to legacy INTx for regression testing.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum IrqMode {
+    /// Legacy INTx pin assertion. Requires `IRQF_SHARED` on registration,
+    /// drives the original `IMR`/`ISR` register window at 0x38/0x3C.
+    Intx = 0,
+    /// Message-Signaled (MSI or MSI-X). Registers without `IRQF_SHARED`,
+    /// drives the `IMR_V2`/`ISR_V2` window at 0x0D0C/0x0D04 with
+    /// `INT_CFG0_ENABLE_8125` set in the chip.
+    Msi = 1,
+}
+
+impl IrqMode {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => IrqMode::Msi,
+            _ => IrqMode::Intx,
+        }
+    }
+}
+
 /// Per-bound-device state — accessed from probe, ndo callbacks, NAPI
 /// poll, and the IRQ handler. All cross-context fields are atomic; the
 /// non-atomic fields are read-only after probe.
@@ -151,9 +186,17 @@ pub(crate) struct NetdevState {
     // context — no concurrent writer means no false-sharing pressure.
     pub(crate) ndev: AtomicPtr<bindings::net_device>,
 
-    /// IRQ number (`pdev->irq`). Captured at probe; passed to
-    /// `request_irq`/`free_irq`.
+    /// IRQ number from `pci_irq_vector(pdev, 0)` after `pci_alloc_irq_vectors`
+    /// (M6 #1 Phase A.2). For MSI/MSI-X this is the kernel-assigned vector
+    /// number; for legacy INTx fallback it equals `pdev->irq`.
     pub(crate) irq_num: u32,
+
+    /// Encoded [`IrqMode`] chosen at probe — see the enum doc. Read by
+    /// `raw_irq_handler` (selects ISR window + ack/mask sequence) and by
+    /// `napi::rearm_irq_baseline` (selects V2 vs legacy IMR write).
+    // NOT-PADDED: set-once at probe, then read-only from every other
+    // context — no concurrent writer means no false-sharing pressure.
+    pub(crate) irq_mode: AtomicU8,
 
     /// DMA + CPU pointers for the TX descriptor ring (N + 1 slots; slot N
     /// is the tail canary from M3).
@@ -214,6 +257,12 @@ impl NetdevState {
     /// the `Devres<Bar>`), so the pointer always outlives every read.
     pub(crate) fn regs(&self) -> Regs<'_> {
         ub::regs_from_state(self)
+    }
+
+    /// IRQ delivery mode chosen by probe.
+    #[inline]
+    pub(crate) fn irq_mode(&self) -> IrqMode {
+        IrqMode::from_u8(self.irq_mode.load(Ordering::Relaxed))
     }
 
     /// Reset all atomic indices and clear any stale TX shadow pointers.
@@ -361,12 +410,18 @@ fn ndo_open(state: &NetdevState) -> Result<()> {
         );
     }
 
-    // Wire the IRQ (legacy INTx, shared). Uses raw bindings::request_threaded_irq
-    // because the new kernel-Rust pci::Device::request_irq returns a pin-init
-    // type that's awkward to store in a non-pin NetdevState. The unsafe call
-    // is wrapped in `ub::request_irq` with a SAFETY block.
+    // Wire the IRQ. Vector allocation already happened at probe time via
+    // `pci_alloc_irq_vectors` (devres-managed); ndo_open just registers
+    // our handler against `state.irq_num`. The flags depend on the
+    // probe-chosen `IrqMode`: INTx pins are shareable, MSI/MSI-X vectors
+    // are not. The unsafe FFI call is wrapped in `ub::request_irq` with
+    // a SAFETY block.
     let cookie_ptr = core::ptr::from_ref(state).cast_mut().cast::<c_void>();
-    ub::request_irq(state.irq_num, raw_irq_handler, cookie_ptr)?;
+    let irq_flags = match state.irq_mode() {
+        IrqMode::Intx => ub::IRQF_SHARED,
+        IrqMode::Msi => 0,
+    };
+    ub::request_irq(state.irq_num, raw_irq_handler, cookie_ptr, irq_flags)?;
 
     // PHY step 1 — connect + soft reset + resume. On the 8125B's
     // integrated MAC/PHY, genphy_soft_reset writes BMCR_RESET which
@@ -407,9 +462,21 @@ fn ndo_open(state: &NetdevState) -> Result<()> {
     // IMR write must come last (after ChipCmd RX|TX enable).
     regs.set_chip_cmd(regs::CMD_RX_ENB | regs::CMD_TX_ENB);
 
-    // Unmask legacy IRQ sources LAST — mirrors r8169 `rtl_irq_enable`.
-    // V2 rearm stays deferred until MSI-X/MSI allocation and
-    // INT_CFG0_ENABLE_8125 activation land together.
+    // M6 #1 Phase A.2 — chip-side activation of the per-message-id
+    // ISR_V2 register layout. Only flip `INT_CFG0_ENABLE_8125` when
+    // probe actually obtained an MSI/MSI-X vector; in INTx fallback the
+    // chip must keep asserting the INTx pin (see hw.rs Phase A.1
+    // comment + docs/M6_MSIX_DESIGN.md for the empirical reason). The
+    // V2 surface must be enabled BEFORE the matching `set_imr_v2_mask`
+    // write or the first unmask would target the legacy IMR while the
+    // chip is already routing through V2.
+    if state.irq_mode() != IrqMode::Intx {
+        regs.set_int_cfg0(regs::INT_CFG0_ENABLE_8125);
+    }
+
+    // Unmask the chosen IRQ surface LAST — mirrors r8169 `rtl_irq_enable`.
+    // `rearm_irq_baseline` picks legacy `IMR` or V2 `IMR_V2_SET` based on
+    // `state.irq_mode()`.
     crate::napi::rearm_irq_baseline(state);
 
     // PHY step 2 — kick the state machine LAST. Per r8169 ordering this
@@ -418,8 +485,12 @@ fn ndo_open(state: &NetdevState) -> Result<()> {
     // reports link-up; the unconditional carrier_on we used at M4-
     // skeleton is dropped.
     if let Err(e) = ub::bridge_phy_kick_state_machine(ndev) {
-        // Roll back: disable chip + free IRQ so a follow-up open can retry.
+        // Roll back: mask both IRQ surfaces (idempotent — V2 write is a
+        // no-op when V2 isn't active), disable chip, free IRQ. Same
+        // discipline as ndo_stop: dual-mask so the rollback is
+        // mode-agnostic and the next open() starts from a known state.
         regs.set_imr(0);
+        regs.clear_imr_v2_mask(0xFFFF_FFFF);
         regs.set_chip_cmd(0);
         ub::bridge_phy_stop(ndev);
         ub::free_irq(
@@ -689,19 +760,36 @@ fn ndo_start_xmit(state: &NetdevState, skb: *mut bindings::sk_buff) -> c_int {
 extern "C" fn raw_irq_handler(_irq: c_int, dev_id: *mut c_void) -> bindings::irqreturn_t {
     let state = state_from(dev_id);
     let regs = state.regs();
-    // M6 #1 Phase A: stay on the legacy ISR/IMR register surface
-    // until Phase A.2 lands MSI-X allocation. The V2 surface in
-    // `mmio.rs` is scaffolding for the moment Phase A.2 enables
-    // `INT_CFG0_ENABLE_8125` in `hw_start_8125b`. See the comment
-    // there for the empirical reason the two must land together.
-    let status = regs.isr();
+    // M6 #1 Phase A.2 — branch on the probe-chosen delivery mode:
+    //   Intx → legacy ISR (0x3C) + IMR (0x38), W1C ack
+    //   Msi  → ISR_V2 (0x0D04) + IMR_V2 (0x0D00/0x0D0C), W1C ack
+    // The two windows are mutually exclusive at the chip: once
+    // `INT_CFG0_ENABLE_8125` is set, the legacy ISR stops latching
+    // sources (and vice versa), so each branch reads exactly one.
+    let status = match state.irq_mode() {
+        IrqMode::Intx => regs.isr(),
+        IrqMode::Msi => regs.isr_v2(),
+    };
     if status == 0 || status == 0xFFFF_FFFF {
+        // 0 = not ours (or stale read after free_irq); !0 = device gone.
+        // For Intx we may legitimately see 0 on a shared line; for
+        // MSI/MSI-X 0 should be rare but is still benign to early-out.
         return bindings::irqreturn_IRQ_NONE as bindings::irqreturn_t;
     }
     note_irq_fire();
     // Ack everything we saw, mask further IRQs, hand off to NAPI.
-    regs.ack_isr(status);
-    regs.set_imr(0);
+    // NAPI's re-arm calls `rearm_irq_baseline` which selects the same
+    // window after `napi_complete_done`, closing the loop.
+    match state.irq_mode() {
+        IrqMode::Intx => {
+            regs.ack_isr(status);
+            regs.set_imr(0);
+        }
+        IrqMode::Msi => {
+            regs.ack_isr_v2(status);
+            regs.clear_imr_v2_mask(0xFFFF_FFFF);
+        }
+    }
     let ndev = state.ndev.load(Ordering::Acquire);
     ub::bridge_napi_schedule(ndev);
     bindings::irqreturn_IRQ_HANDLED as bindings::irqreturn_t

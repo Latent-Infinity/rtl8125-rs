@@ -35,21 +35,22 @@ HW="$ROOT/src/hw.rs"
 NETDEV="$ROOT/src/netdev.rs"
 MAIN="$ROOT/src/r8125_rust_main.rs"
 
-# Pre-engagement: V2 surface is only ACTIVE when hw_start_8125b sets
-# INT_CFG0_ENABLE_8125 (Phase A.2). Phase A.1 lands the surface as
-# scaffolding without activating it — the V2 constants exist but the
-# IRQ handler stays on legacy. We engage the full check only when
-# the chip-side activation lands.
+# Pre-engagement: V2 surface is only ACTIVE when some code path sets
+# `INT_CFG0_ENABLE_8125` on the chip. Phase A.1 had the surface in
+# regs.rs as scaffolding without activating it. Phase A.2 moves the
+# activation out of `hw_start_8125b` (which is run before MSI/MSI-X
+# allocation is known) and into `ndo_open`, where it's gated on
+# `state.irq_mode()`. Accept the activation in either file.
 if ! grep -qE '\bIMR_V2_SET\b|\bISR_V2\b' "$REGS"; then
 	yel "MSI-X register surface not yet in src/regs.rs (M6 #1 not landed) — skipping"
 	exit 0
 fi
 # Distinguish "the constant is mentioned in a comment" from "the bit is
-# actually OR'd into a Config write": look for an actual set_int_cfg0
-# call that includes INT_CFG0_ENABLE_8125 as a written value.
-if ! awk '/fn[[:space:]]+hw_start_8125b_unlocked/,/^}/' "$HW" | \
-		grep -qE 'set_int_cfg0\([^)]*INT_CFG0_ENABLE_8125'; then
-	yel "V2 register surface scaffolded but chip-side INT_CFG0_ENABLE_8125 not active yet (Phase A.1) — full check deferred to Phase A.2"
+# actually written to the chip": look for an actual set_int_cfg0 call
+# that includes INT_CFG0_ENABLE_8125 as a written value, in either
+# hw_start_8125b or ndo_open (Phase A.2 home).
+if ! grep -hE 'set_int_cfg0\([^)]*INT_CFG0_ENABLE_8125' "$HW" "$NETDEV" >/dev/null 2>&1; then
+	yel "V2 register surface scaffolded but chip-side INT_CFG0_ENABLE_8125 not active yet — full check deferred"
 	exit 0
 fi
 
@@ -63,12 +64,15 @@ if [[ "$rc" -eq 0 ]]; then
 	grn "src/regs.rs defines IMR_V2_CLEAR + IMR_V2_SET + ISR_V2 together"
 fi
 
-# 2. INT_CFG0_ENABLE_8125 set in hw_start_8125b.
-if ! awk '/fn hw_start_8125b/,/^}/' "$HW" 2>/dev/null | \
-		grep -qE 'INT_CFG0_ENABLE_8125|set_int_cfg0\s*\([^)]*\|\s*regs::INT_CFG0_ENABLE_8125'; then
-	red "hw_start_8125b does not set INT_CFG0_ENABLE_8125 — chip will stay on legacy ISR"
+# 2. INT_CFG0_ENABLE_8125 is written conditionally (mode-gated) at
+# bring-up. Phase A.2 keeps it in ndo_open guarded by
+# `state.irq_mode() != IrqMode::Intx`; accept either gating idiom.
+if ! grep -hE 'set_int_cfg0\([^)]*INT_CFG0_ENABLE_8125' "$HW" "$NETDEV" >/dev/null 2>&1; then
+	red "no set_int_cfg0(INT_CFG0_ENABLE_8125) call found — chip will stay on legacy ISR"
+elif ! grep -hE 'irq_mode\(\)|IrqMode::' "$NETDEV" >/dev/null 2>&1; then
+	red "INT_CFG0_ENABLE_8125 written but not gated on IrqMode — INTx fallback will break"
 else
-	grn "hw_start_8125b activates v2 ISR via INT_CFG0_ENABLE_8125"
+	grn "INT_CFG0_ENABLE_8125 write is present and gated on IrqMode"
 fi
 
 # 3. IRQ handler reads isr_v2 (not the legacy isr).
@@ -81,20 +85,24 @@ else
 	grn "raw_irq_handler uses MSI-X read path"
 fi
 
-# 4. Vector-allocation request includes fallback flags. We don't know
-#    yet whether kernel-Rust pci will expose this directly or whether
-#    we'll need to wrap pci_alloc_irq_vectors via cshim. Accept either
-#    "pci_alloc_irq_vectors" with the fallback flags listed, or an
-#    explicit Rust API that documents fallback intent.
-if grep -qE 'PCI_IRQ_MSIX.*PCI_IRQ_MSI.*PCI_IRQ_INTX|alloc_irq_vectors.*PCI_IRQ' "$ROOT/src/"*.rs "$ROOT/src/"*.c 2>/dev/null; then
+# 4. Vector-allocation request covers the MSI-X / MSI / INTx options
+# with an explicit fallback. We use the kernel-Rust safe wrappers
+# (`pci::IrqType::MsiX`, `pci::IrqType::Msi`, `pci::IrqType::Intx`,
+# `IrqTypes::all`); accept either an explicit `IrqType::MsiX` reference
+# alongside `IrqType::Intx`, or `IrqTypes::all()`, or the raw
+# PCI_IRQ_MSIX / PCI_IRQ_INTX flag combo if a future patch ever drops
+# back to the FFI directly.
+if grep -qE 'IrqType::MsiX\b' "$ROOT/src/pci.rs" 2>/dev/null \
+		&& grep -qE 'IrqType::Intx\b' "$ROOT/src/pci.rs" 2>/dev/null; then
+	grn "IRQ allocation in pci.rs covers both IrqType::MsiX and IrqType::Intx (explicit fallback)"
+elif grep -qE '\bIrqTypes::all\s*\(\)' "$ROOT/src/pci.rs" 2>/dev/null; then
+	grn "IRQ allocation uses IrqTypes::all() (kernel does MSIX→MSI→INTX fallback)"
+elif grep -qE 'PCI_IRQ_MSIX.*PCI_IRQ_MSI.*PCI_IRQ_INTX|alloc_irq_vectors.*PCI_IRQ' "$ROOT/src/"*.rs "$ROOT/src/"*.c 2>/dev/null; then
 	grn "IRQ allocation includes MSIX|MSI|INTX fallback flags"
-elif grep -qE 'pci_alloc_irq_vectors' "$ROOT/src/"*.rs "$ROOT/src/"*.c 2>/dev/null; then
-	red "pci_alloc_irq_vectors call lacks the MSIX|MSI|INTX fallback flag set"
+elif grep -qE 'pci_alloc_irq_vectors|alloc_irq_vectors' "$ROOT/src/"*.rs "$ROOT/src/"*.c 2>/dev/null; then
+	red "alloc_irq_vectors call lacks MSI-X + INTx fallback (rebind risk on MSI-X failure)"
 else
-	# Not yet calling the new API — but MSI-X registers are defined.
-	# Either we're mid-implementation or using a kernel-Rust wrapper
-	# that hides the flags. Soft check.
-	yel "no explicit pci_alloc_irq_vectors call found — check the kernel-Rust API path"
+	yel "no IRQ vector allocation call found — check the kernel-Rust API path"
 fi
 
 # 5. Module param for INTx-only fallback exists (regression rollback).

@@ -45,11 +45,11 @@ use kernel::{
     sync::aref::ARef,
 };
 
-use core::sync::atomic::AtomicPtr;
+use core::sync::atomic::{AtomicPtr, AtomicU8};
 
 use crate::hw;
 use crate::mmio::{self, Regs};
-use crate::netdev::{NetdevHandle, NetdevState, RxBuffer};
+use crate::netdev::{IrqMode, NetdevHandle, NetdevState, RxBuffer};
 use crate::pm;
 use crate::ring::{self, Ring, RING_LEN};
 use crate::unsafe_boundary;
@@ -212,7 +212,58 @@ impl pci::Driver for R8125Driver {
                     let regs = Regs::new(bar);
                     let mac = regs.mac_address();
                     let bar_ptr = bar as *const pci::Bar<{ mmio::R8125_MMIO_LEN }>;
-                    let irq_num = unsafe_boundary::pci_dev_irq(pdev);
+
+                    // M6 #1 Phase A.2 — allocate one IRQ vector.
+                    //
+                    // Default flag set prefers MSI-X → MSI → INTx (kernel's
+                    // built-in order in `pci_alloc_irq_vectors`). The
+                    // `intx_only` module param short-circuits to legacy
+                    // INTx for regression testing. We detect which type the
+                    // kernel actually gave us by retrying with INTx-only on
+                    // any MSI/MSI-X allocation failure (the empirical fact
+                    // we discovered in Phase A.1: enabling V2 register mode
+                    // without an MSI/MSI-X vector silently breaks IRQ
+                    // delivery — see hw.rs Phase A.1 comment).
+                    let intx_only =
+                        *crate::module_parameters::intx_only.value() != 0;
+                    let irq_mode = if intx_only {
+                        unsafe_boundary::alloc_one_irq_vector(
+                            pdev,
+                            pci::IrqTypes::default()
+                                .with(pci::IrqType::Intx),
+                        )?;
+                        IrqMode::Intx
+                    } else {
+                        // First try MSI-X / MSI exclusively so we can tell
+                        // the kernel "no INTx fallback" — that way, on
+                        // failure we know to take the legacy path.
+                        let msi_set = pci::IrqTypes::default()
+                            .with(pci::IrqType::MsiX)
+                            .with(pci::IrqType::Msi);
+                        match unsafe_boundary::alloc_one_irq_vector(
+                            pdev, msi_set,
+                        ) {
+                            Ok(()) => IrqMode::Msi,
+                            Err(_) => {
+                                unsafe_boundary::alloc_one_irq_vector(
+                                    pdev,
+                                    pci::IrqTypes::default()
+                                        .with(pci::IrqType::Intx),
+                                )?;
+                                IrqMode::Intx
+                            }
+                        }
+                    };
+                    let irq_num =
+                        unsafe_boundary::pci_irq_vector(pdev, 0)?;
+                    dev_info!(
+                        pdev,
+                        "RTL8125 IRQ allocated: vector#0 = IRQ {} (mode={:?}{})\n",
+                        irq_num,
+                        irq_mode,
+                        if intx_only { ", forced by intx_only" } else { "" }
+                    );
+
                     let rx_bufs: kernel::dma::CoherentAllocation<RxBuffer> =
                         kernel::dma::CoherentAllocation::alloc_coherent(
                             pdev.as_ref(),
@@ -226,6 +277,7 @@ impl pci::Driver for R8125Driver {
                             bar_ptr,
                             ndev: AtomicPtr::new(core::ptr::null_mut()),
                             irq_num,
+                            irq_mode: AtomicU8::new(irq_mode as u8),
                             tx_desc: tx_ring.desc_ptr_mut(),
                             tx_dma: tx_ring.dma_handle(),
                             rx_desc: rx_ring.desc_ptr_mut(),

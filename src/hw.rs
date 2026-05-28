@@ -213,29 +213,18 @@ fn hw_start_8125b_unlocked(regs: &Regs<'_>) -> Result<()> {
         regs::MAC_OCP_L1_EXIT_TRIGGERS_MASK,
     );
 
-    // M6 sub-feature #1 Phase A: the ISR_V2 register surface
-    // (`IMR_V2_{SET,CLEAR}` / `ISR_V2` at 0x0D0C / 0x0D00 / 0x0D04) +
-    // the `intx_only` module-param + the `rearm_irq_baseline` helper
-    // are all in tree. Chip-side activation (writing
-    // `INT_CFG0_ENABLE_8125`) is deferred to Phase B because empirical
-    // testing on Controller-KVM 2026-05-28 showed that setting that
-    // bit while still using legacy INTx allocation silently breaks
-    // IRQ delivery — the chip stops asserting the INTx pin once V2
-    // mode is active, expecting MSI-X message-based delivery instead.
-    //
-    // Vendor (`r8125_n.c::rtl8125_alloc_irq`) registers a separate
-    // `rtl8125_interrupt_msix` handler when MSI-X is allocated AND
-    // `HwCurrIsrVer > 1` — the two are paired, never independent.
-    //
-    // Phase B will: (a) request MSI-X vector(s) via
-    // `pci_alloc_irq_vectors` with MSIX|MSI|INTX fallback flags;
-    // (b) on success, enable V2 register layout; (c) on fallback to
-    // legacy INTx, leave V2 disabled. The intx_only module param
-    // forces the (c) branch for regression testing once Phase B
-    // lands. Until then it's a no-op.
-    //
-    // See docs/M6_MSIX_DESIGN.md (Phase A/B split) and the
-    // documenting commit for the bisection that surfaced this.
+    // M6 sub-feature #1 Phase A.2 — chip-side V2 activation has moved
+    // to `ndo_open` (immediately after `set_chip_cmd(RX|TX)`), where it
+    // can read `state.irq_mode()` and only set `INT_CFG0_ENABLE_8125`
+    // when probe actually allocated an MSI/MSI-X vector. Empirically
+    // (Controller-KVM 2026-05-28) flipping that bit while still on
+    // legacy INTx silently breaks IRQ delivery — the chip stops
+    // asserting the INTx pin once V2 mode is active and expects
+    // message-signaled delivery instead. r8169's
+    // `rtl_hw_start_8125_common` doesn't touch this bit either; it's
+    // wired up in `rtl_msix_enable` on the MSI-X path only. We keep
+    // INT_CFG0 at the all-zero baseline written at the top of
+    // `ndo_open` and let the open code path own the conditional flip.
 
     Ok(())
 }
