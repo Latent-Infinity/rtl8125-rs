@@ -142,6 +142,25 @@ support and kernel debugging options enabled. Hardware-specific paths,
 especially PHY, ASPM, FLR, and traffic soak tests, should be rerun on any new
 platform before treating results as representative.
 
+### Dual-environment dev (M5 close-out onward)
+
+From M5 close-out, the project uses two MS-A2 units:
+
+- **Controller** — the first MS-A2, hosts the KVM guest for fast Rust
+  iteration via VFIO passthrough (`docs/M0a_TO_M1_RUNBOOK.md`).
+- **Gateway** — a second MS-A2, runs the Rust driver directly on bare
+  metal for the soak / perf / L1.x gates that VFIO/KVM can't honestly
+  test. Setup: `docs/GATEWAY_SETUP.md`. After M6/M7 finishes, Gateway is
+  wiped and reinstalled as Ubuntu Server.
+
+The split was forced by a 2026-05-26 finding: QEMU's synthetic upstream
+PCIe bridge only advertises ASPM L0s, never L1, so the historical RTL8125
+L1.x lockup gate can't be exercised in the KVM guest no matter what the
+driver does. Bare-metal validation is the only honest path through that
+gate. See `docs/RTL8125_Rust_Driver_Implementation_Plan.md` §1.3 for the
+authoritative split and §7 M5/M6/M7 for per-milestone environment
+assignments.
+
 ## Development Notes
 
 - Keep hot paths allocation-free and statically dispatched.

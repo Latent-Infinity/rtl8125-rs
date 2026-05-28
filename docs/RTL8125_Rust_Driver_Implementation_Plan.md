@@ -1,6 +1,6 @@
 # AI-Assisted Rust Driver for the Realtek RTL8125 on the Minisforum MS-A2
 
-**Implementation Planning Document — v3.4**
+**Implementation Planning Document — v3.5**
 **Target: Ubuntu 26.04 LTS / Linux 7.0+ / Rust-for-Linux**
 **Status: M0a (pre-link fact discovery) in progress on the validated MS-A2. M1 begins only when §15 entry criteria are met. M0b (physical-link baseline) is required before M4.**
 
@@ -56,6 +56,48 @@ The MS-A2 ships with **four heterogeneous NICs**, and this is the single most im
 The Intel I226-V (or one X710 port) carries all host traffic. The Realtek port is dedicated to the experimental driver via VFIO passthrough into the guest. A guest kernel panic never touches host connectivity.
 
 **Operator precondition on the validated MS-A2 (validation finding 3).** This redundancy is a *design intent*, not the current state of the box. As observed: the I226-V (`enp4s0`) is **down**, host connectivity is currently on **Wi-Fi (`wlp6s0`, MT7922)**, and the box also runs **Kubernetes** (flannel/cni/veth bridges on the host L2). Before any destructive M0b step, the operator MUST deliberately (a) pin host management onto the I226-V so SSH survives a guest panic, and (b) isolate the RTL8125 test segment from the existing Kubernetes/host L2 domain (see §8.1 step 6). Until both are done, the "SSH never drops" guarantee is not yet realized.
+
+### 1.3 Dual MS-A2 environment — Controller + Gateway (added 2026-05-27)
+
+Effective M5 close-out, a **second MS-A2 ("Gateway")** joins the project as a
+**bare-metal validation environment**. The first MS-A2 ("Controller") keeps
+its existing KVM-guest dev loop. The split exists because the M5 ASPM-L1.x
+soak revealed a real KVM limitation: QEMU's synthetic upstream PCIe bridge
+advertises ASPM L0s only, never L1, so the historical RTL8125 L1.x lockup
+gate **cannot be exercised inside the KVM guest no matter what the driver
+does**. Bare metal Gateway has a real PCIe root complex that advertises L1,
+and is the only honest path to clearing that gate.
+
+| Box | Role | OS posture | Driver target |
+|---|---|---|---|
+| **Controller** (this box) | dev iteration + KVM host | Ubuntu 26.04 LTS host + custom guest | RTL8125B in VFIO-passthrough guest |
+| **Gateway** (second MS-A2) | bare-metal validation, then production | Custom debug+Rust kernel matching Controller's KVM guest, then wiped to Ubuntu Server after dev complete | RTL8125B directly on bare metal — no VFIO |
+
+Agent autonomous control of Gateway uses the same SSH-key pattern as the
+KVM guest does today (`~/.ssh/agent/rtl8125_gateway_codex`); WiFi (MT7922)
+carries management traffic so the RJ45 ports stay reserved for the driver
+and cross-traffic tests.
+
+Setup procedure: [`GATEWAY_SETUP.md`](GATEWAY_SETUP.md) (the alternate to
+[`M0a_TO_M1_RUNBOOK.md`](M0a_TO_M1_RUNBOOK.md) which targets Controller).
+
+What each environment is for, by milestone:
+
+| Milestone | Controller-KVM (iteration) | Gateway bare-metal (validation) |
+|---|---|---|
+| M1-M4 | primary (M4-perf already cleared here) | n/a — env doesn't exist yet |
+| M5 NAPI correctness | primary | re-confirm after M5 close-out |
+| M5 ASPM-off soak | partial — got 288/288 clean | re-run for primary evidence |
+| **M5 ASPM-on L1.x soak** | **N/A — guest bridge lacks L1** | **primary — only valid path** |
+| M5 syzkaller 4h | partial | primary (no VFIO contention) |
+| M6 MSI-X iteration | primary (quick load/unload cycles) | validation + perf baseline |
+| M6 jumbo iteration | primary | validation + perf baseline |
+| `docs/perf/` numbers | not authoritative (KASAN guest 30%+ overhead) | **authoritative** |
+| M7 maintainer consultation | n/a | bare-metal evidence strengthens RFC |
+
+After Gateway's dev role concludes (post-M7), it is wiped and reinstalled as
+Ubuntu Server for the operator's intended production role. The two-MS-A2
+arrangement is therefore **temporary scaffolding**, not a permanent fixture.
 
 ---
 
@@ -468,6 +510,13 @@ M4 is the first milestone that requires M0b and a connected physical link partne
 
 **Gate:** All NAPI edge-case tests pass. All four soak/cycle/fuzz tests complete clean. The ASPM 24-hour idle soak is the gate that has historically eliminated entire generations of RTL8125 driver candidates — passing it is the explicit goal of this milestone.
 
+**Environment split (added 2026-05-27, see §1.3):**
+- NAPI correctness + queue stop/wake + counter-invariant tests: validated on Controller-KVM as the primary environment; re-confirm on Gateway after each major change for parity.
+- ASPM-off 24h idle soak: runnable on either environment; Controller-KVM already cleared it (288/288 clean samples, 2026-05-26).
+- **ASPM-on 24h L1.x idle soak**: **Gateway only**. The KVM guest's synthetic upstream PCIe bridge advertises ASPM L0s exclusively, so even with `force_aspm=1` setting Config5 ASPM_en=1 the link cannot enter L1.x. This is the historical lockup gate; it must clear on bare metal to be considered honestly cleared. See `docs/M5_CLOSEOUT.md` and `docs/GATEWAY_SETUP.md`.
+- Suspend/resume cycles: gated by the kernel-Rust PCI PM API gap (`docs/M5_PM_GAP.md`). Once the API exists, full cycles run on Gateway against real ACPI S3.
+- Soak harnesses themselves are environment-portable; the `ci/check_*.sh` scripts accept `IFACE`/`PEER`/`BDF` overrides so the same scripts run on either Controller's KVM guest or Gateway bare metal.
+
 ### M6 — Performance Features
 
 Enabled **one at a time**, each with the following gates applied per feature before moving to the next:
@@ -487,6 +536,12 @@ Enabled **one at a time**, each with the following gates applied per feature bef
 
 **Gate:** Throughput within 10% of out-of-tree `r8125` on the same hardware. CPU usage no worse. All per-feature rollback paths verified.
 
+**Environment split (added 2026-05-27, see §1.3):**
+- Feature iteration (code-edit / build / load) runs on Controller-KVM for speed — the KVM guest reloads the module in < 30 s, bare metal needs `dpkg -i` of a kernel module package.
+- Per-feature **validation** (correctness, ethtool toggles, packet capture, bad-checksum injection): runs on both environments. Bug surfaces on either is a bug.
+- Per-feature **perf numbers in `docs/perf/`** are captured on **Gateway bare metal**, not Controller-KVM. The KASAN-debug KVM guest adds 30%+ CPU overhead and skews CPU-per-Gbps, p99-latency, and small-packet-rate measurements. Bare-metal numbers are the only honest comparison vs out-of-tree `r8125`.
+- Multi-queue + RSS sub-feature is **N/A on 8125B** at the hardware level (`docs/M6_MULTIQ_NA.md`) regardless of environment; the per-feature gate is vacuously satisfied. M6 actually delivers MSI-X + jumbo + the existing CSUM/TSO (already done in M4-perf) on this chip.
+
 ### M7 — Upstream / Out-of-Tree Decision
 
 **Deliverables:**
@@ -497,11 +552,33 @@ Enabled **one at a time**, each with the following gates applied per feature bef
 - **Pre-RFC maintainer consultation**: do not post a driver RFC until at least one networking maintainer has reviewed the C-shim boundary and stated whether reusable Rust netdev abstractions should be posted first, separately, as the upstream-acceptable contribution path. Avoid burning reviewer attention on a duplicate-driver RFC if the abstraction path is preferred.
 - Decision: (a) submit driver RFC, (b) refactor and contribute the C-shim's Rust replacement upstream first, or (c) release as a maintained out-of-tree module
 
+**Environment split (added 2026-05-27, see §1.3):**
+- Bare-metal Gateway evidence (clean M5 ASPM L1.x soak, clean M6 perf vs r8125 on real hardware) is the **strongest single artifact** for the maintainer consultation. KVM-only evidence is sufficient for "the code is reasonable"; bare-metal evidence is necessary for "the historical hazards have been cleared". The pre-RFC dossier (`docs/M7_PREP.md`) cites Gateway numbers, not KVM numbers.
+- Post-M7 disposition for Gateway: regardless of which exit (a/b/c) the project takes, Gateway's dev role concludes and the box is wiped + reinstalled as Ubuntu Server. The two-MS-A2 dev arrangement is temporary scaffolding (§1.3); long-term the project lives on Controller plus whatever upstream/distribution channel the M7 decision chose.
+
 ---
 
-## 8. VFIO Isolation — Mandatory, Not Optional
+## 8. VFIO Isolation — Mandatory on Controller, Skipped on Gateway
 
 A faulty driver will panic the kernel. The point of VFIO is that the kernel that panics is the guest's, not the host's.
+
+**Environment scope (added 2026-05-27, see §1.3):** this whole section is
+the **Controller-KVM** procedure. **Gateway runs the driver on bare metal
+with no VFIO indirection** — see `docs/GATEWAY_SETUP.md` instead. The
+consequence of skipping VFIO on Gateway is the operator-visible one: a
+driver panic takes down all of Gateway's networking (the operator must
+power-cycle / WiFi-mgmt-recover). That cost is acceptable because:
+
+1. KASAN-debug catches most driver-panic-class bugs on Controller-KVM
+   long before they're deployed to Gateway.
+2. Gateway is a development unit, not a production gateway during this
+   phase. Its eventual production role (Ubuntu Server) comes after the
+   driver work is complete.
+3. The M5/M6 gates Gateway specifically enables — real ASPM L1.x soak,
+   real PCIe bridge, honest perf numbers — cannot be tested under VFIO,
+   which is why bare metal is needed at all.
+
+Below applies to the **Controller** unit only.
 
 > **Canonical address (validation finding 3).** On the validated MS-A2 the RTL8125 is **`0000:03:00.0`** (`[10ec:8125]` rev `0x05`, IOMMU group 18, isolated). Every `07:00.0` / `bus='0x07'` below is **illustrative of the procedure only**; the concrete commands in this section and in `tools/bind_vfio.sh` / `tools/unbind_vfio.sh` use the real `0000:03:00.0`. Re-derive the address on any other unit with step 3.
 
@@ -803,6 +880,7 @@ M0b physical topology, peer details, L2 isolation, and `r8169`/`r8125` throughpu
 
 ## 17. Changelog
 
+- **v3.5** — Dual-environment dev: added §1.3 ("Controller + Gateway") to record that a **second MS-A2 ("Gateway")** joins for bare-metal validation, while the existing MS-A2 ("Controller") keeps its KVM-guest dev loop. Motivation: the M5 ASPM soak (2026-05-26 → 27) revealed that QEMU's synthetic upstream PCIe bridge advertises ASPM L0s only, so the historical RTL8125 L1.x lockup gate cannot be exercised inside the KVM guest no matter what the driver does. M5/M6/M7 sections gained an "Environment split" subsection each, recording which environment each deliverable runs in (iteration vs validation vs perf-authoritative). §8 retitled to "VFIO Isolation — Mandatory on Controller, Skipped on Gateway" with a Gateway exception note. New companion runbook `docs/GATEWAY_SETUP.md` is the alternate to `M0a_TO_M1_RUNBOOK.md`. Gateway's eventual production role: wiped + reinstalled as Ubuntu Server after M6/M7 finish. **No architectural change**: the layered Rust-core + audited C-shim design, the unsafe-boundary discipline, and the gated milestones all stand. The two-MS-A2 arrangement is temporary scaffolding for the soak/perf gates only.
 - **v3.4** — Applied the six owner-approved `docs/VALIDATION_REPORT.md` §5 edits from the 2026-05-18 non-destructive M0a validation pass on the actual MS-A2: (1) §13 + §16 Q5 — reworded the Rust-metadata risk from "distro lacks it → self-build kernel" to "apt-install the distro-provided kernel-rust toolchain set"; **downgraded High → Medium**; added a separate **new High** risk for the missing debug-instrumented kernel. (2) §7 M0a + §15 — added an explicit entry criterion: a **debug+Rust guest kernel** (`KASAN KCSAN DEBUG_LOCK_ALLOC PROVE_LOCKING DEBUG_KMEMLEAK DMA_API_DEBUG` + `CONFIG_RUST`) is built and boots; this is the true M1 gate. (3) §1.2 + §8.1 — recorded that on this unit host management is currently on Wi-Fi (not the I226-V) and the box runs Kubernetes; both must be deliberately corrected before destructive M0b. (4) §3.1 + §16 Q1 — filled in the resolved target: **RTL8125B, XID 0x641, rev 0x05, fw rtl8125b-2_0.0.2**. (5) §3.3 — repointed the "ASPM-workaround database" from the `ewaldc` changelog (3 commits) to **Realtek-official's git history (~99 commits) + `r8125_n.c` comments**. (6) §8 — canonicalized the device address to **`0000:03:00.0`** (the `07:00.0` examples are now explicitly illustrative). Also corrected the title version stamp, which had lagged at v3.2 while the body already carried the v3.3 M0a/M0b split, and tightened the §4 citation to name the `ewaldc` README. **No architectural change** — the layered Rust-core + audited C-shim design, the unsafe-boundary discipline, and the gated milestones all stand.
 - **v3.3** — Split M0 into M0a pre-link automation and M0b physical-link baseline. M0a is explicitly runnable with the RTL8125 RJ45 unplugged and adds automated host VFIO bind cycling, guest passthrough visibility, privileged trivial-module load/unload looping, serial-capture validation, and CI policy checks before any switch or peer is connected. M0b now owns physical topology, peer details, L2 isolation, peer packet-capture readiness, and `r8169`/`r8125` throughput baselines, and is required before M4 rather than before M1. Clarified that M1-M3 may run unplugged, while M4 is the first packet-moving milestone requiring a link partner. Removed duplicate "Only then does M1 begin."
 - **v3.2** — Addressed second-round review feedback. Softened §0 Rust API maturity claim from "production-grade" to "sufficient for a staged out-of-tree prototype, must be validated against the selected kernel tree." Switched lint discipline from `#![forbid(unsafe_code)]` to `#![deny(unsafe_code)]` (forbid cannot be overridden by allow). Made Kbuild/Makefile authoritative in §6.1; removed `Cargo.toml` and `rust-toolchain.toml` from the critical build path; replaced `cargo asm`/`cargo clippy` with kernel-build equivalents (`make CLIPPY=1`, `llvm-objdump`, `perf annotate`, `pahole`) throughout §10 and §11. Replaced rust-toolchain.toml pin language in §2 with `make LLVM=1 rustavailable` against the kernel tree. Added a pre-M1 blocker for OOT Rust kernel-metadata feasibility (M0 + §15). Reframed `NETDEV_TX_BUSY` in §6.3 as an exceptional ring-full race, with explicit queue-stop/wake flow-control invariants moved into M5; reconciled the §6.3 vs §6.4 RX-allocation contradiction (no descriptor/page allocation on the hot path; skb head via NAPI fast paths is the supported, counted exception). Renamed ASPM module-parameter values to unambiguous `kernel|conservative|force_off|aggressive`. Fixed PCIe 2.0 bandwidth claim (5.0 GT/s with 8b/10b ≈ 4 Gbps per direction); softened jumbo-frame language. Expanded M5 with explicit NAPI edge cases (budget==0, exactly-budget-consumed, IRQ-masking, `napi_disable` race, PREEMPT_RT note). Clarified syzkaller scope re: KCOV not collecting soft/hard IRQ coverage by default. Added `CONFIG_DMA_API_DEBUG`, IOMMU fault logging, descriptor canaries, and ring-snapshot-on-panic to §10 and M3. Made the type-state `Drop` behavior environment-specific (panic in debug VFIO guest; `WARN_ON_ONCE` + quarantine in release). Switched VFIO binding to `driver_override` (per-device, safer than `new_id`); added ACS-override negative gate and L2 isolation requirement. Added CI rule rejecting `Assisted-by:` without human `Signed-off-by:`. Reworded §12 baseline (r8169 as upstream-supported baseline, not "floor"). Added P0/P1 risks: OOT Rust metadata missing, `NETDEV_TX_BUSY` misuse, Secure Boot block, syzkaller miss, tracepoint ABI accident, and the v3.1 forbid/allow lint bug itself. Added §14 pre-RFC maintainer consultation gate. Renamed §15 to "M1 Entry Criteria" to remove the "implementation-ready" contradiction with the status line; expanded checklist with kernel-build feasibility, OOT module test, kernel config capture, Secure Boot state, physical topology, L2 isolation, `.unsafe-allowlist`. Marked tracepoints experimental in §16 Q4. Expanded §16 Q5 distribution tuple with `vermagic`, `Module.symvers` CRC, kernel config hash, Rust metadata package version, module signing state, plus an explicit Secure Boot policy. Removed MS-A1 distraction and "community-validated 128 GB" anecdote.
