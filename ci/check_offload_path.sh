@@ -58,4 +58,16 @@ grep -q 'NETIF_F_TSO' "$BRIDGE" \
   && ok "TSO advertisement is paired with RTL8125B max-size/max-segs caps" \
   || bad "TSO must be advertised only with the validated RTL8125B segment cap"
 
+# Jumbo MTU must drop TSO + TX checksum offloads. RTL8125B's TSO MSS
+# field is 11 bits, so MTU > 1500 can overflow the descriptor MSS and
+# produce malformed segments. r8169 handles this in ndo_fix_features;
+# we require the same pairing plus a feature refresh after MTU changes.
+grep -q 'ndo_fix_features' "$BRIDGE" \
+  && grep -q 'ndev->mtu > ETH_DATA_LEN' "$BRIDGE" \
+  && grep -q 'NETIF_F_ALL_TSO' "$BRIDGE" \
+  && grep -q 'NETIF_F_CSUM_MASK' "$BRIDGE" \
+  && grep -q 'netdev_update_features(ndev)' "$BRIDGE" \
+  && ok "jumbo MTU disables TSO/TX-CSUM and refreshes features on MTU change" \
+  || bad "jumbo MTU must disable TSO/TX-CSUM via ndo_fix_features and netdev_update_features"
+
 exit $fail

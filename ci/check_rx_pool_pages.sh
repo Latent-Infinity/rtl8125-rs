@@ -65,11 +65,36 @@ else
 fi
 
 # 4. ndo_stop walks all slots to free + unmap (the cleanup pairing).
-if awk '/fn ndo_stop\b/,/^}/' "$ROOT/src/netdev.rs" 2>/dev/null | \
-		grep -qE '(rx_slot|rx_shadow_dma).*dma_unmap|__free_pages\(.*rx'; then
+# `rx_free_jumbo` is the safe-Rust wrapper whose cshim does
+# dma_unmap_page + __free_pages atomically — accept it alongside the
+# explicit inline pairing patterns.
+# Note: awk's `\b` word boundary is unreliable (gawk diverges from POSIX);
+# use an explicit `(` lookahead matching `fn ndo_stop(` instead.
+if awk '/fn[[:space:]]+ndo_stop\(/,/^}/' "$ROOT/src/netdev.rs" 2>/dev/null | \
+		grep -qE '(rx_slot|rx_shadow_dma).*dma_unmap|__free_pages\(.*rx|rx_free_jumbo\(|free_rx_slots\(state\)'; then
 	grn "ndo_stop cleans up RX pool (unmap + free per slot)"
 else
 	red "ndo_stop does NOT walk RX slots to free pages + unmap DMA — leak on rmmod"
+fi
+
+# 5. ndo_open rollback after the RX allocation point must also free the
+# pool. The allocation happens before request_irq / PHY connect / hw_start,
+# so every later fallible step needs to route through the same cleanup
+# helper as ndo_stop.
+if grep -qE 'fn[[:space:]]+free_rx_slots\(' "$ROOT/src/netdev.rs" &&
+   awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | \
+		grep -qE 'request_irq\(.*\)[[:space:]]*\{' &&
+   awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | \
+		awk '/request_irq\(/,/return Err\(e\);/' | grep -q 'free_rx_slots(state)' &&
+   awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | \
+		awk '/bridge_phy_connect_and_reset/,/return Err\(e\);/' | grep -q 'free_rx_slots(state)' &&
+   awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | \
+		awk '/hw_start_8125b/,/return Err\(e\);/' | grep -q 'free_rx_slots(state)' &&
+   awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | \
+		awk '/bridge_phy_kick_state_machine/,/return Err\(e\);/' | grep -q 'free_rx_slots(state)'; then
+	grn "ndo_open post-allocation failure paths release RX jumbo slots"
+else
+	red "ndo_open has a post-RX-allocation failure path that does not free RX jumbo slots"
 fi
 
 exit $rc

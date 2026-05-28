@@ -70,9 +70,38 @@ static int bridge_ndo_change_mtu(struct net_device *ndev, int new_mtu)
 	struct r8125_bridge *b = netdev_priv(ndev);
 	int rc = b->ops.change_mtu(b->priv, new_mtu);
 
-	if (!rc)
+	if (!rc) {
 		ndev->mtu = new_mtu;
+		/* RTL8125B's TSO MSS field is 11 bits (`TD1_MSS_SHIFT 18`,
+		 * mask `0x7ff` = 2047 max). At MTU > 1500 the TCP MSS would
+		 * overflow that field and the chip would segment with the
+		 * low 11 bits of the requested MSS — visible as iperf3 going
+		 * to 0 bps while ping still works (the bisection that
+		 * surfaced this on 2026-05-28). r8169 mainline solves it the
+		 * same way: drop NETIF_F_ALL_TSO + NETIF_F_CSUM at jumbo via
+		 * `ndo_fix_features`. We trigger the renegotiation here so
+		 * `bridge_ndo_fix_features` runs against the new MTU. */
+		netdev_update_features(ndev);
+	}
 	return rc;
+}
+
+/*
+ * `bridge_ndo_fix_features` — RTL8125B feature mask vs MTU rule, ported
+ * from `rtl8169_fix_features` in `r8169_main.c:1799`. Without this,
+ * jumbo MTU + TSO produces frames whose MSS field wraps in the TX
+ * descriptor's 11-bit slot, and the chip silently emits malformed
+ * segments. Same workaround applies to HW CSUM at jumbo on MAC_VER
+ * > 06. RTL8125B is MAC_VER_63, so both bits trip.
+ */
+static netdev_features_t bridge_ndo_fix_features(struct net_device *ndev,
+						  netdev_features_t features)
+{
+	if (ndev->mtu > ETH_DATA_LEN) {
+		features &= ~NETIF_F_ALL_TSO;
+		features &= ~NETIF_F_CSUM_MASK;
+	}
+	return features;
 }
 
 /* NAPI poll wrapper: same delegation pattern. */
@@ -88,6 +117,7 @@ static const struct net_device_ops bridge_ops = {
 	.ndo_stop		= bridge_ndo_stop,
 	.ndo_start_xmit		= bridge_ndo_start_xmit,
 	.ndo_change_mtu		= bridge_ndo_change_mtu,
+	.ndo_fix_features	= bridge_ndo_fix_features,
 	.ndo_set_mac_address	= eth_mac_addr,
 	.ndo_validate_addr	= eth_validate_addr,
 };
@@ -111,10 +141,15 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	ndev->needs_free_netdev = false; /* we free explicitly */
 	eth_hw_addr_set(ndev, mac);
 
-	/* M4 baseline: single queue, standard MTU range. Jumbo lands with
-	 * the M5 RX-buffer/page-fragment refactor. */
+	/* M6 #2: jumbo support up to 9000 bytes. The per-slot RX pool
+	 * (netdev_bridge_rx_pool.c) sizes every slot at JUMBO_16K_BYTES,
+	 * so any MTU in [ETH_MIN_MTU, 9000] fits without a per-MTU
+	 * re-alloc. We cap at the industry-common 9000 rather than the
+	 * chip's hardware max (16380) so peers / switches commonly tuned
+	 * for 9000 won't drop oversized frames. Phase-D bump to 16380
+	 * once operator validates peer support. */
 	ndev->min_mtu = ETH_MIN_MTU;
-	ndev->max_mtu = ETH_DATA_LEN;
+	ndev->max_mtu = 9000;
 
 	/* HW offload feature advertisement. opts bits + skb-side setup
 	 * are in netdev_bridge_offload.c (csum + TSO encoders), and the

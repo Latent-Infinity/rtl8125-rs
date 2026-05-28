@@ -313,7 +313,30 @@ pub(crate) const CPLUSCMD_RX_VLAN: u16 = 0x0040;
 pub(crate) const RX_MAX_SIZE: usize = 0xDA;
 /// Standard 1500-MTU Ethernet frame max + room for VLAN tag. r8169 uses
 /// `0x05F3` (1523) for the same purpose at non-jumbo; we round to 1536.
+#[allow(dead_code)]
 pub(crate) const RX_MAX_SIZE_DEFAULT: u16 = 1536;
+/// Jumbo-frame `RxMaxSize`. r8169 mainline sets the chip's RX max-frame
+/// threshold to `R8169_RX_BUF_SIZE = 0x05F3` for non-jumbo and to the
+/// allocated buffer size (`JUMBO_16K` minus VLAN/CRC slack) for jumbo
+/// builds. We follow r8169's "size the chip's drop threshold to match
+/// the actual buffer" rule and program `RX_MAX_SIZE_JUMBO` whenever the
+/// RX pool is allocated at jumbo size. Matches `R8169_RX_BUF_SIZE`
+/// (16383) plus we round to the chip's 14-bit length field cap.
+pub(crate) const RX_MAX_SIZE_JUMBO: u16 = 0x3FFF;
+
+// ── Jumbo-buffer sizing — paired with src/netdev_bridge_rx_pool.c ────────
+/// 9 KiB jumbo cap (the standard Ethernet-industry limit; switches and
+/// SFPs commonly support up to here, and our chip's TSO `max_segs = 10`
+/// (see `docs/RTL8125B_TSO_NOTES.md`) means a single super-skb covers
+/// ~90 KB of payload at MTU 9000 — comfortably under
+/// `netif_set_tso_max_size(64000)`).
+#[allow(dead_code)]
+pub(crate) const JUMBO_9K_BYTES: usize = 9000;
+/// Chip-side jumbo maximum (the hardware accepts up to `R8169_RX_BUF_SIZE
+/// = 16383` per `r8169_main.c`). Each RX slot's streaming-DMA page chunk
+/// must be at least this size; we round up to the nearest order-2 page
+/// allocation (16 KiB = 4 × 4 KiB pages on x86, `__GFP_ORDER(2)`).
+pub(crate) const JUMBO_16K_BYTES: usize = 16384;
 
 // ── Descriptor opts1 bits (TX + RX share this layout) ───────────────────
 /// `OWN` — set means hardware owns the descriptor. Driver clears on

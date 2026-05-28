@@ -1,7 +1,35 @@
 # M6 sub-feature #3 — Jumbo frames (MTU 9000+)
 
-**Status (2026-05-26): design only**. Implementation begins after the
-M5 ASPM soak chain completes (~2026-05-28).
+**Status (2026-05-28): LANDED.** Phases A + B + C from this design
+shipped as one atomic patch alongside an unanticipated Phase D
+(`ndo_fix_features` for the chip's 11-bit MSS field). End-to-end
+Controller-KVM smoke:
+
+| Configuration | iperf3 | retr | MSI-X IRQs (5 s) | Auto-feature state |
+|---|---|---|---|---|
+| MTU 1500, TSO+CSUM on | 2.35 Gbps | 0 | (mode=Msi) | TSO=on, TX-CSUM=on, RX-CSUM=on |
+| MTU 9000, jumbo path | 2.47 Gbps | 0 | 20 128 | TSO=off, TX-CSUM=off, RX-CSUM=on |
+| MTU 9000 → 1500 revert | 2.35 Gbps | 0 | — | TSO/CSUM restored automatically |
+
+Clean rmmod (`xmit_calls=329582 irq_fires=77669 napi_polls=77668`),
+zero kmemleak/WARN. §6.3 invariant holds across the transitions
+(tx_received == tx_consumed + tx_busy_exception + tx_dropped_error).
+
+**Unanticipated Phase D — TSO/CSUM auto-toggle (2026-05-28).** Jumbo
+ping worked first-try but jumbo iperf3 stalled at 0 bps. Bisection:
+RTL8125B's TX descriptor `opts2` MSS field is 11 bits at shift 18
+(mask `0x7ff = 2047`); at MTU 9000 the TCP MSS (~8960) overflows that
+field and the chip emits malformed segments. r8169 mainline solves it
+with `ndo_fix_features` (`r8169_main.c:1799-1812`): drop
+`NETIF_F_ALL_TSO | NETIF_F_CSUM_MASK` when `mtu > ETH_DATA_LEN`. We
+ported the same logic in `src/netdev_bridge.c::bridge_ndo_fix_features`
+and trigger `netdev_update_features()` from `bridge_ndo_change_mtu`,
+so the offload set tracks MTU automatically. The check
+`ci/check_offload_path.sh` covers the desired pairing.
+
+Historical context preserved below.
+
+---
 
 The chip's hardware supports jumbo up to **16380 bytes** (`JUMBO_16K`
 in r8169 mainline for `MAC_VER_61..LAST`). The plan §7 M6 target is

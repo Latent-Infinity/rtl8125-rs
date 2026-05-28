@@ -49,9 +49,9 @@ use core::sync::atomic::{AtomicPtr, AtomicU8};
 
 use crate::hw;
 use crate::mmio::{self, Regs};
-use crate::netdev::{IrqMode, NetdevHandle, NetdevState, RxBuffer};
+use crate::netdev::{IrqMode, NetdevHandle, NetdevState};
 use crate::pm;
-use crate::ring::{self, Ring, RING_LEN};
+use crate::ring::{self, Ring};
 use crate::unsafe_boundary;
 
 /// Realtek's PCI Vendor ID is exposed as [`pci::Vendor::REALTEK`] (0x10EC);
@@ -264,12 +264,10 @@ impl pci::Driver for R8125Driver {
                         if intx_only { ", forced by intx_only" } else { "" }
                     );
 
-                    let rx_bufs: kernel::dma::CoherentAllocation<RxBuffer> =
-                        kernel::dma::CoherentAllocation::alloc_coherent(
-                            pdev.as_ref(),
-                            RING_LEN,
-                            GFP_KERNEL,
-                        )?;
+                    // M6 #2 — RX pool moved to per-slot streaming DMA
+                    // allocated lazily in `ndo_open` (see netdev.rs).
+                    // Probe just zero-initialises the two per-slot
+                    // atomic arrays; the empty sentinel is `null/0`.
 
                     let state = KBox::new(
                         NetdevState {
@@ -282,7 +280,8 @@ impl pci::Driver for R8125Driver {
                             tx_dma: tx_ring.dma_handle(),
                             rx_desc: rx_ring.desc_ptr_mut(),
                             rx_dma: rx_ring.dma_handle(),
-                            rx_bufs,
+                            rx_slot_cpu: core::array::from_fn(|_| AtomicPtr::new(core::ptr::null_mut())),
+                            rx_slot_dma: core::array::from_fn(|_| core::sync::atomic::AtomicU64::new(0)),
                             tx_shadow: core::array::from_fn(|_| AtomicPtr::new(core::ptr::null_mut())),
                             tx_shadow_dma: core::array::from_fn(|_| core::sync::atomic::AtomicU64::new(0)),
                             tx_shadow_len: core::array::from_fn(|_| core::sync::atomic::AtomicU32::new(0)),

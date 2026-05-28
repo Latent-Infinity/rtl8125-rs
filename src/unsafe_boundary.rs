@@ -39,14 +39,18 @@ use core::sync::atomic::Ordering;
 
 use kernel::bindings;
 use kernel::device;
-use kernel::dma::{Device as DmaDevice, DmaMask};
+use kernel::dma::DmaMask;
+// `kernel::dma::Device` is implemented for `pci::Device<Core>` (see
+// `pci.rs::474`); bring it into scope so `pdev.dma_set_mask_and_coherent`
+// resolves below. The alias keeps the name from shadowing `pci::Device`.
+use kernel::dma::Device as _;
 use kernel::error::{to_result, Result};
 use kernel::pci;
 use kernel::prelude::*;
 use kernel::transmute::{AsBytes, FromBytes};
 use kernel::types::Opaque;
 
-use crate::netdev::{NetdevHandle, NetdevState, RxBuffer};
+use crate::netdev::{NetdevHandle, NetdevState};
 use crate::ring::Descriptor;
 
 /// Configure 64-bit DMA addressing on `pdev` and its coherent allocator.
@@ -208,6 +212,27 @@ extern "C" {
     fn r8125_bridge_phy_connect_and_reset(ndev: *mut bindings::net_device) -> c_int;
     fn r8125_bridge_phy_kick_state_machine(ndev: *mut bindings::net_device) -> c_int;
     fn r8125_bridge_phy_stop(ndev: *mut bindings::net_device);
+
+    // ── Jumbo RX-pool (M6 #2) — per-slot streaming-DMA pages ───────────
+    fn r8125_bridge_rx_alloc_jumbo(
+        dev: *mut bindings::device,
+        out_cpu: *mut *mut c_void,
+        out_dma: *mut bindings::dma_addr_t,
+    ) -> c_int;
+    fn r8125_bridge_rx_free_jumbo(
+        dev: *mut bindings::device,
+        cpu: *mut c_void,
+        dma: bindings::dma_addr_t,
+    );
+    fn r8125_bridge_rx_sync_for_cpu(
+        dev: *mut bindings::device,
+        dma: bindings::dma_addr_t,
+        len: usize,
+    );
+    fn r8125_bridge_rx_sync_for_device(
+        dev: *mut bindings::device,
+        dma: bindings::dma_addr_t,
+    );
 }
 
 /// Rust mirror of `struct r8125_bridge_mdio_ops` — four function pointers
@@ -235,25 +260,22 @@ pub(crate) struct BridgeMdioOps {
 // by Send; no ring overrun is possible.
 unsafe impl Send for NetdevHandle {}
 
-// SAFETY: `NetdevState` holds raw pointers (`bar_ptr`, `tx_desc`, `rx_desc`)
-// into kernel-owned mappings whose lifetimes outlive NetdevState (BAR is
-// pinned via Devres in R8125Driver, descriptor rings are owned by
-// CoherentAllocation fields in R8125Driver that drop after NetdevState).
-// Cross-context fields (head/tail/shadow) are atomics. Static fields are
-// read-only after probe. CoherentAllocation in `rx_bufs` is sound to share
-// because hardware writes are serialised by the OWN-bit handshake. NAPI is
-// the only context that mutates rx_tail / tx_tail; xmit is the only one
-// that mutates tx_head. Sharing across threads is therefore safe.
+// SAFETY: `NetdevState` holds raw pointers (`bar_ptr`, `tx_desc`,
+// `rx_desc`) into kernel-owned mappings whose lifetimes outlive
+// NetdevState (BAR is pinned via Devres in R8125Driver, descriptor
+// rings are owned by `Ring<{ RING_LEN }>` fields in R8125Driver that
+// drop after NetdevState). Cross-context fields (head/tail/shadow,
+// per-slot rx cpu/dma) are atomics. Static fields are read-only after
+// probe. The per-slot RX page chunks are owned by `ndo_open` and
+// freed by `ndo_stop`; both run with RTNL held so there's no
+// allocator-side race. NAPI is the only context that mutates
+// rx_tail / tx_tail; xmit is the only one that mutates tx_head.
+// Sharing across threads is therefore safe.
 unsafe impl Send for NetdevState {}
 // SAFETY: same reasoning as the `Send` impl above; all cross-context
-// mutation goes through atomics or device-owned coherent memory.
+// mutation goes through atomics, RTNL-held slow paths, or
+// device-owned coherent memory.
 unsafe impl Sync for NetdevState {}
-
-// SAFETY: `RxBuffer` is `#[repr(C, align(64))]` containing only `[u8; N]`.
-// Every bit pattern is a valid RxBuffer; no uninitialized padding.
-unsafe impl AsBytes for RxBuffer {}
-// SAFETY: same layout and bit-validity argument as `AsBytes`.
-unsafe impl FromBytes for RxBuffer {}
 
 // ── Safe wrappers — M4-full hot path ──────────────────────────────────────
 
@@ -364,6 +386,78 @@ pub(crate) fn pci_irq_vector<Ctx: device::DeviceContext>(
     }
 }
 
+// ── Jumbo RX-pool safe wrappers (M6 #2) ──────────────────────────────────
+//
+// Each `RxSlot` holds one streaming-DMA-mapped 16 KiB page chunk from
+// `r8125_bridge_rx_alloc_jumbo`. The pool's lifecycle is ndo_open
+// (allocate per slot) → ndo_stop (free per slot); see
+// `src/netdev_bridge_rx_pool.c` for the discipline.
+
+/// Allocate one jumbo-sized RX slot. Returns `(cpu, dma)` on success.
+///
+/// # SAFETY contract
+///
+/// `pdev` is alive (ARef holds the refcount). The cshim's
+/// `r8125_bridge_rx_alloc_jumbo` allocates one 16 KiB page chunk + DMA
+/// maps it `FROM_DEVICE`; on failure no resource is leaked. The caller
+/// MUST eventually balance every successful alloc with `rx_free_jumbo`.
+pub(crate) fn rx_alloc_jumbo(
+    pdev: &kernel::sync::aref::ARef<pci::Device>,
+) -> Result<(*mut c_void, bindings::dma_addr_t)> {
+    let dev = bridge_dma_device(pdev);
+    let mut cpu: *mut c_void = core::ptr::null_mut();
+    let mut dma: bindings::dma_addr_t = 0;
+    // SAFETY: see fn-level contract; out-pointers are stack locals,
+    // valid for the duration of the call.
+    let rc = unsafe {
+        r8125_bridge_rx_alloc_jumbo(
+            dev,
+            core::ptr::from_mut(&mut cpu),
+            core::ptr::from_mut(&mut dma),
+        )
+    };
+    to_result(rc)?;
+    Ok((cpu, dma))
+}
+
+/// Release one slot acquired via `rx_alloc_jumbo`. Idempotent against
+/// a null `cpu` pointer (the cshim short-circuits) so the rollback
+/// path in `ndo_open` can call this on partially-acquired state.
+pub(crate) fn rx_free_jumbo(
+    pdev: &kernel::sync::aref::ARef<pci::Device>,
+    cpu: *mut c_void,
+    dma: bindings::dma_addr_t,
+) {
+    let dev = bridge_dma_device(pdev);
+    // SAFETY: `cpu`/`dma` are either both null (no-op) or the values
+    // returned from a prior `rx_alloc_jumbo` on the same `pdev`.
+    unsafe { r8125_bridge_rx_free_jumbo(dev, cpu, dma) };
+}
+
+/// Sync the slot's DMA mapping FOR THE CPU before NAPI reads `len`
+/// bytes. No-op on cache-coherent archs; required on ARM/RISC-V.
+pub(crate) fn rx_sync_for_cpu(
+    pdev: &kernel::sync::aref::ARef<pci::Device>,
+    dma: bindings::dma_addr_t,
+    len: usize,
+) {
+    let dev = bridge_dma_device(pdev);
+    // SAFETY: `dma` was returned from a prior `rx_alloc_jumbo` on the
+    // same `pdev`; `len` is bounded by the chip-reported frame length
+    // which is capped at `JUMBO_16K_BYTES` by the chip's RxMaxSize.
+    unsafe { r8125_bridge_rx_sync_for_cpu(dev, dma, len) };
+}
+
+/// Sync FOR THE DEVICE before the slot's descriptor is re-posted.
+pub(crate) fn rx_sync_for_device(
+    pdev: &kernel::sync::aref::ARef<pci::Device>,
+    dma: bindings::dma_addr_t,
+) {
+    let dev = bridge_dma_device(pdev);
+    // SAFETY: as `rx_sync_for_cpu`.
+    unsafe { r8125_bridge_rx_sync_for_device(dev, dma) };
+}
+
 // ── NetdevState pointer-juggling helpers (keep unsafe in this file) ──────
 
 /// Reinterpret the cshim `cookie` pointer as `&NetdevState`.
@@ -450,18 +544,8 @@ pub(crate) fn desc_write(ring: *mut Descriptor, idx: usize, value: Descriptor) {
     }
 }
 
-/// Pointer to RX slot `idx`'s CPU-readable buffer base. Caller must
-/// dereference for `[u8; RX_BUF_LEN]` (not done here — keeps the unsafe
-/// at the boundary).
-pub(crate) fn rx_buf_ptr(
-    bufs: &kernel::dma::CoherentAllocation<RxBuffer>,
-    idx: usize,
-) -> *const c_void {
-    let start = bufs.start_ptr();
-    // SAFETY: idx < count() guaranteed by caller (NAPI walks 0..RING_LEN).
-    let slot_ptr = unsafe { start.add(idx) };
-    slot_ptr.cast::<c_void>()
-}
+// `rx_buf_ptr` was removed alongside the M6 #2 jumbo refactor. NAPI now
+// reads `state.rx_slot(i).cpu` directly — see `src/netdev.rs::RxSlot`.
 
 // ── sk_buff helpers — safe wrappers, counters live inside the cshim ──────
 

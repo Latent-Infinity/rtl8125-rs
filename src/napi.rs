@@ -38,6 +38,21 @@ use crate::ring::{Descriptor, RING_LEN};
 #[allow(clippy::unsafe_removed_from_name)]
 use crate::unsafe_boundary as ub;
 
+/// Per-descriptor RX length advertised to the chip. The hardware
+/// descriptor's LEN field is 14 bits (`DESC_LEN_MASK = 0x3FFF`), so the
+/// maximum chip-encodable per-slot buffer length is 16383 bytes — one
+/// less than the 16 KiB page chunk the cshim hands us. We clamp here
+/// once (constant fold) so the hot RX loop doesn't redo the saturating
+/// `min` per descriptor.
+const RX_DESC_BUF_LEN: u32 = {
+    let len = RX_BUF_LEN as u32;
+    if len > regs::DESC_LEN_MASK {
+        regs::DESC_LEN_MASK
+    } else {
+        len
+    }
+};
+
 /// Re-arm the chip's interrupt sources to the baseline mask. Branches on
 /// the probe-chosen [`IrqMode`]:
 ///
@@ -102,10 +117,17 @@ pub(crate) fn poll(state: &NetdevState, budget: c_int) -> c_int {
         let len = core::cmp::min(len, RX_BUF_LEN);
 
         let ndev = state.ndev.load(Ordering::Acquire);
+        let slot = state.rx_slot(rx_tail);
         if len > 0 {
+            // Streaming-DMA discipline: invalidate the CPU's cache lines
+            // for the chip-deposited bytes BEFORE the cshim reads them
+            // via `skb_put_data`. On x86 this is a no-op; on ARM/RISC-V
+            // it walks the cache. We sync only `len` (what the chip
+            // wrote) rather than the whole slot.
+            ub::rx_sync_for_cpu(&state.pdev, slot.dma, len);
             // Build skb (cshim copies). Counter `rx_handed_to_stack++` happens
             // inside `bridge_skb_deliver_rx`.
-            let buf_ptr = ub::rx_buf_ptr(&state.rx_bufs, rx_tail);
+            let buf_ptr = slot.cpu.cast_const();
             let skb = ub::skb_build_rx(ndev, buf_ptr, len);
             if !skb.is_null() {
                 // M4-perf: ask the chip-side opts1 if HW verified the L4
@@ -124,9 +146,15 @@ pub(crate) fn poll(state: &NetdevState, budget: c_int) -> c_int {
             }
         }
 
-        // Re-post the descriptor: same DMA address, OWN bit set, len = buf.
-        let dma = state.rx_bufs.dma_handle() + (rx_tail as u64) * (RX_BUF_LEN as u64);
-        let mut opts1 = regs::DESC_OWN | (RX_BUF_LEN as u32 & regs::DESC_LEN_MASK);
+        // Re-post the descriptor: same DMA address, OWN bit set, len =
+        // clamped buffer length. The slot's `dma` is the one we mapped
+        // at `ndo_open`; nothing about it changes across the chip's
+        // OWN handshake — only the descriptor opts. Sync FOR DEVICE
+        // before re-posting so the chip sees an invalidated cache for
+        // the next DMA. No-op on x86 (cache-coherent DMA), required
+        // for portability to ARM/RISC-V.
+        ub::rx_sync_for_device(&state.pdev, slot.dma);
+        let mut opts1 = regs::DESC_OWN | RX_DESC_BUF_LEN;
         if rx_tail == RING_LEN - 1 {
             opts1 |= regs::DESC_EOR;
         }
@@ -136,7 +164,7 @@ pub(crate) fn poll(state: &NetdevState, budget: c_int) -> c_int {
             Descriptor {
                 opts1,
                 opts2: 0,
-                addr: dma,
+                addr: slot.dma,
             },
         );
 

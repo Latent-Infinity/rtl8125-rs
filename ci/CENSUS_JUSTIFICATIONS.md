@@ -86,3 +86,41 @@ and is covered by the task #49 SG proof. `NETIF_F_TSO | NETIF_F_TSO6`
 are now advertised with the RTL8125B-specific `netif_set_tso_max_segs`
 cap documented in `docs/RTL8125B_TSO_NOTES.md`. This did not require
 additional unsafe wrappers.
+
+## 2026-05-28 — M6 #2 jumbo RX-pool refactor bump 53 → 54
+
+Net `unsafe { … }` count moves 53 → 54 in `src/unsafe_boundary.rs`:
+
+**Added (4)** — FFI surface for the per-slot streaming-DMA RX pool
+(`src/netdev_bridge_rx_pool.c`):
+
+- `rx_alloc_jumbo(pdev) -> (cpu, dma)` — wraps
+  `r8125_bridge_rx_alloc_jumbo`. SAFETY: `pdev` is alive via ARef; the
+  cshim allocates one `order-2` page chunk + `dma_map_page(FROM_DEVICE)`,
+  freeing both atomically on failure so the Rust side can't double-free.
+- `rx_free_jumbo(pdev, cpu, dma)` — wraps `r8125_bridge_rx_free_jumbo`
+  which does `dma_unmap_page` + `__free_pages(virt_to_page(cpu))`.
+  SAFETY: `(cpu, dma)` are either both null (no-op short-circuit) or
+  the values returned from a prior `rx_alloc_jumbo` on the same pdev.
+- `rx_sync_for_cpu(pdev, dma, len)` — wraps
+  `r8125_bridge_rx_sync_for_cpu` (`dma_sync_single_for_cpu`). SAFETY:
+  `dma` came from a prior `rx_alloc_jumbo`; `len` is bounded by the
+  chip-side `RxMaxSize` which we program to `JUMBO_16K_BYTES - 1`.
+- `rx_sync_for_device(pdev, dma)` — wraps
+  `r8125_bridge_rx_sync_for_device` (`dma_sync_single_for_device`).
+  SAFETY: as above; the whole buffer is synced because the chip can
+  fill any portion of it next time.
+
+**Removed (3)** — the M4 coherent-allocation RX pool helpers:
+
+- `rx_buf_ptr(bufs, idx)` — slot-pointer math inside the
+  `CoherentAllocation<RxBuffer>` is gone; NAPI reads
+  `state.rx_slot(i).cpu` directly.
+- `unsafe impl AsBytes for RxBuffer` — `RxBuffer` was the contents of
+  the coherent allocation; the type is dropped now that the pool moved
+  to per-slot streaming-DMA pages.
+- `unsafe impl FromBytes for RxBuffer` — same reason.
+
+Net: +4 added − 3 removed = +1. The new helpers are all mechanical
+FFI wrappers around C cshim functions that themselves perform the
+allocation, mapping, and free; no MMIO-touching unsafe is introduced.

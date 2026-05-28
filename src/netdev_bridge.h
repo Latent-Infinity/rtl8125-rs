@@ -220,6 +220,28 @@ void r8125_bridge_skb_dma_unmap_tx(struct device *dev,
 void r8125_bridge_skb_dma_unmap_frag_tx(struct device *dev,
 					dma_addr_t handle, size_t len);
 
+/* ──────────────────────────────────────────────────────────────────────
+ *  Jumbo RX-pool: per-slot streaming-DMA allocator (M6 sub-feature #2).
+ *
+ *  The M4 baseline used a single coherent allocation sized for 256 ×
+ *  2 KiB. Jumbo (RX buffers up to 16 KiB) doesn't fit that pattern —
+ *  4 MiB contiguous DMA-coherent is unreliable on fragmented systems.
+ *  These helpers move the pool to one streaming-DMA page chunk per
+ *  slot (`alloc_pages(order=2)` + `dma_map_page`), matching r8169
+ *  mainline's per-slot strategy. Implementation: netdev_bridge_rx_pool.c.
+ *
+ *  Lifecycle: `ndo_open` calls `rx_alloc_jumbo` per ring slot; `ndo_stop`
+ *  calls `rx_free_jumbo` for each. The sync calls live on the NAPI poll
+ *  RX path (before/after the CPU touches the slot's bytes).
+ * ────────────────────────────────────────────────────────────────────── */
+int  r8125_bridge_rx_alloc_jumbo(struct device *dev, void **out_cpu,
+				 dma_addr_t *out_dma);
+void r8125_bridge_rx_free_jumbo(struct device *dev, void *cpu,
+				dma_addr_t dma);
+void r8125_bridge_rx_sync_for_cpu(struct device *dev, dma_addr_t dma,
+				   size_t len);
+void r8125_bridge_rx_sync_for_device(struct device *dev, dma_addr_t dma);
+
 /*
  * Free an skb on the TX-error path (validation reject, DMA-map failure,
  * etc.). Counter: tx_dropped_error++. Calls `dev_kfree_skb_any` exactly

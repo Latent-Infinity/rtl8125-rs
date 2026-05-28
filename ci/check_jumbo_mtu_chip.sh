@@ -41,7 +41,7 @@ fi
 #    is enabled. We do NOT enforce the exact value (the design allows
 #    either always-16K like r8169 or dynamic-sized); just that it's
 #    not still ETH_DATA_LEN.
-if awk '/fn hw_start_8125b/,/^}/' "$HW" | grep -qE 'set_rx_max_size\s*\(\s*(JUMBO|R8169_RX_BUF_SIZE|0x4000|16384)'; then
+if awk '/fn hw_start_8125b/,/^}/' "$HW" | grep -qE 'set_rx_max_size\s*\(\s*(regs::)?(JUMBO|R8169_RX_BUF_SIZE|RX_MAX_SIZE_JUMBO|0x4000|16384)'; then
 	grn "hw_start_8125b sets RxMaxSize to a jumbo-sized value"
 else
 	red "hw_start_8125b RxMaxSize not aligned with jumbo-bumped max_mtu"
@@ -49,8 +49,10 @@ fi
 
 # 3. Per-revision rollback path. ChipInfo should grow a max_mtu field
 #    so a future non-jumbo chip-rev row can disable advertising
-#    without code surgery.
-if grep -qE 'ChipInfo[^}]*max_mtu\s*:' "$HW" 2>/dev/null; then
+#    without code surgery. grep can't match across newlines portably,
+#    so awk the struct body and scan for the field.
+if awk '/pub\(crate\) struct ChipInfo/,/^}/' "$HW" 2>/dev/null | \
+		grep -qE 'max_mtu\s*:'; then
 	grn "ChipInfo carries per-revision max_mtu field"
 else
 	# Soft: this might be tracked elsewhere or not yet refactored.

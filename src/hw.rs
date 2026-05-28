@@ -48,6 +48,17 @@ pub(crate) struct ChipInfo {
     pub(crate) val: u32,
     pub(crate) mac_version: MacVersion,
     pub(crate) name: &'static str,
+    /// Per-revision jumbo cap. RTL8125B supports up to the chip's
+    /// `R8169_RX_BUF_SIZE = 16383`; we ship the industry-standard
+    /// `JUMBO_9K_BYTES = 9000` as the advertised max so peers/switches
+    /// won't drop oversized frames. A future chip revision that
+    /// doesn't support jumbo can ship `ETH_DATA_LEN` here and the
+    /// bridge will refuse `change_mtu` above 1500 without code surgery.
+    /// Currently informational only — the cshim's `max_mtu` value is
+    /// the hardcoded `9000` until the alloc path is plumbed to pass
+    /// `info.max_mtu` to `r8125_bridge_alloc`.
+    #[allow(dead_code)]
+    pub(crate) max_mtu: usize,
 }
 
 /// Known-chip dispatch table — M2 carries only the validated entry. Adding
@@ -58,6 +69,7 @@ pub(crate) const KNOWN: &[ChipInfo] = &[
         val: 0x641,
         mac_version: MacVersion::Rtl8125B,
         name: "RTL8125B",
+        max_mtu: crate::regs::JUMBO_9K_BYTES,
     },
 ];
 
@@ -193,6 +205,15 @@ fn hw_start_8125b_unlocked(regs: &Regs<'_>) -> Result<()> {
     // rtl_disable_rxdvgate — RX_DV signal from PHY now reaches the MAC.
     let misc = regs.misc();
     regs.set_misc(misc & !regs::MISC_RXDV_GATED_EN);
+
+    // M6 #2 — chip-side `RxMaxSize` sized to match the jumbo-capable
+    // RX pool. The descriptor LEN field is 14 bits (`DESC_LEN_MASK`)
+    // so `JUMBO_16K_BYTES - 1 = 0x3FFF` is the chip-encodable maximum
+    // and the chip's drop threshold sits above any MTU we'd advertise
+    // via `ndo_change_mtu`. r8169 always programs the full
+    // `R8169_RX_BUF_SIZE` here regardless of MTU (it sizes the chip's
+    // FIFO threshold above any plausible frame), and so do we.
+    regs.set_rx_max_size(regs::RX_MAX_SIZE_JUMBO);
 
     // M4-perf phase 2 (task #49): write the TX engine's DMA burst +
     // InterFrameGap config. r8169 calls `rtl_set_tx_config_registers`
