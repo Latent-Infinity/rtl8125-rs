@@ -1,18 +1,40 @@
 // SPDX-License-Identifier: GPL-2.0
-//! PCI bring-up for the RTL8125 — plan §7 M1 + M2.
+//! PCI bring-up for the RTL8125.
 //!
-//! - **M1**: registers the driver for VID `0x10EC` / DID `0x8125`, enables
-//!   memory decoding, maps BAR2 (the 64 KiB MMIO MAC-register window per
-//!   lspci), logs vendor/device/revision.
-//! - **M2**: after the BAR is mapped, identifies the chip from `TxConfig`
-//!   (refuses unknown sub-revisions — *no silent fallback*), runs the
-//!   r8169-style reset sequence with timeout, and logs the PCIe ASPM
-//!   capabilities. The `inject_reset_timeout` module parameter exercises
-//!   the failure-injection path required by the §7 M2 gate.
+//! [`R8125Driver`] implements [`kernel::pci::Driver`] for
+//! VID `0x10EC` / DID `0x8125`. Probe sequence:
 //!
-//! Devres + ARef handle every teardown — including on the probe error paths,
-//! which the plan calls out as the "failed reset path is recoverable"
-//! contract (other drivers can rebind the device cleanly).
+//! 1. Enable memory decoding (`pdev.enable_device_mem()`).
+//! 2. Set the 64-bit DMA mask via
+//!    `unsafe_boundary::set_64bit_dma_mask`.
+//! 3. Map BAR2 (64 KiB MMIO MAC-register window) via [`Devres`].
+//! 4. Identify the chip from `TxConfig`'s XID nibble. Refuse any
+//!    XID not in `hw::KNOWN` — **no silent fallback**.
+//! 5. Reset the chip (r8169-style `CmdReset` + 10 ms poll). The
+//!    `inject_reset_timeout` module parameter forces a timeout to
+//!    exercise the failure path required by plan §7 M2.
+//! 6. Log the PCIe ASPM capabilities (read-only at probe; actual
+//!    ASPM enable/disable lives in `hw::hw_start_8125b`, gated by
+//!    the `force_aspm` module param).
+//! 7. Allocate the TX + RX descriptor rings and the coherent RX
+//!    buffer pool (256 slots × 2 KiB).
+//! 8. Register the net_device via the cshim
+//!    (`netdev::NetdevHandle::new_with_state`). The netdev's
+//!    `ndo_open` performs full bring-up — PHY connect, MAC init,
+//!    IRQ request, NAPI enable.
+//!
+//! ## Drop order (load-bearing)
+//!
+//! [`R8125Driver`] field declaration order matters: Rust drops fields
+//! in declaration order (top-to-bottom). `_netdev` is declared FIRST
+//! so `bridge_unregister_and_free` (which calls `ndo_stop`) runs
+//! before `_bar`'s `Devres` revokes the MMIO mapping. Inverting this
+//! drop order causes a use-after-free when `ndo_stop` accesses chip
+//! registers during teardown.
+//!
+//! Devres + `ARef` handle the rest. Probe-error paths run through
+//! Drop, never bypass it — that's how "failed reset is recoverable"
+//! (plan §7 M2) is enforced (other drivers rebind cleanly).
 
 use kernel::{
     device::Core,

@@ -68,17 +68,21 @@ else
 	grn "poll: napi_complete_done is guarded by 'work_done < budget'"
 fi
 
-# -- 3. set_imr colocated with napi_complete_done ---------------------------
+# -- 3. IRQ re-arm colocated with napi_complete_done ------------------------
+# Accept either a direct `set_imr(INTR_M4_BASELINE)` call or a call to
+# a helper named like `rearm_irq*` (the M6 #1 surface-aware helper
+# wraps the V2 vs legacy branch in one site). Either way the re-arm
+# must land within 3 lines of complete_done.
 if echo "$poll_body" | awk '
 	/napi_complete_done\(/ { saw = NR }
-	/set_imr\(regs::INTR_M4_BASELINE\)/ {
+	/set_imr\(regs::INTR_M4_BASELINE\)|rearm_irq[a-z_]*\(/ {
 		if (saw && NR - saw <= 3) found = 1
 	}
 	END { exit (found ? 0 : 1) }
 '; then
-	grn "poll: set_imr(INTR_M4_BASELINE) is within 3 lines of napi_complete_done"
+	grn "poll: IRQ re-arm is within 3 lines of napi_complete_done"
 else
-	red "poll: set_imr re-arm not colocated with napi_complete_done"
+	red "poll: IRQ re-arm not colocated with napi_complete_done"
 fi
 
 # -- 4. tx_tail.store before bridge_tx_wake_queue in reaper -----------------

@@ -91,12 +91,14 @@ const NETDEV_TX_OK: c_int = 0;
 const NETDEV_TX_BUSY: c_int = 0x10;
 
 /// Stop the TX queue preemptively when fewer than this many descriptor
-/// slots remain free. Pairs with `napi::TX_START_THRS` (= 64) so the
-/// reaper only wakes us after enough slots have drained — without this
-/// hysteresis the kernel-queue state churns on every reaped descriptor
-/// and `tx_busy_exception` spikes under load. 32 leaves ample headroom
-/// for any single LSO super-skb (we cap `tso_max_segs = 10`, so the
-/// max chain is 11 descriptors).
+/// slots remain free. **Must pair** with [`napi::TX_START_THRS`]
+/// (= 64) so the reaper only wakes us after enough slots have
+/// drained — without hysteresis the kernel-queue state churns on
+/// every reaped descriptor and `tx_busy_exception` spikes under load.
+/// 32 leaves headroom for one max-size LSO super-skb (`tso_max_segs =
+/// 10` configured in `netdev_bridge.c`, so the max chain is 11
+/// descriptors). When changing this, also revisit
+/// [`napi::TX_START_THRS`] — they're a paired tuning surface.
 const TX_STOP_THRS: usize = 32;
 
 /// Stop the TX queue, then recheck the producer/consumer indices to cover
@@ -273,23 +275,9 @@ pub(crate) const M4_FULL_OPS: BridgeOps = BridgeOps {
     change_mtu: rust_change_mtu,
 };
 
-// M4-full hot-path. The 2026-05-25 KASAN UAF in `rust_stop` was a
-// drop-order bug in `pci.rs::R8125Driver` (struct fields drop in
-// declaration order, NOT reverse — the doc comment there said the
-// wrong thing). With `_netdev` now first in the declaration, it drops
-// first: `bridge_unregister_and_free` → kernel `ndo_stop` → Rust
-// `rust_stop` reads `bar_ptr` / `tx_desc` / `rx_desc` while `_bar` /
-// `tx_ring` / `rx_ring` are still mapped. After Drop returns, the
-// remaining fields free their resources in declaration order.
-//
-// Cache-padding (RUST_STANDARDS.md §15.2) was applied to tx_head /
-// tx_tail / rx_tail in the same pass — they're now `CachePadded
-// <AtomicUsize>` so xmit (mutating tx_head) and NAPI poll (mutating
-// tx_tail + rx_tail) don't false-share a single 64-byte line.
-//
-// Stub vtable retained as a load-test fallback if M4-full ever needs
-// to be sidelined again. Flip `ACTIVE_OPS` to point at it for the
-// no-traffic insmod/rmmod regression.
+// Skeleton vtable retained as a load-test fallback. Flip `ACTIVE_OPS`
+// to point at `M4_SKELETON_OPS` for a no-traffic insmod/rmmod
+// regression with no chip interaction. Not wired by default.
 #[allow(dead_code)]
 extern "C" fn skel_open(_cookie: *mut c_void) -> c_int { 0 }
 #[allow(dead_code)]
@@ -419,8 +407,10 @@ fn ndo_open(state: &NetdevState) -> Result<()> {
     // IMR write must come last (after ChipCmd RX|TX enable).
     regs.set_chip_cmd(regs::CMD_RX_ENB | regs::CMD_TX_ENB);
 
-    // Unmask IRQ sources LAST — mirrors r8169 `rtl_irq_enable`.
-    regs.set_imr(regs::INTR_M4_BASELINE);
+    // Unmask legacy IRQ sources LAST — mirrors r8169 `rtl_irq_enable`.
+    // V2 rearm stays deferred until MSI-X/MSI allocation and
+    // INT_CFG0_ENABLE_8125 activation land together.
+    crate::napi::rearm_irq_baseline(state);
 
     // PHY step 2 — kick the state machine LAST. Per r8169 ordering this
     // runs after ChipCmd RX|TX enable + IMR programming. Carrier flips
@@ -478,9 +468,16 @@ fn ndo_stop(state: &NetdevState) {
     ub::bridge_carrier_off(ndev);
 
     // Mask IRQs, disable RX/TX, ack any pending bits.
+    //
+    // We mask BOTH legacy and V2 surfaces so the M6 #1 Phase A.2
+    // transition (when V2 + MSI-X land together) doesn't need to
+    // edit ndo_stop. Idempotent: V2 writes are no-ops when chip is
+    // in legacy mode and vice versa.
     regs.set_imr(0);
+    regs.clear_imr_v2_mask(0xFFFF_FFFF);
     regs.set_chip_cmd(0);
     regs.ack_isr(0xFFFF_FFFF);
+    regs.ack_isr_v2(0xFFFF_FFFF);
 
     // Release the IRQ (kernel synchronises).
     ub::free_irq(
@@ -515,10 +512,7 @@ fn ndo_stop(state: &NetdevState) {
 // ── ndo_start_xmit ────────────────────────────────────────────────────────
 
 fn ndo_start_xmit(state: &NetdevState, skb: *mut bindings::sk_buff) -> c_int {
-    let n = XMIT_CALLS.fetch_add(1, Ordering::Relaxed);
-    if n < 3 {
-        pr_info!("r8125_rust xmit#{}: about to map+post\n", n);
-    }
+    XMIT_CALLS.fetch_add(1, Ordering::Relaxed);
 
     // ── Offload bit computation (must run BEFORE DMA mapping) ──────────
     // TSO is checked first; if active, opts1 gets GTSEN bits + transport
@@ -637,10 +631,8 @@ fn ndo_start_xmit(state: &NetdevState, skb: *mut bindings::sk_buff) -> c_int {
     // observes a fully-populated chain when it picks up the head.
     // Whole-struct volatile commit (`ub::desc_write`) is sufficient on
     // x86: TSO ordering + PCIe ordering ensure the descriptor commits
-    // atomically from the chip's perspective. An A/B test on
-    // 2026-05-26 confirmed an explicit two-phase commit
-    // (addr→opts2→fence→opts1) was not required after the real TSO
-    // fix landed (max_segs=10 cap in netdev_bridge.c).
+    // atomically from the chip's perspective. (Two-phase commit was
+    // tried and ruled out — see `docs/RTL8125B_TSO_NOTES.md`.)
     let first_slot = head % RING_LEN;
     let mut first_opts1 =
         regs::DESC_OWN | regs::DESC_TX_FS | (linear_len & regs::DESC_LEN_MASK);
@@ -697,6 +689,11 @@ fn ndo_start_xmit(state: &NetdevState, skb: *mut bindings::sk_buff) -> c_int {
 extern "C" fn raw_irq_handler(_irq: c_int, dev_id: *mut c_void) -> bindings::irqreturn_t {
     let state = state_from(dev_id);
     let regs = state.regs();
+    // M6 #1 Phase A: stay on the legacy ISR/IMR register surface
+    // until Phase A.2 lands MSI-X allocation. The V2 surface in
+    // `mmio.rs` is scaffolding for the moment Phase A.2 enables
+    // `INT_CFG0_ENABLE_8125` in `hw_start_8125b`. See the comment
+    // there for the empirical reason the two must land together.
     let status = regs.isr();
     if status == 0 || status == 0xFFFF_FFFF {
         return bindings::irqreturn_IRQ_NONE as bindings::irqreturn_t;

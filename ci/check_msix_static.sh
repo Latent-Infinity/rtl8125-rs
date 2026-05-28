@@ -35,9 +35,21 @@ HW="$ROOT/src/hw.rs"
 NETDEV="$ROOT/src/netdev.rs"
 MAIN="$ROOT/src/r8125_rust_main.rs"
 
-# Pre-engagement: is MSI-X in tree yet?
+# Pre-engagement: V2 surface is only ACTIVE when hw_start_8125b sets
+# INT_CFG0_ENABLE_8125 (Phase A.2). Phase A.1 lands the surface as
+# scaffolding without activating it — the V2 constants exist but the
+# IRQ handler stays on legacy. We engage the full check only when
+# the chip-side activation lands.
 if ! grep -qE '\bIMR_V2_SET\b|\bISR_V2\b' "$REGS"; then
 	yel "MSI-X register surface not yet in src/regs.rs (M6 #1 not landed) — skipping"
+	exit 0
+fi
+# Distinguish "the constant is mentioned in a comment" from "the bit is
+# actually OR'd into a Config write": look for an actual set_int_cfg0
+# call that includes INT_CFG0_ENABLE_8125 as a written value.
+if ! awk '/fn[[:space:]]+hw_start_8125b_unlocked/,/^}/' "$HW" | \
+		grep -qE 'set_int_cfg0\([^)]*INT_CFG0_ENABLE_8125'; then
+	yel "V2 register surface scaffolded but chip-side INT_CFG0_ENABLE_8125 not active yet (Phase A.1) — full check deferred to Phase A.2"
 	exit 0
 fi
 

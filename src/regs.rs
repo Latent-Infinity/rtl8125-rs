@@ -68,10 +68,64 @@ pub(crate) const INTR_LINK_CHG: u32 = 0x0020;
 pub(crate) const INTR_M4_BASELINE: u32 =
     INTR_ROK | INTR_RER | INTR_TOK | INTR_TER | INTR_LINK_CHG;
 
-// ── INT_CFG — 8125 interrupt config (disable coalescing baseline) ────────
-/// `INT_CFG0` (8-bit at 0x34) — write 0x00 to disable interrupt-config
-/// modes baseline; we don't use ENABLE_8125 or CLKREQEN at M4.
+// ── ISR_V2 / IMR_V2 — per-message-id interrupt layout (M6 #1 scaffolding) ─
+//
+// Activated when `INT_CFG0_ENABLE_8125` is set (Phase A.2, paired with
+// MSI-X vector allocation — V2 layout requires MSI-X delivery on this
+// chip, see hw.rs comment). Bit N corresponds to MSI-X message_id N.
+// We use a small subset: ROK_Q0 (bit 0), TOK_Q0 (bit 16), LINKCHG
+// (bit 21 — vendor default `HwCurrIsrVer`). Multi-queue is N/A on
+// 8125B (docs/M6_MULTIQ_NA.md).
+//
+// `#[allow(dead_code)]` until Phase A.2 wires these — keeping them
+// in tree avoids one big bang of additions when the V2 + MSI-X
+// activation lands.
+//
+// Vendor: `IMR_V2_CLEAR_REG_8125 = 0x0D00`, `ISR_V2_8125 = 0x0D04`,
+// `IMR_V2_SET_REG_8125 = 0x0D0C` (r8125.h:1496-1498).
+/// Write `BIT(message_id)` to mask that source. Idempotent.
+#[allow(dead_code)]
+pub(crate) const IMR_V2_CLEAR: usize = 0x0D00;
+/// Read for currently-set status bits; write `BIT(N)` to ack message N.
+#[allow(dead_code)]
+pub(crate) const ISR_V2: usize = 0x0D04;
+/// Write `BIT(message_id)` to unmask that source. Idempotent.
+#[allow(dead_code)]
+pub(crate) const IMR_V2_SET: usize = 0x0D0C;
+
+/// RX queue 0 done — `ISRIMR_V2_ROK_Q0 = BIT(0)` (vendor `r8125.h:1832`).
+#[allow(dead_code)]
+pub(crate) const ISRIMR_V2_ROK_Q0: u32 = 1 << 0;
+/// TX queue 0 done — `messageId == 0x10` for `HwSuppIsrVer == 2` in
+/// vendor's `rtl8125_vec_2_tx_q_num` mapping.
+#[allow(dead_code)]
+pub(crate) const ISRIMR_V2_TOK_Q0: u32 = 1 << 16;
+/// Link change — vendor `rtl8125_get_linkchg_message_id()` returns 21
+/// for the default `HwCurrIsrVer` (our chip's case).
+#[allow(dead_code)]
+pub(crate) const ISRIMR_V2_LINKCHG: u32 = 1 << 21;
+
+/// V2 sources we want at baseline. Mirrors `INTR_M4_BASELINE` for the
+/// legacy layout: RX OK on queue 0, TX OK on queue 0, link change.
+/// RX error / TX error don't have explicit V2 messages on 8125B; the
+/// chip surfaces them as TOK_Q0 / ROK_Q0 with status flags in the
+/// descriptor, which the NAPI reaper inspects per-packet.
+#[allow(dead_code)]
+pub(crate) const INTR_V2_M4_BASELINE: u32 =
+    ISRIMR_V2_ROK_Q0 | ISRIMR_V2_TOK_Q0 | ISRIMR_V2_LINKCHG;
+
+// ── INT_CFG — 8125 interrupt config ──────────────────────────────────────
+/// `INT_CFG0` (8-bit at 0x34). At M4 we write 0 (legacy-ISR mode).
+/// M6 sub-feature #1 sets `INT_CFG0_ENABLE_8125` to activate the
+/// per-message-id ISR_V2 register layout (`IMR_V2_*` / `ISR_V2` at
+/// 0x0D0C / 0x0D04). See docs/M6_MSIX_DESIGN.md.
 pub(crate) const INT_CFG0: usize = 0x34;
+/// `INT_CFG0` bit 3 — enables the V2 ISR/IMR register layout. Vendor:
+/// `rtl8125_hw_set_isr_ver()` toggles this based on `HwSuppIsrVer >= 2`.
+/// When clear, legacy IMR/ISR at 0x38/0x3C are authoritative.
+/// Scaffolding for Phase A.2 (V2 + MSI-X land together).
+#[allow(dead_code)]
+pub(crate) const INT_CFG0_ENABLE_8125: u8 = 0x08;
 /// `INT_CFG1` (16-bit at 0x7A) — write 0x0000 to disable interrupt
 /// coalescing on MAC_VER_63 (RTL8125B) per r8169.
 pub(crate) const INT_CFG1: usize = 0x7A;

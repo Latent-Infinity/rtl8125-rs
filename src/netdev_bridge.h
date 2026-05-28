@@ -49,18 +49,32 @@ struct napi_struct;
  * ────────────────────────────────────────────────────────────────────── */
 struct r8125_bridge_ops {
 	/*
-	 * open(priv)
+	 * open(priv) — full device bring-up
 	 * ─────────
-	 * Pre   : netdev is registered, RTNL held, device hardware is in the
-	 *         post-reset / post-probe state from M2.
-	 * Post  : on success, hardware is brought up to the limit of what
-	 *         M4-without-peer allows — at minimum, queues stopped, no
-	 *         RX programmed, no IRQ requested. Once the peer arrives,
-	 *         this is where TX/RX enable + IRQ request + NAPI enable
-	 *         live.
-	 * Return: 0 on success; negative errno on failure (the netdev stays
-	 *         in the down state and the kernel will not call any other
-	 *         ndo until open succeeds).
+	 * Pre   : netdev is registered, RTNL held, device hardware is in
+	 *         the post-reset / post-probe state from probe-time M2.
+	 * Post  : on success, the device is fully ready to move packets:
+	 *           - hw_start_8125b run (MAC init, INT_CFG, TXCFG,
+	 *             RXCFG_M4_BASELINE, RSS disable, OCP tuning,
+	 *             L1-exit triggers).
+	 *           - All RX descriptor slots posted with OWN bit set.
+	 *           - IRQ requested through the Rust unsafe-boundary
+	 *             wrapper around request_threaded_irq.
+	 *           - NAPI enabled (handled by bridge_ndo_open before
+	 *             this callback runs).
+	 *           - PHY attached, soft-reset done, link state machine
+	 *             started (carrier-on follows asynchronously when
+	 *             auto-neg completes).
+	 *           - TX queue ready to accept skbs from xmit (subject
+	 *             to the §6.3 NETDEV_TX_BUSY ring-full guard).
+	 *         The kernel may start calling xmit / poll / change_mtu
+	 *         immediately after open returns 0.
+	 * Return: 0 on success; negative errno on failure. On failure the
+	 *         driver MUST roll back any state acquired (free IRQ,
+	 *         undo PHY connect, free DMA mappings) so a subsequent
+	 *         open() retry sees the same pre-state. The netdev stays
+	 *         in the down state and the kernel will not call any
+	 *         other ndo until open succeeds.
 	 */
 	int (*open)(void *priv);
 

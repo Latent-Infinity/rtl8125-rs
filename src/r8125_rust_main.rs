@@ -1,44 +1,63 @@
 // SPDX-License-Identifier: GPL-2.0
-//! r8125_rust — Rust driver for the Realtek RTL8125 (milestones M1 + M2).
+//! r8125_rust — Rust driver for the Realtek RTL8125 family.
 //!
-//! Per [`docs/RTL8125_Rust_Driver_Implementation_Plan.md`]:
-//!
-//! - **M1** (§7 M1, done 2026-05-23): the PCI skeleton — registers a driver
-//!   for VID `0x10EC` / DID `0x8125`, maps BAR2, logs vendor/device/revision.
-//! - **M2** (§7 M2, in progress): adds register/reset layer — XID-based
-//!   chip identification with a per-revision dispatch table, a r8169-style
-//!   reset sequence with deliberate failure-injection support, and ASPM
-//!   capability read + log. Still no `net_device` registration; that is M4.
+//! Single composite kernel module for VID `0x10EC` / DID `0x8125`.
+//! Validated chip: RTL8125B (XID 0x641 / `RTL_GIGA_MAC_VER_63`). Other
+//! XIDs return `-ENODEV` from probe (no silent fallback to a generic
+//! handler).
 //!
 //! ## Architecture (plan §6.1)
 //!
-//! - [`pci`] — the [`pci::Driver`](kernel::pci::Driver) implementation, the
-//!   device-id table, and probe / unbind orchestration.
+//! Rust-side modules (this crate):
+//!
+//! - [`pci`] — [`pci::Driver`](kernel::pci::Driver) impl, device-id
+//!   table, probe / unbind orchestration.
 //! - [`regs`] — curated register offsets and bitfield constants.
-//! - [`mmio`] — typed [`Regs`](mmio::Regs) wrapper around `pci::Bar`. The
-//!   only module outside `unsafe_boundary` that touches MMIO (plan §6.2).
-//! - [`hw`] — per-revision identification (XID → `ChipInfo`) and the reset
-//!   sequence (mirrors r8169 `rtl_hw_reset`).
-//! - [`pm`] — ASPM capability read + log; future home for suspend/resume.
-//! - [`unsafe_boundary`] — the single permitted home for `unsafe`. Still
-//!   empty as of M2: every M2 hot-path uses safe kernel-Rust wrappers
-//!   (`pci::Bar::{read*, write*}`, `kernel::time::delay::udelay`,
-//!   `pci::Device::config_space`).
+//! - [`mmio`] — typed [`Regs`](mmio::Regs) wrapper around `pci::Bar`.
+//!   The only module outside `unsafe_boundary` that touches MMIO
+//!   (plan §6.2).
+//! - [`hw`] — per-revision XID → `ChipInfo` dispatch, the r8169-port
+//!   `hw_start_8125b` chip-init sequence, and the reset path.
+//! - [`netdev`] — `NetdevState`, `ndo_open`/`stop`/`start_xmit`, and
+//!   the raw IRQ handler. The TX hot path lives here.
+//! - [`napi`] — NAPI poll: RX delivery (build skb + `napi_gro_receive`),
+//!   TX completion reaping, queue stop/wake hysteresis
+//!   (`RUST_STANDARDS.md §15.2`).
+//! - [`ring`] — descriptor layout + ring index newtypes.
+//! - [`skb`] — type-state `TxSkb<S>` mirroring the plan §6.3 lifecycle.
+//! - [`dma`], [`phy`], [`pm`] — DMA pool, PHY OCP / C45 MDIO helpers,
+//!   ASPM capability accessor.
+//! - [`unsafe_boundary`] — the single permitted home for `unsafe`.
+//!   Holds every `extern "C"` declaration, every `unsafe impl`, and
+//!   every `// SAFETY:` block. CI (`ci/check_unsafe_allowlist.sh`)
+//!   refuses `#![allow(unsafe_code)]` in any other file.
 //!
-//! ## Lint discipline
+//! C-side cshim (`src/netdev_bridge*.c`): covers the `net_device` +
+//! NAPI + `sk_buff` + `mii_bus` + `ethtool_ops` surface that
+//! kernel-Rust has not yet abstracted (plan §5.2; see `docs/M7_PREP.md`
+//! for the upstream gap inventory). Contract:
+//! `src/netdev_bridge.h::r8125_bridge_ops`.
 //!
-//! Crate root carries `#![deny(unsafe_code)]` per plan §6.2.
+//! ## Discipline
 //!
-//! ## Filename note
+//! - Crate root carries `#![deny(unsafe_code)]` (plan §6.2).
+//! - Module parameters: `inject_reset_timeout` (probe failure-injection
+//!   test gate); `force_aspm` (M5 ASPM-on soak test — DO NOT set in
+//!   production: leaving ASPM enabled regresses TSO, see
+//!   `docs/RTL8125B_TSO_NOTES.md`).
 //!
-//! For a single-language Rust OOT module the crate root `.rs` must match the
-//! `obj-m` target name (`$(obj)/%.o: $(obj)/%.rs` rule). For a **composite**
-//! module that combines Rust + C objects, naming the Rust component the
-//! same as the composite triggers a kbuild circular-dep warning and silently
-//! drops the Rust `.o` from the final link. So the crate root is
-//! `r8125_rust_main.rs` and the composite is `r8125_rust.ko` — same pattern
-//! `samples/rust/rust_print` uses (`rust_print_main.rs` + `rust_print_events.c`
-//! → `rust_print.ko`).
+//! ## Filename note (kbuild requirement)
+//!
+//! For a composite Rust + C kbuild module, the Rust crate root cannot
+//! share its name with the composite `.ko` — kbuild's circular-dep
+//! check silently drops the Rust object from the link. The crate root
+//! is `r8125_rust_main.rs`; the composite is `r8125_rust.ko`. Same
+//! pattern as `samples/rust/rust_print` (`rust_print_main.rs` +
+//! `rust_print_events.c` → `rust_print.ko`).
+//!
+//! Milestone history, design rationale, and bisection logs live in
+//! `docs/` — see `docs/RTL8125_Rust_Driver_Implementation_Plan.md`,
+//! `docs/M5_CLOSEOUT.md`, `docs/RTL8125B_TSO_NOTES.md`.
 #![deny(unsafe_code)]
 #![allow(clippy::unnecessary_safety_comment)]
 
@@ -86,6 +105,15 @@ kernel::module_pci_driver! {
         force_aspm: u8 {
             default: 0,
             description: "Leave ASPM enabled (test-only, breaks TSO)",
+        },
+        // M6 sub-feature #1 rollback knob. Phase A.1 keeps legacy
+        // INTx active regardless of this value because the V2 register
+        // layout only works once MSI-X/MSI vector allocation is wired.
+        // When Phase B enables V2, non-zero will force the legacy
+        // IMR/ISR path as a regression fallback.
+        intx_only: u8 {
+            default: 0,
+            description: "Force legacy INTx ISR/IMR register layout (test rollback)",
         },
     },
 }

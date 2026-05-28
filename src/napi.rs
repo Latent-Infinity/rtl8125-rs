@@ -38,13 +38,27 @@ use crate::ring::{Descriptor, RING_LEN};
 #[allow(clippy::unsafe_removed_from_name)]
 use crate::unsafe_boundary as ub;
 
+/// Re-arm the chip's interrupt sources to `INTR_M4_BASELINE`.
+/// Centralized here so the three call sites (ndo_open initial
+/// unmask, the IRQ handler, and napi_complete_done) read the same
+/// surface choice. M6 #1 Phase A.2 will branch this on the V2 vs
+/// legacy register layout based on whether MSI-X allocation
+/// succeeded; until then we always use legacy.
+pub(crate) fn rearm_irq_baseline(state: &NetdevState) {
+    state.regs().set_imr(regs::INTR_M4_BASELINE);
+}
+
 /// Wake the TX queue only when at least this many descriptors are free.
-/// Pairs with `TX_STOP_THRS` in `netdev.rs::ndo_start_xmit` to provide
-/// hysteresis: stop when free slots drop below STOP_THRS, wake only
-/// when they climb back past START_THRS. Without hysteresis the queue
-/// oscillates between stopped and woken on every reaped descriptor,
-/// wasting kernel queue-state churn. 2× the stop threshold matches
-/// r8169's `R8169_TX_START_THRS = 2 * R8169_TX_STOP_THRS` discipline.
+/// **Must pair** with [`netdev::TX_STOP_THRS`](crate::netdev) (= 32) —
+/// stop when free slots drop below STOP_THRS, wake only when they
+/// climb back past START_THRS. Without hysteresis the queue oscillates
+/// between stopped and woken on every reaped descriptor. 2× the stop
+/// threshold matches r8169's `R8169_TX_START_THRS = 2 *
+/// R8169_TX_STOP_THRS` discipline. When changing this, also revisit
+/// `netdev::TX_STOP_THRS` — they're a paired tuning surface.
+///
+/// Related policy knobs in the cshim (`src/netdev_bridge.c`):
+/// `BRIDGE_NAPI_WEIGHT`, `netif_set_tso_max_segs`, `netif_set_tso_max_size`.
 pub(crate) const TX_START_THRS: usize = 64;
 
 /// Called from the cshim's `bridge_napi_poll` (which is the kernel's NAPI
@@ -197,17 +211,12 @@ pub(crate) fn poll(state: &NetdevState, budget: c_int) -> c_int {
 
     let work_done = work_done as c_int;
     if work_done < budget {
-        // `work_done < budget` covers two cases:
-        //   - We did real work but cleared the ring (work_done in
-        //     [0, budget)) — tell NAPI we're done so it re-enables IRQs.
-        //   - `budget == 0` (TX-cleanup-only path): we never bumped
-        //     work_done, so 0 < 0 is FALSE and we skip this whole branch
-        //     per the §7 M5 contract. The condition correctly guards
-        //     against the bug class "called napi_complete_done with
-        //     budget=0" which races with concurrent IRQs.
+        // See module docstring for the §7 M5 contract: `budget == 0`
+        // falls through this branch (0 < 0 is false) so we don't
+        // call complete_done in the TX-cleanup-only path.
         let ndev = state.ndev.load(Ordering::Acquire);
         ub::bridge_napi_complete_done(ndev, work_done);
-        state.regs().set_imr(regs::INTR_M4_BASELINE);
+        rearm_irq_baseline(state);
     }
     // If `work_done == budget`, return without complete_done so the
     // kernel re-polls us — IRQs stay masked across the re-poll.

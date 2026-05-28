@@ -114,7 +114,39 @@ For 8125B specifically:
   TX queue 0 when `HwSuppIsrVer == 2`. So:
   - **message_id 16** = TX queue 0 done
 
-## Proposed implementation path
+## Implementation status (2026-05-28)
+
+**Phase A.1 — V2 register surface scaffolded (LANDED).** Added in
+`src/regs.rs` (ISR_V2 / IMR_V2 register offsets + INT_CFG0_ENABLE_8125
++ ISRIMR_V2_* bits + INTR_V2_M4_BASELINE), `src/mmio.rs` (set/clear
+v2 mask + isr_v2 + ack_isr_v2 wrappers), `src/r8125_rust_main.rs`
+(`intx_only` module param) and `src/napi.rs` (centralized
+`rearm_irq_baseline` helper). `ndo_stop` masks BOTH surfaces
+idempotently. The V2 surface compiles, is gated `#[allow(dead_code)]`
+until Phase A.2, and the legacy IRQ path is unchanged. Controller-KVM
+regression: 2.32 Gbps, 0 retransmits, ping 0.4 ms — baseline
+preserved exactly.
+
+**Phase A.2 — chip-side V2 enable + MSI-X allocation (PENDING).**
+Empirical finding 2026-05-28 (Controller-KVM): setting
+`INT_CFG0_ENABLE_8125` in `hw_start_8125b` while still using legacy
+INTx allocation **silently breaks IRQ delivery**. The chip stops
+asserting INTx once V2 mode is active; vendor source confirms
+(`r8125_n.c::rtl8125_alloc_irq`) that the MSI-X handler
+`rtl8125_interrupt_msix` and `HwCurrIsrVer > 1` are paired — the
+chip only signals via MSI messages in V2 mode. Therefore Phase A.2
+must land **MSI-X allocation + chip-side V2 enable in one atomic
+patch** with the `intx_only` param as the fallback. They cannot
+be split further.
+
+Phase A.2 work list:
+- Add `pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSIX | PCI_IRQ_MSI | PCI_IRQ_INTX)` wrapper in `unsafe_boundary.rs`
+- Replace the current `request_irq(state.irq_num, ...)` call with the new vector-aware path
+- On allocation success with MSI-X or MSI: enable INT_CFG0_ENABLE_8125 in hw_start_8125b, switch raw_irq_handler + rearm_irq_baseline to V2 surface
+- On fallback to INTx OR with `intx_only=1`: keep legacy register surface (current behavior)
+- The CI engagement check `set_int_cfg0(...INT_CFG0_ENABLE_8125)` (already in tree) auto-engages the full check_msix_static.sh + check_isr_v2_paired.sh suites once Phase A.2 lands
+
+## Proposed implementation path (Phase A.2 onward)
 
 **Phase A — switch interrupt mode without changing queue count.**
 

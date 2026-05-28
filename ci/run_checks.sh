@@ -32,6 +32,9 @@ echo
 echo "== M5 NAPI contract (poll budget, IRQ masking, queue hysteresis) =="
 bash "$CI/check_napi_contract.sh" || rc=1
 echo
+echo "== clean implementation-contract docs =="
+bash "$CI/check_clean_contract_docs.sh" || rc=1
+echo
 echo "== M6 design gates (skip vacuously until impl lands) =="
 bash "$CI/check_msix_static.sh" || rc=1
 bash "$CI/check_isr_v2_paired.sh" || rc=1

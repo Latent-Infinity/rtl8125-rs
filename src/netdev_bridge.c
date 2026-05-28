@@ -39,8 +39,8 @@ static int bridge_ndo_open(struct net_device *ndev)
 		napi_disable(&b->napi);
 		return rc;
 	}
-	/* M4-without-peer leaves the queue stopped and the carrier off;
-	 * the Rust open() decides when to wake / mark-carrier-on. */
+	/* Rust open() performs the hardware bring-up and decides when the
+	 * TX queue is ready. Carrier follows the PHY link-state callback. */
 	return 0;
 }
 
@@ -116,45 +116,17 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	ndev->min_mtu = ETH_MIN_MTU;
 	ndev->max_mtu = ETH_DATA_LEN;
 
-	/* M4-perf: HW offload feature advertisement.
-	 *  - NETIF_F_IP_CSUM / IPV6_CSUM: chip computes IP/TCP/UDP checksum
-	 *    (task #48; opts2 bits set by r8125_bridge_skb_tx_csum_opts).
-	 *  - NETIF_F_RXCSUM: chip validates incoming checksums (task #48;
-	 *    r8125_bridge_skb_rx_csum_set sets skb->ip_summed when valid).
-	 *  - NETIF_F_SG: kernel may hand us multi-fragment skbs that we
-	 *    post as N descriptors per logical packet (task #49). Required
-	 *    for TSO.
-	 *  - NETIF_F_TSO / NETIF_F_TSO6: chip performs TCP segmentation —
-	 *    we receive a single up-to-64K skb and the chip emits MSS-sized
-	 *    frames on the wire (task #49). Bits set by
-	 *    r8125_bridge_skb_tso_setup.
+	/* HW offload feature advertisement. opts bits + skb-side setup
+	 * are in netdev_bridge_offload.c (csum + TSO encoders), and the
+	 * driver advertises the matching kernel-side capability flags
+	 * here so the stack actually exercises the offload paths.
 	 *
-	 * Without these features the kernel software-segments and software-
-	 * checksums everything, which caps single-stream throughput at
-	 * ~1 Gbps in the KASAN-debug guest (per-packet overhead bound).
-	 * With SG+TSO the chip handles ~64K logical sends in one batch.
-	 *
-	 * TSO chip limits — RTL8125B-specific empirical caps (see
-	 * docs/RTL8125B_TSO_NOTES.md for the full bisection log):
-	 *
-	 *   netif_set_tso_max_segs(ndev, 10)
-	 *
-	 *   The chip's LSO engine reliably segments super-skbs of up to 11
-	 *   MSS-worth of payload; at 12+ segments per super-skb it stalls
-	 *   the TX queue and drops segments wholesale (verified by bisection
-	 *   2026-05-26 across max_segs = 2..16; 11 works, 12 hangs the TX
-	 *   queue, 16 produces a ~65 Mbps glide-down with ~530 retransmits
-	 *   per 6-second iperf3 run). r8169 mainline and Realtek vendor
-	 *   both publish 64 — that limit is wrong for this chip in practice.
-	 *   We use 10 for safety margin under the measured 11-segment
-	 *   threshold; line rate (2.35 Gbps in our KVM/VFIO/KASAN-debug
-	 *   setup, matching the r8169 reference) is already saturated at
-	 *   8 segments so the cap does not bottleneck throughput.
-	 *
-	 *   netif_set_tso_max_size(ndev, 64000)
-	 *
-	 *   Matches r8169 mainline RTL_GSO_MAX_SIZE_V2 / Realtek LSO_64K;
-	 *   the segment cap above is the binding constraint, not the size. */
+	 * TSO segment cap = 10. The chip's LSO engine reliably handles up
+	 * to 11 MSS-segments per super-skb; 12+ stalls the TX queue.
+	 * r8169 mainline + Realtek vendor both publish 64; that is wrong
+	 * for this chip. Line rate (2.35 Gbps) is reached at ~8 segments
+	 * so the cap is not a throughput bottleneck. Full bisection log
+	 * + counter-evidence: docs/RTL8125B_TSO_NOTES.md. */
 	ndev->hw_features = NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
 			    NETIF_F_RXCSUM | NETIF_F_SG |
 			    NETIF_F_TSO | NETIF_F_TSO6;

@@ -28,9 +28,16 @@ MMIO="$ROOT/src/mmio.rs"
 NETDEV="$ROOT/src/netdev.rs"
 NAPI="$ROOT/src/napi.rs"
 
-# Pre-engagement check.
+# Pre-engagement check. V2 surface is scaffolding-only until chip-side
+# INT_CFG0_ENABLE_8125 is set; full pairing checks engage at Phase A.2.
 if ! grep -qE '\bset_imr_v2_mask\b' "$MMIO"; then
 	yel "set_imr_v2_mask not yet in src/mmio.rs (M6 MSI-X not landed) — skipping"
+	exit 0
+fi
+HW="$ROOT/src/hw.rs"
+if ! awk '/fn[[:space:]]+hw_start_8125b_unlocked/,/^}/' "$HW" 2>/dev/null | \
+		grep -qE 'set_int_cfg0\([^)]*INT_CFG0_ENABLE_8125'; then
+	yel "V2 surface scaffolded but chip-side activation deferred to Phase A.2 — pairing checks skipped"
 	exit 0
 fi
 
@@ -50,8 +57,9 @@ else
 	red "set_imr_v2_mask=$set_count clear_imr_v2_mask=$clr_count — clear is missing in cleanup"
 fi
 
-# 2. ndo_stop fully masks before free_irq.
-if awk '/fn ndo_stop\b/,/^}/' "$NETDEV" | \
+# 2. ndo_stop fully masks before free_irq. Note: awk's `\b` word
+# boundary is not portable; use an explicit `(` lookahead instead.
+if awk '/fn[[:space:]]+ndo_stop\(/,/^}/' "$NETDEV" | \
 		awk '/clear_imr_v2_mask\(\s*(0xFFFF_FFFF|!0u32|u32::MAX)/{c=NR}
 		     /ub::free_irq\(/{if (c && NR > c) found=1}
 		     END {exit (found ? 0 : 1)}'; then

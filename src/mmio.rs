@@ -128,10 +128,46 @@ impl<'a> Regs<'a> {
         self.bar.write32(bits, regs::ISR);
     }
 
+    // ── ISR_V2 / IMR_V2 (M6 #1 scaffolding — Phase A.2 activates) ───────
+    //
+    // `clear_imr_v2_mask` and `ack_isr_v2` are USED in `ndo_stop` to
+    // mask both surfaces at teardown (idempotent — V2 writes are
+    // no-ops while the chip is in legacy mode). The other two methods
+    // wait for Phase A.2.
+
+    /// Unmask the given message_id bits (write to IMR_V2_SET).
+    #[allow(dead_code)]
+    pub(crate) fn set_imr_v2_mask(&self, bits: u32) {
+        self.bar.write32(bits, regs::IMR_V2_SET);
+    }
+
+    /// Mask the given message_id bits (write to IMR_V2_CLEAR).
+    pub(crate) fn clear_imr_v2_mask(&self, bits: u32) {
+        self.bar.write32(bits, regs::IMR_V2_CLEAR);
+    }
+
+    /// Read which V2 message_ids have fired.
+    #[allow(dead_code)]
+    pub(crate) fn isr_v2(&self) -> u32 {
+        self.bar.read32(regs::ISR_V2)
+    }
+
+    /// Acknowledge V2 message_id bits (W1C).
+    pub(crate) fn ack_isr_v2(&self, bits: u32) {
+        self.bar.write32(bits, regs::ISR_V2);
+    }
+
     /// Kick the TX engine after posting one or more descriptors. On 8125
     /// this is a 16-bit write to TxPoll_8125 (0x90) with `NPQ = BIT(0)`.
     pub(crate) fn tx_poll(&self) {
         self.bar.write16(regs::TPPOLL_NPQ, regs::TPPOLL);
+    }
+
+    /// Read `INT_CFG0_8125` (0x34, 8-bit). Phase A.2 will use this for
+    /// the read-modify-write that sets `INT_CFG0_ENABLE_8125`.
+    #[allow(dead_code)]
+    pub(crate) fn int_cfg0(&self) -> u8 {
+        self.bar.read8(regs::INT_CFG0)
     }
 
     /// Write `INT_CFG0_8125` (0x34, 8-bit). 0x00 disables interrupt-config
