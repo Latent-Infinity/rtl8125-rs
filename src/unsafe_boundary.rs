@@ -103,6 +103,13 @@ unsafe impl AsBytes for Descriptor {}
 // fully defined for any bit pattern the device can produce.
 unsafe impl FromBytes for Descriptor {}
 
+// The task #58 stack-overflow fix uses `KBox::init` with
+// `init_array_from_fn` to populate the giant 256-slot atomic arrays in
+// `NetdevState` directly on the heap. No `Zeroable` impl is needed for
+// our atomic types because `init_array_from_fn` constructs each element
+// from a closure-returned value via the `impl<T> Init<T> for T` blanket
+// (any value is its own one-shot initializer). See `pci.rs::probe`.
+
 // ───────────────────────────────────────────────────────────────────────
 // M4 — Rust ↔ C bridge FFI declarations + safe wrappers
 //

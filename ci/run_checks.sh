@@ -35,6 +35,9 @@ echo
 echo "== clean implementation-contract docs =="
 bash "$CI/check_clean_contract_docs.sh" || rc=1
 echo
+echo "== bare-metal stack / teardown regression guard =="
+bash "$CI/check_bare_metal_stack_teardown.sh" || rc=1
+echo
 echo "== M6 design gates (skip vacuously until impl lands) =="
 bash "$CI/check_msix_static.sh" || rc=1
 bash "$CI/check_isr_v2_paired.sh" || rc=1

@@ -23,14 +23,17 @@
 //!    `ndo_open` performs full bring-up — PHY connect, MAC init,
 //!    IRQ request, NAPI enable.
 //!
-//! ## Drop order (load-bearing)
+//! ## Remove order (load-bearing)
 //!
-//! [`R8125Driver`] field declaration order matters: Rust drops fields
-//! in declaration order (top-to-bottom). `_netdev` is declared FIRST
-//! so `bridge_unregister_and_free` (which calls `ndo_stop`) runs
-//! before `_bar`'s `Devres` revokes the MMIO mapping. Inverting this
-//! drop order causes a use-after-free when `ndo_stop` accesses chip
-//! registers during teardown.
+//! [`R8125Driver::unbind`] explicitly shuts the registered netdev down before
+//! the PCI adapter releases devres-managed resources. This is required because
+//! netdev unregister runs `ndo_stop`, and that path touches chip registers via
+//! the BAR mapping owned by `_bar`.
+//!
+//! Field declaration order remains a fallback guard for probe-error paths:
+//! Rust drops fields in declaration order (top-to-bottom), so `_netdev` is
+//! declared first and its idempotent Drop runs before the Rust-owned BAR/ring
+//! fields when normal `unbind` did not run.
 //!
 //! Devres + `ARef` handle the rest. Probe-error paths run through
 //! Drop, never bypass it — that's how "failed reset is recoverable"
@@ -80,12 +83,17 @@ kernel::pci_device_table!(
 
 /// Per-device driver state.
 ///
-/// **Drop order matters.** Rust drops struct fields in **declaration order**
-/// (top → bottom), per the Reference. `_netdev` MUST be first: its Drop
-/// triggers `r8125_bridge_unregister_and_free` → kernel `ndo_stop` → Rust
-/// `rust_stop`, which reads `bar_ptr` / `tx_desc` / `rx_desc`. Those must
-/// still be live during that callback, so `_bar` + `tx_ring` + `rx_ring`
-/// have to drop AFTER `_netdev`. Then `pdev` (just a refcount) last.
+/// **Remove order matters.** Normal remove goes through
+/// [`R8125Driver::unbind`], which drains `_netdev` before the PCI adapter calls
+/// `devres_release_all` and revokes `_bar`'s MMIO mapping. That explicit
+/// shutdown is load-bearing: unregistering the netdev runs `ndo_stop` → Rust
+/// `rust_stop`, which reads `bar_ptr` / `tx_desc` / `rx_desc`.
+///
+/// Field declaration order is still intentional for probe-error paths and as a
+/// fallback if the adapter contract changes: Rust drops struct fields in
+/// **declaration order** (top → bottom), per the Reference. `_netdev` stays
+/// first so its idempotent Drop runs before `_bar` + `tx_ring` + `rx_ring`
+/// when `unbind` never ran. Then `pdev` (just a refcount) last.
 ///
 /// Historical: 2026-05-25 M4-full first cut crashed with a KASAN slab-UAF
 /// in `rust_stop+0x80` because this struct previously listed `_netdev`
@@ -93,8 +101,8 @@ kernel::pci_device_table!(
 /// reverse. See `src/netdev.rs` M4_FULL_OPS comment block.
 ///
 /// - `_netdev` — RAII for the registered net_device + boxed NetdevState.
-///   Drop fires `r8125_bridge_unregister_and_free` (kernel synchronously
-///   runs `ndo_stop`, releases IRQ, disables NAPI) then frees the KBox.
+///   `unbind` calls `shutdown` while the BAR is mapped; Drop is the
+///   idempotent fallback and always frees the KBox.
 /// - `_bar` — [`Devres`]-owned MMIO mapping; on drop calls `iounmap` +
 ///   `pci_release_region`.
 /// - `tx_ring`, `rx_ring` — M3 cold DMA descriptor rings (`RING_LEN + 1`
@@ -103,9 +111,9 @@ kernel::pci_device_table!(
 ///   the whole bound period. Drops last.
 ///
 /// No explicit `PinnedDrop` impl — that would be an `unsafe impl`, which
-/// the crate-root `#![deny(unsafe_code)]` rejects. Field-level drop does
-/// the teardown; M1/M2/M3/M4 gates have verified it under kmemleak +
-/// lockdep + KASAN.
+/// the crate-root `#![deny(unsafe_code)]` rejects. The safe `unbind` hook plus
+/// field-level Drop handle teardown; M1/M2/M3/M4 gates have verified it under
+/// kmemleak + lockdep + KASAN.
 #[pin_data]
 pub(crate) struct R8125Driver {
     /// M4 net_device — must drop FIRST. See struct-level docs.
@@ -120,6 +128,23 @@ pub(crate) struct R8125Driver {
 impl pci::Driver for R8125Driver {
     type IdInfo = IdInfo;
     const ID_TABLE: pci::IdTable<Self::IdInfo> = &PCI_TABLE;
+
+    /// Tear the registered netdev down BEFORE devres releases the BAR.
+    ///
+    /// Kernel-Rust's `pci::Adapter::remove_callback` runs `T::unbind`,
+    /// THEN `devres_release_all`, THEN drops `T::DriverData`. The BAR
+    /// mapping is owned via `Devres<pci::Bar>` and goes away at the
+    /// devres phase — so by the time the field `_netdev` would drop,
+    /// any chip-touching MMIO in its teardown path crashes on a
+    /// stale pointer. We sidestep that by doing the netdev unregister
+    /// here, while devres is still holding the BAR alive.
+    ///
+    /// `NetdevHandle::shutdown` is idempotent — the matching `Drop`
+    /// observes the drained sentinel and skips the redundant
+    /// `unregister_netdev` call.
+    fn unbind(_dev: &pci::Device<Core>, this: Pin<&Self>) {
+        this._netdev.shutdown();
+    }
 
     fn probe(pdev: &pci::Device<Core>, _info: &Self::IdInfo) -> impl PinInit<Self, Error> {
         pin_init::pin_init_scope(move || {
@@ -268,9 +293,21 @@ impl pci::Driver for R8125Driver {
                     // allocated lazily in `ndo_open` (see netdev.rs).
                     // Probe just zero-initialises the two per-slot
                     // atomic arrays; the empty sentinel is `null/0`.
-
-                    let state = KBox::new(
-                        NetdevState {
+                    //
+                    // task #58 stack-overflow fix (2026-05-29): the giant
+                    // 6 × `[Atomic*; RING_LEN]` arrays in `NetdevState`
+                    // add up to ~9.5 KiB. Building the value on the
+                    // stack via `KBox::new(NetdevState { ... })` blew the
+                    // 16 KiB kernel stack — Gateway's bare-metal probe
+                    // crashed with `BUG: TASK stack guard page was hit`
+                    // inside `pci::Adapter::probe_callback` (objdump
+                    // showed a 14 208-byte stack frame). `KBox::init`
+                    // with `try_init!` and `init_array_from_fn` writes
+                    // each field directly into the heap allocation,
+                    // dropping the probe stack frame below 4 KiB without
+                    // adding `Zeroable` impls for atomic types.
+                    let state = KBox::init(
+                        kernel::try_init!(NetdevState {
                             pdev: pdev.into(),
                             bar_ptr,
                             ndev: AtomicPtr::new(core::ptr::null_mut()),
@@ -280,12 +317,24 @@ impl pci::Driver for R8125Driver {
                             tx_dma: tx_ring.dma_handle(),
                             rx_desc: rx_ring.desc_ptr_mut(),
                             rx_dma: rx_ring.dma_handle(),
-                            rx_slot_cpu: core::array::from_fn(|_| AtomicPtr::new(core::ptr::null_mut())),
-                            rx_slot_dma: core::array::from_fn(|_| core::sync::atomic::AtomicU64::new(0)),
-                            tx_shadow: core::array::from_fn(|_| AtomicPtr::new(core::ptr::null_mut())),
-                            tx_shadow_dma: core::array::from_fn(|_| core::sync::atomic::AtomicU64::new(0)),
-                            tx_shadow_len: core::array::from_fn(|_| core::sync::atomic::AtomicU32::new(0)),
-                            tx_shadow_is_frag: core::array::from_fn(|_| core::sync::atomic::AtomicBool::new(false)),
+                            rx_slot_cpu <- pin_init::init_array_from_fn(
+                                |_| AtomicPtr::new(core::ptr::null_mut())
+                            ),
+                            rx_slot_dma <- pin_init::init_array_from_fn(
+                                |_| core::sync::atomic::AtomicU64::new(0)
+                            ),
+                            tx_shadow <- pin_init::init_array_from_fn(
+                                |_| AtomicPtr::new(core::ptr::null_mut())
+                            ),
+                            tx_shadow_dma <- pin_init::init_array_from_fn(
+                                |_| core::sync::atomic::AtomicU64::new(0)
+                            ),
+                            tx_shadow_len <- pin_init::init_array_from_fn(
+                                |_| core::sync::atomic::AtomicU32::new(0)
+                            ),
+                            tx_shadow_is_frag <- pin_init::init_array_from_fn(
+                                |_| core::sync::atomic::AtomicBool::new(false)
+                            ),
                             tx_head: crate::netdev::CachePadded::new(
                                 core::sync::atomic::AtomicUsize::new(0),
                             ),
@@ -298,7 +347,7 @@ impl pci::Driver for R8125Driver {
                             ocp_base: core::sync::atomic::AtomicU32::new(
                                 crate::regs::OCP_STD_PHY_BASE,
                             ),
-                        },
+                        }? kernel::error::Error),
                         GFP_KERNEL,
                     )?;
                     NetdevHandle::new_with_state(pdev, state, &mac)?

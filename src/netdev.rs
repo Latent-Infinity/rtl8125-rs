@@ -906,9 +906,36 @@ extern "C" fn raw_irq_handler(_irq: c_int, dev_id: *mut c_void) -> bindings::irq
 
 // ── RAII handle for the registered net_device + boxed NetdevState ────────
 
+/// Owns the registered `net_device` + the `Box<NetdevState>` cookie.
+///
+/// ## Two-phase teardown (task #58 fix, 2026-05-28)
+///
+/// The kernel-Rust PCI adapter calls `T::unbind(dev, this)` and then
+/// runs `devres_release_all(dev)` BEFORE dropping `T::DriverData`. That
+/// means by the time `R8125Driver::drop` runs, our `_bar` field's
+/// underlying ioremap mapping has ALREADY been torn down. Any chip-side
+/// MMIO from `bridge_unregister_and_free` (ndo_stop → phy_stop →
+/// genphy_suspend → MDIO read → `gphy_ocp_read` → MMIO 32-bit write
+/// on the BAR pointer) hits a stale virtual address and triggers
+/// `BUG: unable to handle page fault` on `rmmod` under traffic.
+/// Recovered from EFI pstore on Gateway 2026-05-28
+/// (CR2 = `bar_base + 0xB8`, addr was `ffffcf02421d00b8`).
+///
+/// Fix: `R8125Driver::unbind` calls [`Self::shutdown`] which runs the
+/// whole netdev unregister synchronously, BEFORE devres releases the
+/// BAR. `shutdown` is idempotent — both the explicit `unbind` call and
+/// the trailing `Drop` route through it via the atomic "drained"
+/// sentinel. After `shutdown` the `ndev` slot is null and the `Drop`
+/// implementation skips re-entry, only reclaiming the cookie KBox.
 pub(crate) struct NetdevHandle {
-    ndev: *mut bindings::net_device,
-    cookie: *mut NetdevState,
+    /// Set to null after `shutdown` (or after Drop) drains it; the
+    /// atomic-swap is the linearisation point that lets both teardown
+    /// paths run exactly once.
+    ndev: AtomicPtr<bindings::net_device>,
+    /// Same idempotency dance for the boxed NetdevState pointer. Drained
+    /// at the very end of teardown — after `bridge_unregister_and_free`
+    /// returns the cshim no longer has any reference to it.
+    cookie: AtomicPtr<NetdevState>,
 }
 
 impl NetdevHandle {
@@ -956,15 +983,39 @@ impl NetdevHandle {
             "r8125_rust netdev registered: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (M4-full)\n",
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
         );
-        Ok(Self { ndev, cookie })
+        Ok(Self {
+            ndev: AtomicPtr::new(ndev),
+            cookie: AtomicPtr::new(cookie),
+        })
+    }
+
+    /// Synchronously unregister the netdev (kernel runs ndo_stop +
+    /// phy_stop + free_irq + napi_disable inside this call) and tear
+    /// down the MDIO bus. Idempotent against a concurrent `Drop` thanks
+    /// to the `AtomicPtr::swap` linearisation: whichever path drains
+    /// `ndev` first does the work; the other observes null and skips.
+    ///
+    /// Called from `R8125Driver::unbind` so the chip-side MMIO during
+    /// teardown lands on the still-mapped BAR. Safe to call at any
+    /// time after `new_with_state`; if already drained it's a no-op.
+    pub(crate) fn shutdown(&self) {
+        let ndev = self.ndev.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if !ndev.is_null() {
+            ub::bridge_unregister_and_free(ndev);
+        }
     }
 }
 
 impl Drop for NetdevHandle {
     fn drop(&mut self) {
-        // unregister first (kernel synchronises ndo_stop + IRQ release +
-        // NAPI disable), then drop the boxed state.
-        ub::bridge_unregister_and_free(self.ndev);
-        ub::kbox_drop_from_raw(self.cookie);
+        // Normally `shutdown` was already called from `R8125Driver::unbind`
+        // and this is a no-op for `ndev`. Keep the call so probe-error
+        // paths (where `unbind` isn't invoked because probe never
+        // succeeded) still teardown correctly.
+        self.shutdown();
+        let cookie = self.cookie.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if !cookie.is_null() {
+            ub::kbox_drop_from_raw(cookie);
+        }
     }
 }
