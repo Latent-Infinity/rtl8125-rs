@@ -133,12 +133,12 @@ struct r8125_bridge_ops {
 	 * change_mtu(priv, new_mtu) — MTU sysfs / ip link mtu N
 	 * ───────────────────────
 	 * Pre   : new_mtu is the requested MTU. Driver must validate range.
- *         M4 accepts the standard Ethernet MTU only; jumbo support lands
- *         with the M5 RX-buffer/page-fragment refactor.
+	 *         Jumbo MTU up to 9000 bytes is supported by the Rust-side
+	 *         per-slot RX page pool and the bridge's MTU bounds.
 	 * Post  : on success, the net_device's `mtu` field has already been
 	 *         updated by the kernel; this callback runs AFTER. The
-	 *         driver may need to retune RX buffer sizes — that work
-	 *         arrives with the peer.
+	 *         driver refreshes feature flags so jumbo disables the
+	 *         offloads that are not safe at that MTU.
 	 */
 	int (*change_mtu)(void *priv, int new_mtu);
 };

@@ -1,6 +1,7 @@
-# `src/` — Rust core
+# `src/` — driver core
 
-**Status: M4-full packet-path development. M1/M2/M3/M4-skeleton are complete; M0b peer baseline is captured.**
+**Status: RTL8125B packet path with MSI/MSI-X fallback, jumbo RX buffers,
+offload gates, MDIO/PHY plumbing, and bounded C shim review contracts.**
 
 - **M1** (Rust PCI skeleton) passed 2026-05-23 — evidence
   [`../docs/baseline/m1_gate_proof.txt`](../docs/baseline/m1_gate_proof.txt).
@@ -11,31 +12,27 @@
 - **M0b** ✅ 2026-05-25 — physical topology and r8169 peer baselines captured
   in [`../docs/baseline/TOPOLOGY.md`](../docs/baseline/TOPOLOGY.md) and
   `../docs/baseline/iperf3/`.
-- **M4-skeleton** ✅ 2026-05-24 — `net_device` registration via the C
-  shim wired end-to-end; 1000× insmod/rmmod regression clean. Evidence
-  [`../docs/baseline/m4_skeleton_proof.txt`](../docs/baseline/m4_skeleton_proof.txt).
-  The peer-driven items (ndo_open hardware-enable, IRQ + NAPI bodies,
-  ndo_start_xmit, `ip link up/down` loop, ping/iperf3) wait for the peer.
+- **M4/M5/M6 driver path** — `net_device` registration, IRQ/NAPI, TX/RX,
+  offload gates, jumbo RX pool, and MSI/INTx rollback are implemented and
+  covered by the static gates in [`../ci/run_checks.sh`](../ci/run_checks.sh).
 
 ## Module layout (plan §6.1)
 
 | Module | Responsibility | Milestone | Status |
 |---|---|---|---|
-| `r8125_rust.rs` | crate root: `module_pci_driver!`, crate-root `#![deny(unsafe_code)]`, `inject_reset_timeout` param (the "lib.rs" role from the plan — see naming note below) | M1 / M2 | ✅ |
-| `pci.rs` | `pci::Driver` impl: probe/unbind, BAR mapping, device-id table; M2-wire to `hw`/`pm` | M1 / M2 | ✅ |
-| `regs.rs` | curated register map (offsets, bitfields) | M2 | ✅ |
-| `mmio.rs` | typed register read/write wrappers (only MMIO site outside `unsafe_boundary`) | M2 | ✅ |
-| `hw.rs` | XID-based revision detection, dispatch table, reset sequence | M2 | ✅ |
-| `pm.rs` | suspend/resume callbacks, ASPM policy, runtime PM (§3.3) | M2 (ASPM log) / M5 (suspend) | ✅ M2 log; policy deferred |
-| `dma.rs` | coherent + streaming buffer allocation; streaming-mapping plan for M4+ | M3 | ✅ M3 (cold rings); streaming at M4 |
-| `ring.rs` | TX/RX descriptor rings, typed indices, canaries | M3 | ✅ |
-| `skb.rs` | typed `sk_buff` wrappers + FFI ownership state machine (§6.3) | M4/M5 | ✅ cshim-helper disposition for M4; type-state refactor queued for M5 |
-| `napi.rs` | NAPI poll-path Rust side; calls into C shim | M4/M5 | ✅ M4 first cut |
-| `netdev.rs` | Rust netdev glue: `BridgeOps` vtable, `NetdevHandle` RAII, ndo entry stubs, M4 TX/RX open path | M4 | ✅ M4-full active |
-| `netdev_bridge.h` + `netdev_bridge*.c` | C bridge — sk_buff ownership contract from §6.3, net_device/NAPI/sk_buff plus split PHY/MDIO plumbing; primary bridge ≤400 LOC | M4 | ✅ |
-| `stats.rs` | counters, ethtool surfaces | M4+ | — |
-| `trace.rs` | tracepoint definitions (experimental/versioned until M6, §16 Q4) | M4+ | — |
-| `unsafe_boundary.rs` | the **only** module permitted `#![allow(unsafe_code)]` | M1 (empty) | ✅ — M3 residents (`set_64bit_dma_mask`, `AsBytes`/`FromBytes` for `ring::Descriptor`) plus M4 residents (cshim FFI extern block, raw pointer conversions, IRQ/DMA/skb/NAPI wrappers, `unsafe impl Send/Sync`). Census baseline: 43 |
+| `r8125_rust_main.rs` | crate root: `module_pci_driver!`, crate-root `#![deny(unsafe_code)]`, module parameters (`inject_reset_timeout`, `force_aspm`, `intx_only`, `aspm_force_off`) | core | ✅ |
+| `pci.rs` | `pci::Driver` impl: probe/unbind, BAR mapping, device-id table, DMA mask, IRQ-vector mode selection, heap-in-place `NetdevState` construction | core | ✅ |
+| `regs.rs` | curated register map, descriptor bits, IRQ masks, jumbo/offload constants | core | ✅ |
+| `mmio.rs` | typed register read/write wrappers; only MMIO site outside `unsafe_boundary` | core | ✅ |
+| `hw.rs` | XID-based revision detection, reset sequence, RTL8125B hardware init, chip-side ASPM policy, jumbo `RxMaxSize` | core | ✅ |
+| `pm.rs` | probe-time ASPM visibility and documented host-side ASPM API gap | core | ✅ |
+| `dma.rs` | DMA ownership notes; coherent rings live in `ring`, streaming RX/TX map/unmap flows live in netdev/cshim helpers | core | ✅ |
+| `ring.rs` | TX/RX descriptor rings, typed indices, canaries, compile-time layout checks | core | ✅ |
+| `skb.rs` | `DriverOwnedSkb` domain wrapper and TX/RX skb ownership verbs | core | ✅ |
+| `napi.rs` | NAPI poll path: RX delivery, TX completion reaping, queue hysteresis, IRQ re-arm | hot path | ✅ |
+| `netdev.rs` | Rust netdev glue: `BridgeOps` vtable, `NetdevHandle` RAII, ndo_open/stop/xmit, IRQ handler, TX/RX rollback guards | hot path | ✅ |
+| `netdev_bridge.h` + `netdev_bridge*.c` | bounded C shim for net_device/NAPI/sk_buff/MDIO/PHY/ethtool/RX page-pool APIs missing from kernel Rust | cshim | ✅ |
+| `unsafe_boundary.rs` | the **only** module permitted `#![allow(unsafe_code)]`; all FFI declarations, unsafe impls, and raw pointer conversions | boundary | ✅ |
 
 ## Naming note — `r8125_rust_main.rs` vs the plan's "lib.rs"
 

@@ -79,7 +79,7 @@ kernel::module_pci_driver! {
     type: pci::R8125Driver,
     name: "r8125_rust",
     authors: ["rtl8125-rs"],
-    description: "Rust driver for the Realtek RTL8125 (M4-full packet-path development)",
+    description: "Rust driver for the Realtek RTL8125",
     license: "GPL v2",
     params: {
         // Deliberate failure-injection knob for the plan §7 M2
@@ -125,9 +125,8 @@ kernel::module_pci_driver! {
         // Chip-side ASPM is already disabled by default via the
         // `force_aspm=0` Config5 clear path (see src/hw.rs
         // `hw_start_8125b_unlocked`); this param reserves the name
-        // for a future host-side `LnkCtl` disable when the kernel-Rust
-        // binding for
-        // `pci_disable_link_state` is added.
+        // for a future host-side `LnkCtl` disable when the
+        // `pci_disable_link_state` binding is added.
         aspm_force_off: u8 {
             default: 0,
             description: "Reserve operator intent for ASPM force-off (chip-side already off by default)",
