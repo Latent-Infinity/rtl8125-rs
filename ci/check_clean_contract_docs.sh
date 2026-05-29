@@ -22,7 +22,7 @@ scan_files=(
 )
 
 if grep -nE \
-	'no net_device registration|M2, in progress|Still no `?net_device`?|M4-without-peer|Default 0 \(use the V2|helper picks V2 vs legacy|IRQ requested via pci::Device::request_irq' \
+	'no net_device registration|M2, in progress|Still no `?net_device`?|M4-without-peer|Default 0 \(use the V2|helper picks V2 vs legacy|IRQ requested via pci::Device::request_irq|NetdevState::ocp_base|rx_slot_cpu|rx_slot_dma|tx_desc / tx_dma|bar_ptr`, `tx_desc`' \
 	"${scan_files[@]}" >/tmp/r8125_clean_contract_docs.$$ 2>/dev/null; then
 	cat /tmp/r8125_clean_contract_docs.$$
 	red "stale implementation-contract prose found"

@@ -5,10 +5,10 @@
 //!
 //! `NetdevState` holds everything the ndo callbacks need: a raw pointer
 //! into the mapped BAR (so `ndo_open`/`xmit`/`poll`/IRQ can issue MMIO
-//! from any context), DMA + CPU pointers for the TX/RX descriptor rings,
-//! the coherent RX buffer pool, the per-TX-slot software shadow holding
-//! posted skb pointers, and atomic head/tail indices shared between
-//! `xmit` (BH context), NAPI poll (softirq), and the IRQ handler.
+//! from any context), plus named TX/RX/IRQ/PHY sub-states. The hot-path
+//! state stays explicit: TX/RX descriptor pointers, RX streaming-DMA
+//! slots, TX software shadow, and cache-padded ring indices shared
+//! between `xmit` (BH context), NAPI poll (softirq), and the IRQ handler.
 //!
 //! `Box<NetdevState>` is heap-allocated at probe; its raw pointer is the
 //! `cookie` the cshim hands back to every callback. The handle wrapper
@@ -23,10 +23,9 @@ use core::ptr;
 use core::sync::atomic::{
     AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
-// AtomicU32 also serves the new NetdevState::ocp_base field below.
 // AtomicU64/U32 shadow the per-descriptor DMA mapping (handle/len) for SG.
-// AtomicU8 carries the (probe-time-determined) IRQ delivery mode for the
-// IRQ handler + NAPI re-arm branch (M6 #1 Phase A.2).
+// AtomicU8 carries the probe-chosen IRQ delivery mode; AtomicU32 carries the
+// PHY OCP page selector in `PhyState`.
 
 /// Cache-line padded wrapper. Per `docs/RUST_STANDARDS.md` §15.2, atomics
 /// mutated from independent contexts (here: `tx_head` from xmit, `tx_tail`
@@ -112,7 +111,7 @@ fn stop_tx_queue_with_recheck(state: &NetdevState, head: usize) {
     let ndev = state.ndev.load(Ordering::Acquire);
     ub::bridge_tx_stop_queue(ndev);
 
-    let tail_now = state.tx_tail.inner.load(Ordering::Acquire);
+    let tail_now = state.tx.tail.inner.load(Ordering::Acquire);
     let in_flight_now = head.wrapping_sub(tail_now);
     if RING_LEN - in_flight_now > crate::napi::TX_START_THRS {
         ub::bridge_tx_wake_queue(ndev);
@@ -135,7 +134,7 @@ pub(crate) const RX_BUF_LEN: usize = crate::regs::JUMBO_16K_BYTES;
 /// Per-slot streaming-DMA RX buffer view. One pair per ring descriptor:
 /// the chip's RX completion deposits bytes via DMA into `dma`; the NAPI
 /// poll reads them through `cpu`. Stored as a pair of per-slot atomics
-/// (`rx_slot_cpu` + `rx_slot_dma` on `NetdevState`) so probe → ndo_open
+/// (`RxRingState::slot_cpu` + `RxRingState::slot_dma`) so probe → ndo_open
 /// allocation, the NAPI hot path, and ndo_stop free can all access the
 /// pool through `&NetdevState` without unsafe interior mutability.
 ///
@@ -192,9 +191,180 @@ impl IrqMode {
     }
 }
 
+/// TX-ring slice of the per-device state (task #59 split, 2026-05-29).
+///
+/// Owned by `xmit` (producer) and the NAPI poll TX reaper (consumer).
+/// `desc` / `dma` are set at probe and read-only afterwards; the
+/// shadow arrays and indices are mutated atomically. See the docs on
+/// `NetdevState` for the cache-padding rationale.
+pub(crate) struct TxRingState {
+    /// DMA + CPU pointers for the TX descriptor ring (N + 1 slots; slot N
+    /// is the tail canary from M3).
+    pub(crate) desc: *mut Descriptor,
+    pub(crate) dma: u64,
+
+    /// One AtomicPtr per TX slot. For SG (multi-fragment) skbs only the
+    /// LastFrag descriptor's slot holds the skb pointer; intermediate
+    /// fragment slots store null. `xmit` stores; NAPI poll reaper consumes
+    /// via `bridge_skb_consume_tx` only when the slot's pointer is non-null.
+    pub(crate) shadow: [AtomicPtr<bindings::sk_buff>; RING_LEN],
+
+    /// Per-descriptor DMA mapping shadow — the chip clears the descriptor's
+    /// LEN field on TX completion (per r8169 vendor errata, also seen on
+    /// 8125B), and `napi_consume_skb` invalidates the skb pointer, so we
+    /// can't recover (handle, len) from either source at unmap time. SG
+    /// makes this worse because each fragment is mapped separately and
+    /// must be unmapped separately.
+    pub(crate) shadow_dma: [AtomicU64; RING_LEN],
+    pub(crate) shadow_len: [AtomicU32; RING_LEN],
+    pub(crate) shadow_is_frag: [AtomicBool; RING_LEN],
+
+    /// Producer index (advanced by `ndo_start_xmit`). Cache-padded per
+    /// RUST_STANDARDS.md §15.2 — written by xmit, read by NAPI poll.
+    pub(crate) head: CachePadded<AtomicUsize>,
+    /// Consumer index (advanced by the NAPI TX reaper). Cache-padded; read
+    /// by xmit's ring-full check.
+    pub(crate) tail: CachePadded<AtomicUsize>,
+}
+
+impl TxRingState {
+    /// Heap-in-place initializer (task #58 stack-overflow fix). Each of
+    /// the 4 × `RING_LEN` shadow arrays is constructed slot-by-slot via
+    /// `init_array_from_fn`, never materialised on the stack.
+    pub(crate) fn new(
+        desc: *mut Descriptor,
+        dma: u64,
+    ) -> impl pin_init::Init<Self, kernel::error::Error> {
+        kernel::try_init!(Self {
+            desc,
+            dma,
+            shadow <- pin_init::init_array_from_fn(
+                |_| AtomicPtr::new(core::ptr::null_mut())
+            ),
+            shadow_dma <- pin_init::init_array_from_fn(
+                |_| AtomicU64::new(0)
+            ),
+            shadow_len <- pin_init::init_array_from_fn(
+                |_| AtomicU32::new(0)
+            ),
+            shadow_is_frag <- pin_init::init_array_from_fn(
+                |_| AtomicBool::new(false)
+            ),
+            head: CachePadded::new(AtomicUsize::new(0)),
+            tail: CachePadded::new(AtomicUsize::new(0)),
+        }? kernel::error::Error)
+    }
+
+    #[inline]
+    pub(crate) fn clear_shadow_slot(&self, slot: usize) {
+        self.shadow_dma[slot].store(0, Ordering::Release);
+        self.shadow_len[slot].store(0, Ordering::Release);
+        self.shadow_is_frag[slot].store(false, Ordering::Release);
+        self.shadow[slot].store(core::ptr::null_mut(), Ordering::Release);
+    }
+}
+
+/// RX-ring slice — populated by `ndo_open` (per-slot streaming-DMA pages),
+/// drained by `ndo_stop`, hot-path read by NAPI poll.
+pub(crate) struct RxRingState {
+    pub(crate) desc: *mut Descriptor,
+    pub(crate) dma: u64,
+
+    /// Per-slot streaming-DMA RX buffers (M6 #2 jumbo refactor). Each
+    /// slot holds one `order-2` page chunk (16 KiB on x86) mapped
+    /// `FROM_DEVICE` for the lifetime of the open: `ndo_open` populates
+    /// every slot via `ub::rx_alloc_jumbo`, `ndo_stop` frees the lot
+    /// via `ub::rx_free_jumbo`. The `cpu`/`dma` pair is stored as two
+    /// per-slot atomics — both fields are written together (by
+    /// `NetdevState::set_rx_slot`) and read together (by
+    /// `NetdevState::rx_slot`); see [`RxSlot`]. `(null, 0)` is the
+    /// empty sentinel.
+    ///
+    /// We don't cache-pad these because the access pattern is "NAPI
+    /// reads one slot per RX frame, then writes the same slot's
+    /// descriptor LEN field" — same context, same cache line; no
+    /// cross-context false sharing is possible.
+    pub(crate) slot_cpu: [AtomicPtr<core::ffi::c_void>; RING_LEN],
+    pub(crate) slot_dma: [AtomicU64; RING_LEN],
+
+    /// RX consumer index (advanced by the NAPI RX path). Cache-padded so
+    /// the RX hot loop's index doesn't ping-pong with TX indices.
+    pub(crate) tail: CachePadded<AtomicUsize>,
+}
+
+impl RxRingState {
+    pub(crate) fn new(
+        desc: *mut Descriptor,
+        dma: u64,
+    ) -> impl pin_init::Init<Self, kernel::error::Error> {
+        kernel::try_init!(Self {
+            desc,
+            dma,
+            slot_cpu <- pin_init::init_array_from_fn(
+                |_| AtomicPtr::new(core::ptr::null_mut())
+            ),
+            slot_dma <- pin_init::init_array_from_fn(
+                |_| AtomicU64::new(0)
+            ),
+            tail: CachePadded::new(AtomicUsize::new(0)),
+        }? kernel::error::Error)
+    }
+}
+
+/// IRQ slice — set at probe by the kernel-Rust `pci_alloc_irq_vectors`
+/// dance + mode detection (M6 #1 Phase A.2). Read-only after probe; the
+/// atomic on `mode` is just to satisfy the `&self` access pattern.
+pub(crate) struct IrqState {
+    /// IRQ number from `pci_irq_vector(pdev, 0)`. For MSI/MSI-X this is
+    /// the kernel-assigned vector number; for legacy INTx fallback it
+    /// equals `pdev->irq`.
+    pub(crate) num: u32,
+    /// Encoded [`IrqMode`] chosen at probe. Read by `raw_irq_handler`
+    /// (selects ISR window + ack/mask sequence) and by
+    /// `napi::rearm_irq_baseline` (selects V2 vs legacy IMR write).
+    // NOT-PADDED: set-once at probe, then read-only from every other
+    // context — no concurrent writer means no false-sharing pressure.
+    pub(crate) mode: AtomicU8,
+}
+
+impl IrqState {
+    pub(crate) fn new(
+        num: u32,
+        mode: IrqMode,
+    ) -> impl pin_init::Init<Self, kernel::error::Error> {
+        kernel::try_init!(Self {
+            num,
+            mode: AtomicU8::new(mode as u8),
+        }? kernel::error::Error)
+    }
+}
+
+/// PHY slice — the OCP page selector. Mutated only from process context
+/// (MDIO bus callbacks); the atomic is just to satisfy the `&self`
+/// access pattern.
+pub(crate) struct PhyState {
+    /// Current PHY OCP page base (default `OCP_STD_PHY_BASE = 0xA400`).
+    /// MDIO writes to MII reg 0x1F switch pages; subsequent MII reads/writes
+    /// use this base.
+    // NOT-PADDED: PHY-config slow path; mutated only from process
+    // context (MDIO bus callbacks), no hot-path contention.
+    pub(crate) ocp_base: AtomicU32,
+}
+
+impl PhyState {
+    pub(crate) fn new() -> impl pin_init::Init<Self, kernel::error::Error> {
+        kernel::try_init!(Self {
+            ocp_base: AtomicU32::new(crate::regs::OCP_STD_PHY_BASE),
+        }? kernel::error::Error)
+    }
+}
+
 /// Per-bound-device state — accessed from probe, ndo callbacks, NAPI
-/// poll, and the IRQ handler. All cross-context fields are atomic; the
-/// non-atomic fields are read-only after probe.
+/// poll, and the IRQ handler. Sub-state lives in `tx` / `rx` / `irq` /
+/// `phy` to make the cross-context ownership story obvious from the
+/// type (task #59 split, 2026-05-29). The top-level fields are
+/// device-wide invariants: `pdev` holds the ARef, `bar_ptr` is the
+/// stable MMIO mapping, `ndev` is the registered net_device handle.
 pub(crate) struct NetdevState {
     /// Reference-counted device handle. Holds the device live for the
     /// full lifetime of this NetdevState (which is the bound period).
@@ -213,76 +383,14 @@ pub(crate) struct NetdevState {
     // context — no concurrent writer means no false-sharing pressure.
     pub(crate) ndev: AtomicPtr<bindings::net_device>,
 
-    /// IRQ number from `pci_irq_vector(pdev, 0)` after `pci_alloc_irq_vectors`
-    /// (M6 #1 Phase A.2). For MSI/MSI-X this is the kernel-assigned vector
-    /// number; for legacy INTx fallback it equals `pdev->irq`.
-    pub(crate) irq_num: u32,
-
-    /// Encoded [`IrqMode`] chosen at probe — see the enum doc. Read by
-    /// `raw_irq_handler` (selects ISR window + ack/mask sequence) and by
-    /// `napi::rearm_irq_baseline` (selects V2 vs legacy IMR write).
-    // NOT-PADDED: set-once at probe, then read-only from every other
-    // context — no concurrent writer means no false-sharing pressure.
-    pub(crate) irq_mode: AtomicU8,
-
-    /// DMA + CPU pointers for the TX descriptor ring (N + 1 slots; slot N
-    /// is the tail canary from M3).
-    pub(crate) tx_desc: *mut Descriptor,
-    pub(crate) tx_dma: u64,
-
-    /// Same for the RX descriptor ring.
-    pub(crate) rx_desc: *mut Descriptor,
-    pub(crate) rx_dma: u64,
-
-    /// Per-slot streaming-DMA RX buffers (M6 #2 jumbo refactor). Each
-    /// slot holds one `order-2` page chunk (16 KiB on x86) mapped
-    /// `FROM_DEVICE` for the lifetime of the open: `ndo_open` populates
-    /// every slot via `ub::rx_alloc_jumbo`, `ndo_stop` frees the lot
-    /// via `ub::rx_free_jumbo`. The `cpu`/`dma` pair is stored as two
-    /// per-slot atomics — both fields are written together (by
-    /// `set_rx_slot`) and read together (by `rx_slot`); see [`RxSlot`].
-    /// `(null, 0)` is the empty sentinel.
-    ///
-    /// We don't cache-pad these because the access pattern is "NAPI
-    /// reads one slot per RX frame, then writes the same slot's
-    /// descriptor LEN field" — same context, same cache line; no
-    /// cross-context false sharing is possible.
-    pub(crate) rx_slot_cpu: [AtomicPtr<core::ffi::c_void>; RING_LEN],
-    pub(crate) rx_slot_dma: [AtomicU64; RING_LEN],
-
-    /// One AtomicPtr per TX slot. For SG (multi-fragment) skbs only the
-    /// LastFrag descriptor's slot holds the skb pointer; intermediate
-    /// fragment slots store null. `xmit` stores; NAPI poll reaper consumes
-    /// via `bridge_skb_consume_tx` only when the slot's pointer is non-null.
-    pub(crate) tx_shadow: [AtomicPtr<bindings::sk_buff>; RING_LEN],
-
-    /// Per-descriptor DMA mapping shadow — the chip clears the descriptor's
-    /// LEN field on TX completion (per r8169 vendor errata, also seen on
-    /// 8125B), and `napi_consume_skb` invalidates the skb pointer, so we
-    /// can't recover (handle, len) from either source at unmap time. SG
-    /// makes this worse because each fragment is mapped separately and
-    /// must be unmapped separately.
-    pub(crate) tx_shadow_dma: [AtomicU64; RING_LEN],
-    pub(crate) tx_shadow_len: [AtomicU32; RING_LEN],
-    pub(crate) tx_shadow_is_frag: [AtomicBool; RING_LEN],
-
-    /// Producer index (advanced by `ndo_start_xmit`). Cache-padded per
-    /// RUST_STANDARDS.md §15.2 — written by xmit, read by NAPI poll.
-    pub(crate) tx_head: CachePadded<AtomicUsize>,
-    /// Consumer index (advanced by the NAPI TX reaper). Cache-padded; read
-    /// by xmit's ring-full check.
-    pub(crate) tx_tail: CachePadded<AtomicUsize>,
-    /// RX consumer index (advanced by the NAPI RX path). Cache-padded so
-    /// the RX hot loop's index doesn't ping-pong with TX indices.
-    pub(crate) rx_tail: CachePadded<AtomicUsize>,
-
-    /// Current PHY OCP page base (default `OCP_STD_PHY_BASE = 0xA400`).
-    /// MDIO writes to MII reg 0x1F switch pages; subsequent MII reads/writes
-    /// use this base. Single-context (process), but atomic for the &self
-    /// access pattern.
-    // NOT-PADDED: PHY-config slow path; mutated only from process
-    // context (MDIO bus callbacks), no hot-path contention.
-    pub(crate) ocp_base: AtomicU32,
+    /// TX descriptor ring + producer/consumer indices + shadow.
+    pub(crate) tx: TxRingState,
+    /// RX descriptor ring + per-slot streaming-DMA pages + consumer index.
+    pub(crate) rx: RxRingState,
+    /// IRQ number + delivery mode (set at probe, read on every fire).
+    pub(crate) irq: IrqState,
+    /// PHY OCP page selector.
+    pub(crate) phy: PhyState,
 }
 
 // Send + Sync for NetdevState — the impls live in `unsafe_boundary` so the
@@ -300,7 +408,7 @@ impl NetdevState {
     /// IRQ delivery mode chosen by probe.
     #[inline]
     pub(crate) fn irq_mode(&self) -> IrqMode {
-        IrqMode::from_u8(self.irq_mode.load(Ordering::Relaxed))
+        IrqMode::from_u8(self.irq.mode.load(Ordering::Relaxed))
     }
 
     /// Snapshot RX slot `i`'s (cpu, dma) pair. Both atomics are read
@@ -310,8 +418,8 @@ impl NetdevState {
     #[inline]
     pub(crate) fn rx_slot(&self, i: usize) -> RxSlot {
         RxSlot {
-            cpu: self.rx_slot_cpu[i].load(Ordering::Acquire),
-            dma: self.rx_slot_dma[i].load(Ordering::Acquire),
+            cpu: self.rx.slot_cpu[i].load(Ordering::Acquire),
+            dma: self.rx.slot_dma[i].load(Ordering::Acquire),
         }
     }
 
@@ -321,19 +429,19 @@ impl NetdevState {
     /// "freed" to the rmmod / failure-rollback paths.
     #[inline]
     pub(crate) fn set_rx_slot(&self, i: usize, slot: RxSlot) {
-        self.rx_slot_cpu[i].store(slot.cpu, Ordering::Release);
-        self.rx_slot_dma[i].store(slot.dma, Ordering::Release);
+        self.rx.slot_cpu[i].store(slot.cpu, Ordering::Release);
+        self.rx.slot_dma[i].store(slot.dma, Ordering::Release);
     }
 
-    /// Reset all atomic indices and clear any stale TX shadow pointers.
+    /// Reset all atomic indices and clear stale TX shadow metadata.
     /// Called at `ndo_open` so a fresh open after a previous close starts
     /// with a clean slate.
     pub(crate) fn reset_indices(&self) {
-        self.tx_head.inner.store(0, Ordering::Relaxed);
-        self.tx_tail.inner.store(0, Ordering::Relaxed);
-        self.rx_tail.inner.store(0, Ordering::Relaxed);
-        for slot in self.tx_shadow.iter() {
-            slot.store(ptr::null_mut(), Ordering::Relaxed);
+        self.tx.head.inner.store(0, Ordering::Relaxed);
+        self.tx.tail.inner.store(0, Ordering::Relaxed);
+        self.rx.tail.inner.store(0, Ordering::Relaxed);
+        for i in 0..RING_LEN {
+            self.tx.clear_shadow_slot(i);
         }
     }
 }
@@ -426,29 +534,34 @@ fn free_rx_slots(state: &NetdevState) {
     }
 }
 
-// ── ndo_open ──────────────────────────────────────────────────────────────
+// ── ndo_open phase helpers (task #60, 2026-05-29) ─────────────────────────
+//
+// The phases below split the M4-full bring-up sequence into named,
+// individually documentable steps. The top-level `ndo_open` reads as
+// a sequence of phase calls; each helper is local to this module and
+// either pure or holds the precise invariant needed (e.g. "BAR is
+// alive and the RX pool is populated before pre-posting descriptors").
+// Rollback stays inline at the call site so the unwind order — which
+// is direction-sensitive — is visible where it matters.
 
-fn ndo_open(state: &NetdevState) -> Result<()> {
-    state.reset_indices();
-    let regs = state.regs();
-
-    // Bus-mastering on. (DMA mask was set at probe.)
-    ub::pci_set_master(&state.pdev);
-
-    // Program TX / RX ring DMA bases. The +1 tail-canary slot is invisible
-    // to hardware — it never goes past index RING_LEN-1.
-    regs.set_tx_ring_base(state.tx_dma);
-    regs.set_rx_ring_base(state.rx_dma);
-    // RxMaxSize lives in `hw_start_8125b` so all chip-side init sits
-    // in one place; the register is sized for the jumbo pool (M6 #2).
+/// Map TX/RX ring DMA bases + program RxConfig / CPlusCmd. `RxMaxSize`
+/// is set inside `hw_start_8125b` so all chip-side init lives in one
+/// place; this helper only touches registers that program the rings
+/// the kernel-Rust DMA layer allocated for us.
+#[inline]
+fn program_dma_rings(state: &NetdevState, regs: &Regs<'_>) {
+    regs.set_tx_ring_base(state.tx.dma);
+    regs.set_rx_ring_base(state.rx.dma);
     regs.set_rcr(regs::RCR_M4_BASELINE);
     regs.set_cpluscmd(regs::CPLUSCMD_RX_CHKSUM);
+}
 
-    // M6 #2 — allocate one jumbo-sized streaming-DMA page chunk per RX
-    // slot. On any per-slot failure unwind every successful allocation
-    // before returning so the next `ndo_open` retry sees a fresh state.
-    // Pre-posting the descriptor only happens after the allocation
-    // succeeds so the chip can't see a half-initialised slot.
+/// Allocate one jumbo-sized streaming-DMA page chunk per RX slot (M6 #2).
+/// On any per-slot failure unwinds every successful allocation before
+/// returning so the next `ndo_open` retry sees a fresh state. Pre-posting
+/// the descriptor only happens AFTER alloc succeeds so the chip never
+/// sees a half-initialised slot.
+fn allocate_rx_pool(state: &NetdevState) -> Result<()> {
     for i in 0..RING_LEN {
         match ub::rx_alloc_jumbo(&state.pdev) {
             Ok((cpu, dma)) => state.set_rx_slot(i, RxSlot { cpu, dma }),
@@ -458,14 +571,17 @@ fn ndo_open(state: &NetdevState) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
 
-    // Pre-post every RX descriptor with its slot's DMA address + OWN bit.
-    // The last (hardware-visible) slot also gets the EOR marker so the
-    // chip wraps RxHead back to index 0. The descriptor LEN field is
-    // 14 bits (`DESC_LEN_MASK = 0x3FFF`), so the chip-encodable max is
-    // 16383 — we clamp here. The cshim's page chunk is 16384 bytes;
-    // the extra byte is invisible to hardware and exists only so the
-    // alloc lines up with `order = 2` page boundaries.
+/// Pre-post every RX descriptor with its slot's DMA address + OWN bit.
+/// The last (hardware-visible) slot also gets the EOR marker so the
+/// chip wraps RxHead back to index 0. The descriptor LEN field is
+/// 14 bits (`DESC_LEN_MASK = 0x3FFF`), so the chip-encodable max is
+/// 16383 — we clamp here. The cshim's page chunk is 16384 bytes; the
+/// extra byte is invisible to hardware and exists only so the alloc
+/// lines up with `order = 2` page boundaries.
+fn pre_post_rx_descriptors(state: &NetdevState) {
     for i in 0..RING_LEN {
         let dma = state.rx_slot(i).dma;
         let mut opts1 = regs::DESC_OWN | (RX_BUF_LEN as u32).min(regs::DESC_LEN_MASK);
@@ -473,152 +589,208 @@ fn ndo_open(state: &NetdevState) -> Result<()> {
             opts1 |= regs::DESC_EOR;
         }
         ub::desc_write(
-            state.rx_desc,
+            state.rx.desc,
             i,
-            Descriptor {
-                opts1,
-                opts2: 0,
-                addr: dma,
-            },
+            Descriptor { opts1, opts2: 0, addr: dma },
         );
     }
+}
 
-    // TX descriptors: zero them. The first xmit will populate.
+/// Zero the TX descriptor ring; first `xmit` populates each slot
+/// on-demand. EOR on the wrap slot is the only persistent bit we keep
+/// across opens (so the chip wraps back to slot 0).
+fn zero_tx_descriptors(state: &NetdevState) {
     for i in 0..RING_LEN {
         let mut opts1 = 0u32;
         if i == RING_LEN - 1 {
             opts1 |= regs::DESC_EOR;
         }
         ub::desc_write(
-            state.tx_desc,
+            state.tx.desc,
             i,
-            Descriptor {
-                opts1,
-                opts2: 0,
-                addr: 0,
-            },
+            Descriptor { opts1, opts2: 0, addr: 0 },
         );
     }
+}
 
-    // Wire the IRQ. Vector allocation already happened at probe time via
-    // `pci_alloc_irq_vectors` (devres-managed); ndo_open just registers
-    // our handler against `state.irq_num`. The flags depend on the
-    // probe-chosen `IrqMode`: INTx pins are shareable, MSI/MSI-X vectors
-    // are not. The unsafe FFI call is wrapped in `ub::request_irq` with
-    // a SAFETY block.
-    let cookie_ptr = core::ptr::from_ref(state).cast_mut().cast::<c_void>();
+/// Pointer reinterpretation: the cshim's IRQ contract gives the handler
+/// the same opaque cookie passed at registration. We pass `&NetdevState`
+/// cast to `*mut c_void`. Helper kept here so every IRQ-related call
+/// uses the identical cast pattern.
+#[inline]
+fn cookie_from_state(state: &NetdevState) -> *mut c_void {
+    core::ptr::from_ref(state).cast_mut().cast::<c_void>()
+}
+
+/// Register the IRQ handler with mode-aware flags. INTx pins may be
+/// shared (`IRQF_SHARED`); MSI/MSI-X vectors are exclusive (`0`).
+fn register_irq_handler(state: &NetdevState, cookie: *mut c_void) -> Result<()> {
     let irq_flags = match state.irq_mode() {
         IrqMode::Intx => ub::IRQF_SHARED,
         IrqMode::Msi => 0,
     };
-    if let Err(e) = ub::request_irq(state.irq_num, raw_irq_handler, cookie_ptr, irq_flags) {
+    ub::request_irq(state.irq.num, raw_irq_handler, cookie, irq_flags)
+}
+
+/// r8169 RTL8125B (MAC_VER_63) baseline: disable interrupt coalescing
+/// before enabling IRQ sources. Mirrors `rtl_hw_start_8125` in
+/// `r8169_main.c`. Zeros `INT_CFG0`, the 0xa00..0xa80 coalescing table,
+/// and `INT_CFG1`. Without this the chip may delay/suppress IRQs.
+/// Sticky `ISR` bits are W1C-acked here too so the first post-unmask
+/// edge into the IO-APIC isn't lost.
+#[inline]
+fn setup_interrupt_config(regs: &Regs<'_>) {
+    regs.set_int_cfg0(0);
+    regs.zero_coalesce_table_8125b();
+    regs.set_int_cfg1(0);
+    regs.ack_isr(0xFFFF_FFFF);
+}
+
+/// M6 #1 Phase A.2 — chip-side activation of the per-message-id
+/// ISR_V2 register layout. Only flip `INT_CFG0_ENABLE_8125` when probe
+/// actually obtained an MSI/MSI-X vector; in INTx fallback the chip
+/// must keep asserting the INTx pin (see `hw.rs` Phase A.1 comment +
+/// `docs/M6_MSIX_DESIGN.md` for the empirical reason). Must run BEFORE
+/// the matching `set_imr_v2_mask` write — `rearm_irq_baseline` then
+/// targets the V2 surface.
+#[inline]
+fn activate_v2_isr_for_msi(state: &NetdevState, regs: &Regs<'_>) {
+    if state.irq_mode() != IrqMode::Intx {
+        regs.set_int_cfg0(regs::INT_CFG0_ENABLE_8125);
+    }
+}
+
+/// Enable RX + TX in the chip-command register. Per r8169 the IMR write
+/// must come AFTER this (we do that next via `rearm_irq_baseline`).
+#[inline]
+fn enable_chip_engines(regs: &Regs<'_>) {
+    regs.set_chip_cmd(regs::CMD_RX_ENB | regs::CMD_TX_ENB);
+}
+
+/// Mask both legacy and V2 IRQ surfaces idempotently and disable the
+/// chip-command register. Shared between the `ndo_stop` teardown and
+/// the `ndo_open` post-hw_start rollback paths so the rollback discipline
+/// is mode-agnostic. The V2 writes are no-ops when V2 isn't active and
+/// vice versa.
+#[inline]
+fn quiesce_chip(regs: &Regs<'_>) {
+    regs.set_imr(0);
+    regs.clear_imr_v2_mask(0xFFFF_FFFF);
+    regs.set_chip_cmd(0);
+}
+
+/// Walk the TX shadow at `ndo_stop` and release any DMA mapping +
+/// skb the chip didn't complete before we masked it. Each slot's
+/// per-fragment `is_frag` flag picks `dma_unmap_page` vs
+/// `dma_unmap_single`; the (last-frag-only) skb pointer is freed via
+/// `skb_free_error` so the §6.3 disposition counter records a TX error.
+fn reap_inflight_tx_shadow(state: &NetdevState) {
+    for i in 0..RING_LEN {
+        let len = state.tx.shadow_len[i].swap(0, Ordering::AcqRel) as usize;
+        if len > 0 {
+            let handle = state.tx.shadow_dma[i].load(Ordering::Acquire);
+            if state.tx.shadow_is_frag[i].swap(false, Ordering::AcqRel) {
+                ub::skb_dma_unmap_frag_tx(&state.pdev, handle, len);
+            } else {
+                ub::skb_dma_unmap_tx(&state.pdev, handle, len);
+            }
+        }
+        let skb = state.tx.shadow[i].swap(ptr::null_mut(), Ordering::AcqRel);
+        if !skb.is_null() {
+            ub::skb_free_error(skb);
+        }
+    }
+}
+
+/// Read back the key post-open registers as a sanity log. Diagnostic
+/// only — the actual bring-up correctness is decided by the linked
+/// state of the chip command register + the unmasked IMR / IMR_V2.
+fn log_ndo_open_complete(state: &NetdevState, regs: &Regs<'_>) {
+    pr_info!(
+        "r8125_rust ndo_open complete: IRQ={} ChipCmd=0x{:02x} ISR=0x{:08x} IMR_rb=0x{:08x} PHYStatus=0x{:02x} tx_dma=0x{:016x} rx_dma=0x{:016x}\n",
+        state.irq.num,
+        regs.chip_cmd(),
+        regs.isr(),
+        regs.imr_readback(),
+        regs.phy_status(),
+        state.tx.dma,
+        state.rx.dma,
+    );
+}
+
+// ── ndo_open ──────────────────────────────────────────────────────────────
+
+fn ndo_open(state: &NetdevState) -> Result<()> {
+    state.reset_indices();
+    let regs = state.regs();
+
+    // Bus-mastering on. (DMA mask was set at probe.)
+    ub::pci_set_master(&state.pdev);
+
+    program_dma_rings(state, &regs);
+    allocate_rx_pool(state)?;
+    pre_post_rx_descriptors(state);
+    zero_tx_descriptors(state);
+
+    let cookie = cookie_from_state(state);
+    if let Err(e) = register_irq_handler(state, cookie) {
         free_rx_slots(state);
         return Err(e);
     }
 
     // PHY step 1 — connect + soft reset + resume. On the 8125B's
-    // integrated MAC/PHY, genphy_soft_reset writes BMCR_RESET which
-    // ALSO clears MAC-side state (ChipCmd). Running it BEFORE the MAC
-    // OCP init + ChipCmd write is critical, or our ChipCmd RX|TX bits
-    // get wiped out by the PHY reset. Matches r8169 ordering at
-    // rtl8169_up (phy_init_hw → phy_resume → rtl8169_init_phy run before
-    // rtl_reset_work → rtl_hw_start).
+    // integrated MAC/PHY, `genphy_soft_reset` writes `BMCR_RESET` which
+    // ALSO clears MAC-side state (`ChipCmd`). Running it BEFORE the MAC
+    // OCP init + `ChipCmd` write is critical, or our `ChipCmd` RX|TX
+    // bits get wiped out by the PHY reset. Matches r8169 ordering at
+    // `rtl8169_up` (`phy_init_hw → phy_resume → rtl8169_init_phy` run
+    // before `rtl_reset_work → rtl_hw_start`).
     let ndev = state.ndev.load(Ordering::Acquire);
     if let Err(e) = ub::bridge_phy_connect_and_reset(ndev) {
-        ub::free_irq(
-            state.irq_num,
-            core::ptr::from_ref(state).cast_mut().cast::<c_void>(),
-        );
+        ub::free_irq(state.irq.num, cookie);
         free_rx_slots(state);
         return Err(e);
     }
 
-    // r8169 RTL8125B (MAC_VER_63) baseline: disable interrupt coalescing
-    // before enabling IRQ sources. Mirrors `rtl_hw_start_8125` in
-    // r8169_main.c. Zeros INT_CFG0, the 0xa00..0xa80 coalescing table,
-    // and INT_CFG1. Without this the chip may delay/suppress IRQs.
-    regs.set_int_cfg0(0);
-    regs.zero_coalesce_table_8125b();
-    regs.set_int_cfg1(0);
+    setup_interrupt_config(&regs);
 
-    // ack any sticky ISR bits BEFORE unmasking — otherwise the first
-    // edge into the IO-APIC is lost.
-    regs.ack_isr(0xFFFF_FFFF);
-
-    // r8169 `rtl_hw_start_8125_common` for MAC_VER_63. The minimum init
-    // sequence (MAC OCP + MISC ungate) the chip needs before ChipCmd
-    // RX|TX enable, or the engines silently refuse to move packets. Sits
-    // in hw::hw_start_8125b so cross-referencing with the upstream
-    // source-of-truth function stays trivial.
+    // r8169 `rtl_hw_start_8125_common` for `MAC_VER_63`. The minimum
+    // init sequence (MAC OCP + MISC ungate) the chip needs before
+    // `ChipCmd RX|TX` enable, or the engines silently refuse to move
+    // packets. Lives in `hw::hw_start_8125b` so cross-referencing with
+    // the upstream source-of-truth function stays trivial.
     if let Err(e) = crate::hw::hw_start_8125b(&regs) {
         ub::bridge_phy_stop(ndev);
-        ub::free_irq(
-            state.irq_num,
-            core::ptr::from_ref(state).cast_mut().cast::<c_void>(),
-        );
+        ub::free_irq(state.irq.num, cookie);
         free_rx_slots(state);
         return Err(e);
     }
 
-    // Enable RX + TX in the chip command register FIRST. Per r8169 the
-    // IMR write must come last (after ChipCmd RX|TX enable).
-    regs.set_chip_cmd(regs::CMD_RX_ENB | regs::CMD_TX_ENB);
-
-    // M6 #1 Phase A.2 — chip-side activation of the per-message-id
-    // ISR_V2 register layout. Only flip `INT_CFG0_ENABLE_8125` when
-    // probe actually obtained an MSI/MSI-X vector; in INTx fallback the
-    // chip must keep asserting the INTx pin (see hw.rs Phase A.1
-    // comment + docs/M6_MSIX_DESIGN.md for the empirical reason). The
-    // V2 surface must be enabled BEFORE the matching `set_imr_v2_mask`
-    // write or the first unmask would target the legacy IMR while the
-    // chip is already routing through V2.
-    if state.irq_mode() != IrqMode::Intx {
-        regs.set_int_cfg0(regs::INT_CFG0_ENABLE_8125);
-    }
+    enable_chip_engines(&regs);
+    activate_v2_isr_for_msi(state, &regs);
 
     // Unmask the chosen IRQ surface LAST — mirrors r8169 `rtl_irq_enable`.
-    // `rearm_irq_baseline` picks legacy `IMR` or V2 `IMR_V2_SET` based on
-    // `state.irq_mode()`.
+    // `rearm_irq_baseline` picks legacy `IMR` or V2 `IMR_V2_SET` based
+    // on `state.irq_mode()`.
     crate::napi::rearm_irq_baseline(state);
 
     // PHY step 2 — kick the state machine LAST. Per r8169 ordering this
-    // runs after ChipCmd RX|TX enable + IMR programming. Carrier flips
-    // on automatically inside `bridge_phylink_handler` when the PHY
-    // reports link-up; the unconditional carrier_on we used at M4-
-    // skeleton is dropped.
+    // runs after `ChipCmd RX|TX` enable + `IMR` programming. Carrier
+    // flips on automatically inside `bridge_phylink_handler` when the
+    // PHY reports link-up; the unconditional `carrier_on` we used at
+    // M4-skeleton is dropped.
     if let Err(e) = ub::bridge_phy_kick_state_machine(ndev) {
-        // Roll back: mask both IRQ surfaces (idempotent — V2 write is a
-        // no-op when V2 isn't active), disable chip, free IRQ. Same
-        // discipline as ndo_stop: dual-mask so the rollback is
-        // mode-agnostic and the next open() starts from a known state.
-        regs.set_imr(0);
-        regs.clear_imr_v2_mask(0xFFFF_FFFF);
-        regs.set_chip_cmd(0);
+        // Roll back the full bring-up. `quiesce_chip` dual-masks both
+        // IRQ surfaces idempotently so a follow-up `ndo_open` retry
+        // sees a known state.
+        quiesce_chip(&regs);
         ub::bridge_phy_stop(ndev);
-        ub::free_irq(
-            state.irq_num,
-            core::ptr::from_ref(state).cast_mut().cast::<c_void>(),
-        );
+        ub::free_irq(state.irq.num, cookie);
         free_rx_slots(state);
         return Err(e);
     }
     ub::bridge_tx_wake_queue(ndev);
-
-    // Read back key registers so we can confirm the writes took effect.
-    let chipcmd = regs.chip_cmd();
-    let isr = regs.isr();
-    let imr_readback = regs.imr_readback();
-    let phy_status = regs.phy_status();
-    pr_info!(
-        "r8125_rust ndo_open complete: IRQ={} ChipCmd=0x{:02x} ISR=0x{:08x} IMR_rb=0x{:08x} PHYStatus=0x{:02x} tx_dma=0x{:016x} rx_dma=0x{:016x}\n",
-        state.irq_num,
-        chipcmd,
-        isr,
-        imr_readback,
-        phy_status,
-        state.tx_dma,
-        state.rx_dma
-    );
+    log_ndo_open_complete(state, &regs);
     Ok(())
 }
 
@@ -641,45 +813,22 @@ fn ndo_stop(state: &NetdevState) {
     ub::bridge_phy_stop(ndev);
     ub::bridge_carrier_off(ndev);
 
-    // Mask IRQs, disable RX/TX, ack any pending bits.
-    //
-    // We mask BOTH legacy and V2 surfaces so the M6 #1 Phase A.2
-    // transition (when V2 + MSI-X land together) doesn't need to
-    // edit ndo_stop. Idempotent: V2 writes are no-ops when chip is
-    // in legacy mode and vice versa.
-    regs.set_imr(0);
-    regs.clear_imr_v2_mask(0xFFFF_FFFF);
-    regs.set_chip_cmd(0);
+    // Mask both IRQ surfaces + disable RX/TX engines (idempotent — see
+    // `quiesce_chip` doc). Then W1C-ack any pending bits on BOTH ISR
+    // windows so a follow-up `ndo_open` sees a clean slate.
+    quiesce_chip(&regs);
     regs.ack_isr(0xFFFF_FFFF);
     regs.ack_isr_v2(0xFFFF_FFFF);
 
     // Release the IRQ (kernel synchronises).
-    ub::free_irq(
-        state.irq_num,
-        core::ptr::from_ref(state).cast_mut().cast::<c_void>(),
-    );
+    ub::free_irq(state.irq.num, cookie_from_state(state));
 
-    // Reap any in-flight TX mappings/skbs the hardware never completed.
-    for i in 0..RING_LEN {
-        let len = state.tx_shadow_len[i].swap(0, Ordering::AcqRel) as usize;
-        if len > 0 {
-            let handle = state.tx_shadow_dma[i].load(Ordering::Acquire);
-            if state.tx_shadow_is_frag[i].swap(false, Ordering::AcqRel) {
-                ub::skb_dma_unmap_frag_tx(&state.pdev, handle, len);
-            } else {
-                ub::skb_dma_unmap_tx(&state.pdev, handle, len);
-            }
-        }
-        let skb = state.tx_shadow[i].swap(ptr::null_mut(), Ordering::AcqRel);
-        if !skb.is_null() {
-            ub::skb_free_error(skb);
-        }
-    }
+    reap_inflight_tx_shadow(state);
 
     // Zero the descriptor rings so a subsequent open starts fresh.
     for i in 0..RING_LEN {
-        ub::desc_write(state.tx_desc, i, Descriptor::default());
-        ub::desc_write(state.rx_desc, i, Descriptor::default());
+        ub::desc_write(state.tx.desc, i, Descriptor::default());
+        ub::desc_write(state.rx.desc, i, Descriptor::default());
     }
 
     // M6 #2 — release every RX slot's page chunk + DMA mapping. The
@@ -689,94 +838,120 @@ fn ndo_stop(state: &NetdevState) {
     free_rx_slots(state);
 }
 
-// ── ndo_start_xmit ────────────────────────────────────────────────────────
+// ── ndo_start_xmit phase helpers (task #60) ───────────────────────────────
 
-fn ndo_start_xmit(state: &NetdevState, skb: *mut bindings::sk_buff) -> c_int {
-    XMIT_CALLS.fetch_add(1, Ordering::Relaxed);
-
-    // ── Offload bit computation (must run BEFORE DMA mapping) ──────────
-    // TSO is checked first; if active, opts1 gets GTSEN bits + transport
-    // offset and opts2 gets MSS. Otherwise plain CSUM bits go in opts2.
-    // The TSO setup may mutate skb (skb_cow_head + tcp_v6_gso_csum_prep
-    // for IPv6); the CSUM path may call skb_checksum_help for the short-
-    // UDP errata. Both write through the linear data, so any subsequent
-    // DMA map sees the final bytes.
-    let (tso_opts1, first_opts2) = match ub::skb_tso_setup(skb) {
-        Some((o1, o2)) => (o1, o2),
+/// TSO/CSUM offload bit computation. Returns `Some((tso_opts1, opts2))`
+/// to OR into the descriptors, or `None` if the skb must be DROPPED
+/// (chip can't honour the requested CSUM and software fallback also
+/// failed). On the `None` return the skb has already been freed via
+/// `skb_free_error`, so the caller just returns `NETDEV_TX_OK`.
+///
+/// May mutate the skb (`skb_cow_head` + `tcp_v6_gso_csum_prep` for IPv6
+/// TSO; `skb_checksum_help` for the short-UDP errata). Both write the
+/// linear data, so any subsequent DMA map sees the final bytes — which
+/// is why this phase MUST run before `map_skb_linear`.
+fn compute_offload_bits(skb: *mut bindings::sk_buff) -> Option<(u32, u32)> {
+    match ub::skb_tso_setup(skb) {
+        Some((o1, o2)) => Some((o1, o2)),
         None => {
             let csum_opts2 = ub::skb_tx_csum_opts(skb);
             if csum_opts2 == regs::TX_CSUM_OPTS_DROP {
                 ub::skb_free_error(skb);
-                return NETDEV_TX_OK;
+                None
+            } else {
+                Some((0u32, csum_opts2))
             }
-            (0u32, csum_opts2)
         }
-    };
+    }
+}
 
-    // ── Ring space reservation for the whole logical packet ─────────────
-    // n_desc = 1 head + N paged frags. We keep at least one slot empty so
-    // tx_head == tx_tail can only mean "ring empty" (not "ring full").
-    let nr_frags = ub::skb_nr_frags(skb) as usize;
-    let n_desc = 1 + nr_frags;
-    let head = state.tx_head.inner.load(Ordering::Relaxed);
-    let tail = state.tx_tail.inner.load(Ordering::Acquire);
+/// Check ring capacity for a logical packet of `n_desc` descriptors. We
+/// keep at least one slot empty so `tx_head == tx_tail` can only mean
+/// "ring empty" (not "ring full").
+///
+/// On exhaustion: bumps the §6.3 `tx_busy_exception` counter, asks the
+/// kernel to retry via `bridge_tx_stop_queue` (with the SMP-race
+/// recheck), and returns `None`. Caller returns `NETDEV_TX_BUSY`. On
+/// success returns `Some(tail)` so the caller can reuse the snapshot
+/// in the post-commit `in_flight_after` calculation.
+fn try_reserve_ring_space(
+    state: &NetdevState,
+    head: usize,
+    n_desc: usize,
+) -> Option<usize> {
+    let tail = state.tx.tail.inner.load(Ordering::Acquire);
     let in_flight = head.wrapping_sub(tail);
     if in_flight + n_desc >= RING_LEN {
-        // Hard stop — ring genuinely doesn't have room. This is the
-        // safety net; the preemptive stop further down should make
-        // this branch rare. If we hit it we report TX_BUSY so the
-        // kernel re-queues the skb without dropping it.
         let ndev = state.ndev.load(Ordering::Acquire);
         ub::tx_busy_exception(ndev);
         stop_tx_queue_with_recheck(state, head);
-        return NETDEV_TX_BUSY;
+        None
+    } else {
+        Some(tail)
     }
+}
 
-    // ── Map the linear head ────────────────────────────────────────────
-    let mut linear_handle: bindings::dma_addr_t = 0;
-    let mut linear_len: u32 = 0;
-    if ub::skb_data_dma_map(
-        &state.pdev,
-        skb,
-        &mut linear_handle,
-        &mut linear_len,
-    )
-    .is_err()
-    {
+/// DMA-map the LINEAR head of `skb`. Returns `Some((handle, len))` on
+/// success, or `None` if the mapping failed — in which case `skb` has
+/// been freed via `skb_free_error` so the caller just returns
+/// `NETDEV_TX_OK`.
+fn map_skb_linear(
+    state: &NetdevState,
+    skb: *mut bindings::sk_buff,
+) -> Option<(bindings::dma_addr_t, u32)> {
+    let mut handle: bindings::dma_addr_t = 0;
+    let mut len: u32 = 0;
+    if ub::skb_data_dma_map(&state.pdev, skb, &mut handle, &mut len).is_err() {
         ub::skb_free_error(skb);
-        return NETDEV_TX_OK;
+        None
+    } else {
+        Some((handle, len))
     }
+}
 
-    // ── Map each paged fragment + write its descriptor ──────────────────
-    // Fragments get OWN set up-front so the chip can walk them as soon as
-    // it sees OWN on slot[0] (which we write LAST below). On failure mid-
-    // way, walk back through already-mapped slots to unmap, then free.
+/// DMA-map paged fragments of `skb` starting at slot `head+1` and write
+/// each fragment's descriptor in-place with the propagated TSO/CSUM
+/// bits. The chip walks the chain after seeing `OWN|FS` on `head` (which
+/// the FirstFrag write commits LAST) so it's safe to publish fragment
+/// descriptors with `OWN` set as we go.
+///
+/// On any per-fragment failure: unmaps the linear head + every
+/// already-mapped fragment, clears their shadows, frees the skb, and
+/// returns `Err(())`. Caller returns `NETDEV_TX_OK`.
+///
+/// Per r8169 `rtl8169_tx_map` and Realtek vendor `rtl8125_xmit_frags`,
+/// BOTH opts[0] (TSO GTSEN bits) AND opts[1] (CSUM bits / MSS) get
+/// propagated to every fragment descriptor — they're not first-only.
+/// Zeroing opts2 on frags previously caused on-wire checksum corruption.
+#[allow(clippy::too_many_arguments)]
+fn map_skb_fragments(
+    state: &NetdevState,
+    skb: *mut bindings::sk_buff,
+    head: usize,
+    nr_frags: usize,
+    linear_handle: bindings::dma_addr_t,
+    linear_len: u32,
+    tso_opts1: u32,
+    first_opts2: u32,
+) -> Result<(), ()> {
     for i in 0..nr_frags {
         let mut h: bindings::dma_addr_t = 0;
         let mut l: u32 = 0;
         if ub::skb_frag_dma_map(&state.pdev, skb, i as u32, &mut h, &mut l).is_err() {
-            // Unwind: unmap linear + the (i) frags we already mapped.
+            // Unwind: unmap linear + every fragment already published.
             ub::skb_dma_unmap_tx(&state.pdev, linear_handle, linear_len as usize);
             for j in 0..i {
                 let prev_slot = (head.wrapping_add(1 + j)) % RING_LEN;
-                let pa = state.tx_shadow_dma[prev_slot].load(Ordering::Acquire);
-                let pl = state.tx_shadow_len[prev_slot].load(Ordering::Acquire);
+                let pa = state.tx.shadow_dma[prev_slot].load(Ordering::Acquire);
+                let pl = state.tx.shadow_len[prev_slot].load(Ordering::Acquire);
                 ub::skb_dma_unmap_frag_tx(&state.pdev, pa, pl as usize);
-                state.tx_shadow_len[prev_slot].store(0, Ordering::Release);
-                state.tx_shadow_is_frag[prev_slot].store(false, Ordering::Release);
-                state.tx_shadow[prev_slot].store(core::ptr::null_mut(), Ordering::Release);
+                state.tx.clear_shadow_slot(prev_slot);
             }
             ub::skb_free_error(skb);
-            return NETDEV_TX_OK;
+            return Err(());
         }
         let slot = (head.wrapping_add(1 + i)) % RING_LEN;
         let is_last_frag = i + 1 == nr_frags;
-        // Per r8169 rtl8169_tx_map AND Realtek vendor rtl8125_xmit_frags:
-        // BOTH opts[0] (TSO GTSEN bits) AND opts[1] (CSUM bits / MSS) get
-        // PROPAGATED to every fragment descriptor — they're not first-
-        // only. The chip walks the chain and aggregates the bits. We
-        // previously zeroed opts2 on frags and that produced a wrong
-        // checksum on the wire (iperf3 cookie corruption).
         let mut opts1 = regs::DESC_OWN | tso_opts1 | (l & regs::DESC_LEN_MASK);
         if is_last_frag {
             opts1 |= regs::DESC_TX_LS;
@@ -784,24 +959,62 @@ fn ndo_start_xmit(state: &NetdevState, skb: *mut bindings::sk_buff) -> c_int {
         if slot == RING_LEN - 1 {
             opts1 |= regs::DESC_EOR;
         }
-        state.tx_shadow_dma[slot].store(h, Ordering::Release);
-        state.tx_shadow_len[slot].store(l, Ordering::Release);
-        state.tx_shadow_is_frag[slot].store(true, Ordering::Release);
+        state.tx.shadow_dma[slot].store(h, Ordering::Release);
+        state.tx.shadow_len[slot].store(l, Ordering::Release);
+        state.tx.shadow_is_frag[slot].store(true, Ordering::Release);
         // skb pointer lives on the LAST descriptor only; intermediate
         // fragments stay null so the reaper only consumes the skb once.
-        state.tx_shadow[slot].store(
+        state.tx.shadow[slot].store(
             if is_last_frag { skb } else { core::ptr::null_mut() },
             Ordering::Release,
         );
         ub::desc_write(
-            state.tx_desc,
+            state.tx.desc,
             slot,
-            Descriptor {
-                opts1,
-                opts2: first_opts2, // CSUM bits / MSS propagate to all frags
-                addr: h,
-            },
+            Descriptor { opts1, opts2: first_opts2, addr: h },
         );
+    }
+    Ok(())
+}
+
+// ── ndo_start_xmit ────────────────────────────────────────────────────────
+
+fn ndo_start_xmit(state: &NetdevState, skb: *mut bindings::sk_buff) -> c_int {
+    XMIT_CALLS.fetch_add(1, Ordering::Relaxed);
+
+    // Offload bits — may mutate skb data; must precede the DMA map.
+    let (tso_opts1, first_opts2) = match compute_offload_bits(skb) {
+        Some(bits) => bits,
+        None => return NETDEV_TX_OK,
+    };
+
+    let nr_frags = ub::skb_nr_frags(skb) as usize;
+    let n_desc = 1 + nr_frags;
+    let head = state.tx.head.inner.load(Ordering::Relaxed);
+
+    let tail = match try_reserve_ring_space(state, head, n_desc) {
+        Some(t) => t,
+        None => return NETDEV_TX_BUSY,
+    };
+
+    let (linear_handle, linear_len) = match map_skb_linear(state, skb) {
+        Some(pair) => pair,
+        None => return NETDEV_TX_OK,
+    };
+
+    if map_skb_fragments(
+        state,
+        skb,
+        head,
+        nr_frags,
+        linear_handle,
+        linear_len,
+        tso_opts1,
+        first_opts2,
+    )
+    .is_err()
+    {
+        return NETDEV_TX_OK;
     }
 
     // ── Write FirstFrag descriptor LAST — this is the commit point ─────
@@ -824,17 +1037,17 @@ fn ndo_start_xmit(state: &NetdevState, skb: *mut bindings::sk_buff) -> c_int {
     }
     first_opts1 |= tso_opts1;
 
-    state.tx_shadow_dma[first_slot].store(linear_handle, Ordering::Release);
-    state.tx_shadow_len[first_slot].store(linear_len, Ordering::Release);
-    state.tx_shadow_is_frag[first_slot].store(false, Ordering::Release);
+    state.tx.shadow_dma[first_slot].store(linear_handle, Ordering::Release);
+    state.tx.shadow_len[first_slot].store(linear_len, Ordering::Release);
+    state.tx.shadow_is_frag[first_slot].store(false, Ordering::Release);
     if n_desc == 1 {
         // Single-fragment skb — LastFrag is also the FirstFrag.
-        state.tx_shadow[first_slot].store(skb, Ordering::Release);
+        state.tx.shadow[first_slot].store(skb, Ordering::Release);
     } else {
-        state.tx_shadow[first_slot].store(core::ptr::null_mut(), Ordering::Release);
+        state.tx.shadow[first_slot].store(core::ptr::null_mut(), Ordering::Release);
     }
     ub::desc_write(
-        state.tx_desc,
+        state.tx.desc,
         first_slot,
         Descriptor {
             opts1: first_opts1,
@@ -850,7 +1063,7 @@ fn ndo_start_xmit(state: &NetdevState, skb: *mut bindings::sk_buff) -> c_int {
     // free slots after THIS xmit are under TX_STOP_THRS, the next xmit
     // would likely BUSY, so we stop now and let the reaper wake us.
     let new_head = head.wrapping_add(n_desc);
-    state.tx_head.inner.store(new_head, Ordering::Release);
+    state.tx.head.inner.store(new_head, Ordering::Release);
     let in_flight_after = new_head.wrapping_sub(tail);
     let free_after = RING_LEN - in_flight_after;
     if free_after < TX_STOP_THRS {

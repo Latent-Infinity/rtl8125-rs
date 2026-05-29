@@ -60,8 +60,11 @@ fi
 
 # 2. ndo_stop fully masks before free_irq. Note: awk's `\b` word
 # boundary is not portable; use an explicit `(` lookahead instead.
+# Task #60 named-phases refactor wraps the dual-mask discipline in
+# `quiesce_chip(&regs)` — accept that helper call too.
 if awk '/fn[[:space:]]+ndo_stop\(/,/^}/' "$NETDEV" | \
 		awk '/clear_imr_v2_mask\(\s*(0xFFFF_FFFF|!0u32|u32::MAX)/{c=NR}
+		     /quiesce_chip\(/{c=NR}
 		     /ub::free_irq\(/{if (c && NR > c) found=1}
 		     END {exit (found ? 0 : 1)}'; then
 	grn "ndo_stop masks all v2 sources before free_irq"

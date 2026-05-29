@@ -48,7 +48,7 @@ use kernel::{
     sync::aref::ARef,
 };
 
-use core::sync::atomic::{AtomicPtr, AtomicU8};
+use core::sync::atomic::AtomicPtr;
 
 use crate::hw;
 use crate::mmio::{self, Regs};
@@ -87,7 +87,7 @@ kernel::pci_device_table!(
 /// [`R8125Driver::unbind`], which drains `_netdev` before the PCI adapter calls
 /// `devres_release_all` and revokes `_bar`'s MMIO mapping. That explicit
 /// shutdown is load-bearing: unregistering the netdev runs `ndo_stop` → Rust
-/// `rust_stop`, which reads `bar_ptr` / `tx_desc` / `rx_desc`.
+/// `rust_stop`, which reads `bar_ptr`, `tx.desc`, and `rx.desc`.
 ///
 /// Field declaration order is still intentional for probe-error paths and as a
 /// fallback if the adapter contract changes: Rust drops struct fields in
@@ -289,64 +289,33 @@ impl pci::Driver for R8125Driver {
                         if intx_only { ", forced by intx_only" } else { "" }
                     );
 
-                    // M6 #2 — RX pool moved to per-slot streaming DMA
-                    // allocated lazily in `ndo_open` (see netdev.rs).
-                    // Probe just zero-initialises the two per-slot
-                    // atomic arrays; the empty sentinel is `null/0`.
-                    //
-                    // task #58 stack-overflow fix (2026-05-29): the giant
-                    // 6 × `[Atomic*; RING_LEN]` arrays in `NetdevState`
-                    // add up to ~9.5 KiB. Building the value on the
-                    // stack via `KBox::new(NetdevState { ... })` blew the
-                    // 16 KiB kernel stack — Gateway's bare-metal probe
-                    // crashed with `BUG: TASK stack guard page was hit`
-                    // inside `pci::Adapter::probe_callback` (objdump
-                    // showed a 14 208-byte stack frame). `KBox::init`
-                    // with `try_init!` and `init_array_from_fn` writes
-                    // each field directly into the heap allocation,
-                    // dropping the probe stack frame below 4 KiB without
-                    // adding `Zeroable` impls for atomic types.
+                    // Heap-in-place construction (task #58 stack-overflow
+                    // fix). Each substruct (`TxRingState`, `RxRingState`,
+                    // `IrqState`, `PhyState` from task #59) carries its
+                    // own `new()` returning `impl Init<Self, Error>`,
+                    // so `KBox::init(try_init!(NetdevState { tx <- ... }))`
+                    // walks down into each child's
+                    // `init_array_from_fn` for the per-slot arrays.
+                    // Probe stack frame stays under 4 KiB — well within
+                    // the 16 KiB x86_64 kernel stack budget.
                     let state = KBox::init(
                         kernel::try_init!(NetdevState {
                             pdev: pdev.into(),
                             bar_ptr,
                             ndev: AtomicPtr::new(core::ptr::null_mut()),
-                            irq_num,
-                            irq_mode: AtomicU8::new(irq_mode as u8),
-                            tx_desc: tx_ring.desc_ptr_mut(),
-                            tx_dma: tx_ring.dma_handle(),
-                            rx_desc: rx_ring.desc_ptr_mut(),
-                            rx_dma: rx_ring.dma_handle(),
-                            rx_slot_cpu <- pin_init::init_array_from_fn(
-                                |_| AtomicPtr::new(core::ptr::null_mut())
+                            tx <- crate::netdev::TxRingState::new(
+                                tx_ring.desc_ptr_mut(),
+                                tx_ring.dma_handle(),
                             ),
-                            rx_slot_dma <- pin_init::init_array_from_fn(
-                                |_| core::sync::atomic::AtomicU64::new(0)
+                            rx <- crate::netdev::RxRingState::new(
+                                rx_ring.desc_ptr_mut(),
+                                rx_ring.dma_handle(),
                             ),
-                            tx_shadow <- pin_init::init_array_from_fn(
-                                |_| AtomicPtr::new(core::ptr::null_mut())
+                            irq <- crate::netdev::IrqState::new(
+                                irq_num,
+                                irq_mode,
                             ),
-                            tx_shadow_dma <- pin_init::init_array_from_fn(
-                                |_| core::sync::atomic::AtomicU64::new(0)
-                            ),
-                            tx_shadow_len <- pin_init::init_array_from_fn(
-                                |_| core::sync::atomic::AtomicU32::new(0)
-                            ),
-                            tx_shadow_is_frag <- pin_init::init_array_from_fn(
-                                |_| core::sync::atomic::AtomicBool::new(false)
-                            ),
-                            tx_head: crate::netdev::CachePadded::new(
-                                core::sync::atomic::AtomicUsize::new(0),
-                            ),
-                            tx_tail: crate::netdev::CachePadded::new(
-                                core::sync::atomic::AtomicUsize::new(0),
-                            ),
-                            rx_tail: crate::netdev::CachePadded::new(
-                                core::sync::atomic::AtomicUsize::new(0),
-                            ),
-                            ocp_base: core::sync::atomic::AtomicU32::new(
-                                crate::regs::OCP_STD_PHY_BASE,
-                            ),
+                            phy <- crate::netdev::PhyState::new(),
                         }? kernel::error::Error),
                         GFP_KERNEL,
                     )?;

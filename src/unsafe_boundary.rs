@@ -267,8 +267,8 @@ pub(crate) struct BridgeMdioOps {
 // by Send; no ring overrun is possible.
 unsafe impl Send for NetdevHandle {}
 
-// SAFETY: `NetdevState` holds raw pointers (`bar_ptr`, `tx_desc`,
-// `rx_desc`) into kernel-owned mappings whose lifetimes outlive
+// SAFETY: `NetdevState` holds raw pointers (`bar_ptr`, `tx.desc`,
+// `rx.desc`) into kernel-owned mappings whose lifetimes outlive
 // NetdevState (BAR is pinned via Devres in R8125Driver, descriptor
 // rings are owned by `Ring<{ RING_LEN }>` fields in R8125Driver that
 // drop after NetdevState). Cross-context fields (head/tail/shadow,
@@ -276,7 +276,7 @@ unsafe impl Send for NetdevHandle {}
 // probe. The per-slot RX page chunks are owned by `ndo_open` and
 // freed by `ndo_stop`; both run with RTNL held so there's no
 // allocator-side race. NAPI is the only context that mutates
-// rx_tail / tx_tail; xmit is the only one that mutates tx_head.
+// `rx.tail` / `tx.tail`; xmit is the only one that mutates `tx.head`.
 // Sharing across threads is therefore safe.
 unsafe impl Send for NetdevState {}
 // SAFETY: same reasoning as the `Send` impl above; all cross-context
@@ -865,7 +865,7 @@ pub(crate) fn skb_frag_dma_map(
 /// already did per-descriptor unmap in the SG-aware reaper loop.
 ///
 /// # SAFETY: `ndev` is the registered net_device (alive while
-/// NetdevHandle lives); `skb` was just removed from `tx_shadow` and is
+/// NetdevHandle lives); `skb` was just removed from the TX shadow and is
 /// driver-owned exclusively at this point.
 pub(crate) fn skb_consume_tx(
     ndev: *mut bindings::net_device,

@@ -85,11 +85,13 @@ else
 	red "poll: IRQ re-arm not colocated with napi_complete_done"
 fi
 
-# -- 4. tx_tail.store before bridge_tx_wake_queue in reaper -----------------
-# Look in the reaper section; require tx_tail.inner.store before any
-# bridge_tx_wake_queue call.
+# -- 4. tx tail store before bridge_tx_wake_queue in reaper -----------------
+# Look in the reaper section; require the tx-tail inner store before any
+# bridge_tx_wake_queue call. (Task #59 nested the tail under `tx.`; the
+# regex matches both pre-refactor `tx_tail.inner.store` and the current
+# `tx.tail.inner.store`.)
 if echo "$poll_body" | awk '
-	/tx_tail\.inner\.store/ { stored = 1 }
+	/tx[_.]tail\.inner\.store/ { stored = 1 }
 	/bridge_tx_wake_queue/ { if (!stored) print "BAD"; exit }
 ' | grep -q BAD; then
 	red "poll: tx_wake_queue called before tx_tail.store"
@@ -97,14 +99,15 @@ else
 	grn "poll: tx_tail stored before tx_wake_queue"
 fi
 
-# -- 5. tx_head.store before tx_poll() (the chip doorbell) in xmit ----------
-# Only the doorbell requires tx_head to be stored first — the descriptor
-# ring + tx_head together define the chip's view of "what's posted". The
-# ring-full safety branch may call tx_stop_queue BEFORE tx_head.store
-# because no descriptors were posted in that branch (we return BUSY).
+# -- 5. tx head store before tx_poll() (the chip doorbell) in xmit ----------
+# Only the doorbell requires the tx-head value to be stored first — the
+# descriptor ring + head together define the chip's view of "what's
+# posted". The ring-full safety branch may call tx_stop_queue BEFORE the
+# store because no descriptors were posted in that branch (we return
+# BUSY). Regex tolerates the task #59 `tx.head` nesting.
 xmit_body=$(awk '/fn ndo_start_xmit/,/^}/' "$NETDEV")
 if echo "$xmit_body" | awk '
-	/tx_head\.inner\.store/ { stored = 1 }
+	/tx[_.]head\.inner\.store/ { stored = 1 }
 	/regs\(\)\.tx_poll/ { if (!stored) print "BAD"; exit }
 ' | grep -q BAD; then
 	red "xmit: tx_poll() (chip doorbell) called before tx_head.store"

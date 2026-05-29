@@ -33,14 +33,19 @@ else
 	grn "NetdevState uses heap in-place initialization"
 fi
 
-for field in rx_slot_cpu rx_slot_dma tx_shadow tx_shadow_dma tx_shadow_len tx_shadow_is_frag; do
-	if ! grep -q "${field} <- pin_init::init_array_from_fn" "$pci"; then
+# Each large [Atomic*; RING_LEN] array must reach the heap via
+# init_array_from_fn (not core::array::from_fn, which stack-builds).
+# After the #59 split the call sites moved from pci.rs into the
+# substruct `new()` constructors in netdev.rs — accept either file.
+# RX slots renamed slot_cpu/slot_dma; TX shadows kept their suffixes.
+for field in slot_cpu slot_dma shadow shadow_dma shadow_len shadow_is_frag; do
+	if ! grep -hq "${field} <- pin_init::init_array_from_fn" "$pci" "$netdev"; then
 		red "$field is not initialized with pin_init::init_array_from_fn"
 	fi
 done
 
-if grep -q 'core::array::from_fn' "$pci"; then
-	red "pci.rs still uses core::array::from_fn; verify it cannot create large probe-stack temporaries"
+if grep -hq 'core::array::from_fn' "$pci" "$netdev"; then
+	red "still uses core::array::from_fn; verify it cannot create large probe-stack temporaries"
 else
 	grn "NetdevState array fields avoid core::array::from_fn stack temporaries"
 fi

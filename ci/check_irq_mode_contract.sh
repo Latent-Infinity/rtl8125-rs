@@ -24,14 +24,21 @@ REGS="$ROOT/src/regs.rs"
 if grep -qE 'enum[[:space:]]+IrqMode' "$NETDEV" &&
    grep -qE 'Intx[[:space:]]*=' "$NETDEV" &&
    grep -qE 'Msi[[:space:]]*=' "$NETDEV" &&
-   grep -qE 'irq_mode:[[:space:]]*AtomicU8' "$NETDEV" &&
+   # Task #59 split: AtomicU8 mode field lives on `IrqState` as `mode`
+   # (was `irq_mode` on flat `NetdevState`). Accept either.
+   grep -qE '(irq_mode|mode):[[:space:]]*AtomicU8' "$NETDEV" &&
    grep -qE 'fn[[:space:]]+irq_mode\(&self\)[[:space:]]*->[[:space:]]*IrqMode' "$NETDEV"; then
 	grn "NetdevState stores a probe-selected IrqMode"
 else
 	red "NetdevState is missing the IrqMode enum, AtomicU8 field, or accessor"
 fi
 
-if grep -qE 'AtomicU8::new\(irq_mode[[:space:]]+as[[:space:]]+u8\)' "$PCI" &&
+# Probe wires `AtomicU8::new(mode as u8)` for IrqMode storage. After #59
+# that call lives inside `IrqState::new(num, mode)` in netdev.rs rather
+# than directly in pci.rs; accept either location plus the substruct
+# construction in probe.
+if (grep -qE 'AtomicU8::new\(irq_mode[[:space:]]+as[[:space:]]+u8\)' "$PCI" \
+    || grep -qE 'AtomicU8::new\(mode[[:space:]]+as[[:space:]]+u8\)' "$NETDEV") &&
    grep -qE 'IrqType::MsiX' "$PCI" &&
    grep -qE 'IrqType::Msi' "$PCI" &&
    grep -qE 'IrqType::Intx' "$PCI" &&

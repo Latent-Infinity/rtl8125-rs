@@ -25,7 +25,7 @@ else
 fi
 
 grep -q 'dma_unmap_single(dev, handle, len, DMA_TO_DEVICE)' "$BRIDGE" \
-  && grep -q 'tx_shadow_len' "$NETDEV" \
+  && grep -qE 'tx[._]shadow_len|tx\.shadow_len' "$NETDEV" \
   && ok "TX linear DMA unmap uses shadowed map length" \
   || bad "TX DMA unmap must use the saved DMA map length, not descriptor length"
 
@@ -41,7 +41,7 @@ grep -q 'R8125_TX_CSUM_OPTS_DROP' "$OFFLOAD" \
 
 grep -q 'skb_frag_dma_map(dev, frag' "$OFFLOAD" \
   && grep -q 'dma_unmap_page(dev, handle, len, DMA_TO_DEVICE)' "$OFFLOAD" \
-  && grep -q 'tx_shadow_is_frag' "$NETDEV" \
+  && grep -qE 'tx[._]shadow_is_frag|tx\.shadow_is_frag' "$NETDEV" \
   && ok "SG fragment DMA map/unmap path preserves mapping type" \
   || bad "SG fragments mapped with skb_frag_dma_map must be unmapped with dma_unmap_page"
 

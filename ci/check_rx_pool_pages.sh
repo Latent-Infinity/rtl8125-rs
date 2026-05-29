@@ -78,14 +78,15 @@ else
 fi
 
 # 5. ndo_open rollback after the RX allocation point must also free the
-# pool. The allocation happens before request_irq / PHY connect / hw_start,
+# pool. The allocation happens before IRQ register / PHY connect / hw_start,
 # so every later fallible step needs to route through the same cleanup
-# helper as ndo_stop.
+# helper as ndo_stop. Task #60 split `request_irq` into a phase wrapper
+# `register_irq_handler` — accept either form for the IRQ-failure branch.
 if grep -qE 'fn[[:space:]]+free_rx_slots\(' "$ROOT/src/netdev.rs" &&
    awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | \
-		grep -qE 'request_irq\(.*\)[[:space:]]*\{' &&
+		grep -qE '(request_irq|register_irq_handler)\(.*\)[[:space:]]*\{' &&
    awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | \
-		awk '/request_irq\(/,/return Err\(e\);/' | grep -q 'free_rx_slots(state)' &&
+		awk '/(request_irq|register_irq_handler)\(/,/return Err\(e\);/' | grep -q 'free_rx_slots(state)' &&
    awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | \
 		awk '/bridge_phy_connect_and_reset/,/return Err\(e\);/' | grep -q 'free_rx_slots(state)' &&
    awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | \

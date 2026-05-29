@@ -32,6 +32,10 @@ grn()  { printf '\033[1;32mPASS\033[0m %s\n' "$*"; }
 # (file, struct-name) pairs to scan.
 STRUCTS=(
 	"src/netdev.rs|NetdevState"
+	"src/netdev.rs|TxRingState"
+	"src/netdev.rs|RxRingState"
+	"src/netdev.rs|IrqState"
+	"src/netdev.rs|PhyState"
 )
 
 for entry in "${STRUCTS[@]}"; do
