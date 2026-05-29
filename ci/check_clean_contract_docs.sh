@@ -16,13 +16,14 @@ grn() { printf '\033[1;32mPASS\033[0m %s\n' "$*"; }
 scan_files=(
 	"$ROOT/src/r8125_rust_main.rs"
 	"$ROOT/src/pci.rs"
+	"$ROOT/src/pm.rs"
 	"$ROOT/src/netdev.rs"
 	"$ROOT/src/netdev_bridge.h"
 	"$ROOT/src/netdev_bridge.c"
 )
 
 if grep -nE \
-	'no net_device registration|M2, in progress|Still no `?net_device`?|M4-without-peer|Default 0 \(use the V2|helper picks V2 vs legacy|IRQ requested via pci::Device::request_irq|NetdevState::ocp_base|rx_slot_cpu|rx_slot_dma|tx_desc / tx_dma|bar_ptr`, `tx_desc`' \
+	'no net_device registration|M2, in progress|Still no `?net_device`?|M4-without-peer|Default 0 \(use the V2|helper picks V2 vs legacy|IRQ requested via pci::Device::request_irq|NetdevState::ocp_base|rx_slot_cpu|rx_slot_dma|tx_desc / tx_dma|bar_ptr`, `tx_desc`|deferred to M4 cshim|Both pieces land at \*\*M4\*\*|plan §7 M2 gate' \
 	"${scan_files[@]}" >/tmp/r8125_clean_contract_docs.$$ 2>/dev/null; then
 	cat /tmp/r8125_clean_contract_docs.$$
 	red "stale implementation-contract prose found"

@@ -47,6 +47,9 @@ echo
 echo "== cshim per-file LOC caps (task #63) =="
 bash "$CI/check_cshim_loc_caps.sh" || rc=1
 echo
+echo "== Tier 3c aspm_force_off operator-knob contract =="
+bash "$CI/check_aspm_force_off_param.sh" || rc=1
+echo
 echo "== M6 design gates (skip vacuously until impl lands) =="
 bash "$CI/check_msix_static.sh" || rc=1
 bash "$CI/check_isr_v2_paired.sh" || rc=1

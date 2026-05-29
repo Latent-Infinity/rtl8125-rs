@@ -164,9 +164,9 @@ impl pci::Driver for R8125Driver {
             // SAFETY contract lives in `unsafe_boundary::set_64bit_dma_mask`.
             unsafe_boundary::set_64bit_dma_mask(pdev)?;
 
-            // Reset-timeout failure-injection knob (plan §7 M2 gate). Read
-            // once at probe entry so the value is consistent through the
-            // BAR-mapping + reset flow inside the init scope below.
+            // Reset-timeout failure-injection knob. Read once at probe entry
+            // so the value is consistent through the BAR-mapping + reset flow
+            // inside the init scope below.
             let inject_timeout =
                 *crate::module_parameters::inject_reset_timeout.value() != 0;
 
@@ -288,6 +288,24 @@ impl pci::Driver for R8125Driver {
                         irq_mode,
                         if intx_only { ", forced by intx_only" } else { "" }
                     );
+
+                    // Tier 3c: `aspm_force_off=1` operator intent.
+                    // Chip-side ASPM is already disabled by default
+                    // (`force_aspm=0` clears Config5 ASPM_en in
+                    // `hw_start_8125b_unlocked`). This param reserves
+                    // the operator-visible name and logs intent so
+                    // dmesg confirms the request reached the driver.
+                    // A future patch will add a host-side
+                    // `pci_disable_link_state` call once that binding
+                    // exists in `kernel::pci`.
+                    let aspm_force_off =
+                        *crate::module_parameters::aspm_force_off.value() != 0;
+                    if aspm_force_off {
+                        dev_info!(
+                            pdev,
+                            "RTL8125 aspm_force_off=1 acknowledged (chip-side ASPM already off by default; host-side LnkCtl disable deferred)\n"
+                        );
+                    }
 
                     // Heap-in-place construction (task #58 stack-overflow
                     // fix). Each substruct (`TxRingState`, `RxRingState`,

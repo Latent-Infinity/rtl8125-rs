@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
-//! Power-management surface — for M2, the ASPM **probe-time log line** the
-//! plan §7 M2 gate calls for, plus a recorded deferral for the full cap-list
-//! walk and `pci_disable_link_state()`-style policy enforcement.
+//! Power-management surface for the ASPM **probe-time log line**, plus a
+//! recorded deferral for full cap-list walk and
+//! `pci_disable_link_state()`-style policy enforcement.
 //!
 //! ## What works today
 //!
@@ -25,8 +25,9 @@
 //! Mirror situation on the policy side: `pci_disable_link_state()` is not
 //! yet exposed as a `kernel::pci` abstraction.
 //!
-//! Both pieces land at **M4** through the C shim (plan §5.3 / §13), or
-//! whenever the upstream `kernel::pci` API grows the necessary surface.
+//! Do not claim host-side ASPM policy enforcement until either the upstream
+//! `kernel::pci` API exposes the necessary surface or this driver adds a
+//! small audited C shim wrapper for it.
 
 use kernel::io::Io;
 use kernel::pci;
@@ -38,18 +39,16 @@ const PCI_STATUS: usize = 0x06;
 /// list, which is where ASPM advertisement lives.
 const PCI_STATUS_CAP_LIST: u16 = 0x10;
 
-/// Log a single dmesg line about ASPM at probe time — satisfies the plan §7
-/// M2 gate's "ASPM policy log line present in dmesg after probe" requirement
-/// even though the actual cap-list walk is deferred (see this file's module
-/// doc for why). The log records what we *can* see (Status + CAP_LIST bit)
-/// and explicitly states that the policy step is deferred so reviewers see
-/// the gap rather than miss it.
+/// Log a single dmesg line about ASPM at probe time. The actual cap-list walk
+/// is still deferred (see this file's module doc for why). The log records
+/// what we *can* see (Status + CAP_LIST bit) and explicitly states that the
+/// policy step is deferred so reviewers see the gap rather than miss it.
 pub(crate) fn log_aspm(pdev: &pci::Device<kernel::device::Bound>) {
     let status = pdev.config_space().read16(PCI_STATUS);
     let cap_list = (status & PCI_STATUS_CAP_LIST) != 0;
     dev_info!(
         pdev,
-        "ASPM: PCI Status=0x{:04x} CAP_LIST={} — cap-list walk + policy deferred to M4 cshim (kernel::pci has no fallible config read and no ASPM API yet; see plan §13 / src/pm.rs)\n",
+        "ASPM: PCI Status=0x{:04x} CAP_LIST={} — cap-list walk + policy deferred until kernel::pci or cshim exposes ASPM control (no fallible config read and no ASPM API yet; see src/pm.rs)\n",
         status,
         u8::from(cap_list)
     );

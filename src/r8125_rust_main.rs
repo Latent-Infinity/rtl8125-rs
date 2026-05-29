@@ -42,9 +42,10 @@
 //!
 //! - Crate root carries `#![deny(unsafe_code)]` (plan §6.2).
 //! - Module parameters: `inject_reset_timeout` (probe failure-injection
-//!   test gate); `force_aspm` (M5 ASPM-on soak test — DO NOT set in
-//!   production: leaving ASPM enabled regresses TSO, see
-//!   `docs/RTL8125B_TSO_NOTES.md`).
+//!   test gate), `force_aspm` (test-only ASPM-on soak; DO NOT set in
+//!   production), `intx_only` (MSI/MSI-X rollback), and `aspm_force_off`
+//!   (operator-visible ASPM-off intent until host-side ASPM control is
+//!   exposed). See `docs/RTL8125B_TSO_NOTES.md`.
 //!
 //! ## Filename note (kbuild requirement)
 //!
@@ -117,6 +118,19 @@ kernel::module_pci_driver! {
         intx_only: u8 {
             default: 0,
             description: "Force legacy INTx ISR/IMR register layout (test rollback)",
+        },
+        // Operator escape hatch for any future ASPM regression.
+        // When non-zero, probe logs an informational dmesg line so
+        // the operator can confirm the intent reached the driver.
+        // Chip-side ASPM is already disabled by default via the
+        // `force_aspm=0` Config5 clear path (see src/hw.rs
+        // `hw_start_8125b_unlocked`); this param reserves the name
+        // for a future host-side `LnkCtl` disable when the kernel-Rust
+        // binding for
+        // `pci_disable_link_state` is added.
+        aspm_force_off: u8 {
+            default: 0,
+            description: "Reserve operator intent for ASPM force-off (chip-side already off by default)",
         },
     },
 }
