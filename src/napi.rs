@@ -112,19 +112,26 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
         if len > 0 {
             ub::rx_sync_for_cpu(&state.pdev, slot.dma, len);
             let buf_ptr = slot.cpu.cast_const();
-            let skb = ub::skb_build_rx(ndev, buf_ptr, len);
-            if !skb.is_null() {
-                // Ask the chip-side opts1 if HW verified the L4 checksum;
-                // set skb->ip_summed accordingly so the stack doesn't
-                // re-compute on every RX packet.
-                ub::skb_rx_csum_set(skb, desc.opts1);
-                let napi = ub::bridge_napi(ndev);
-                ub::skb_deliver_rx(napi, skb);
-                ub::bridge_account_rx(ndev, len as u32);
-            } else {
-                // No skb exists to free, but the §6.3 disposition counter
-                // still needs to record the RX allocation failure.
-                ub::rx_drop_error(ndev);
+            // Wrap the freshly-built skb at the boundary. `build_rx`
+            // returns `None` if the cshim ran out of memory; the §6.3
+            // `rx_dropped_error` counter is bumped via `rx_drop_error`
+            // (task #62 domain-type discipline).
+            match crate::skb::DriverOwnedSkb::build_rx(ndev, buf_ptr, len) {
+                Some(skb) => {
+                    // Ask the chip-side opts1 if HW verified the L4 checksum;
+                    // set skb->ip_summed accordingly so the stack doesn't
+                    // re-compute on every RX packet.
+                    skb.rx_csum_set(desc.opts1);
+                    let napi = ub::bridge_napi(ndev);
+                    skb.deliver_rx(napi);
+                    ub::bridge_account_rx(ndev, len as u32);
+                }
+                None => {
+                    // No skb exists to free, but the §6.3 disposition
+                    // counter still needs to record the RX allocation
+                    // failure.
+                    ub::rx_drop_error(ndev);
+                }
             }
         }
 
@@ -183,14 +190,14 @@ fn process_tx_completions(state: &NetdevState) -> (usize, usize, usize) {
             // xmit overwrites it.
             state.tx.shadow_len[slot].store(0, Ordering::Release);
         }
-        let skb = state.tx.shadow[slot].swap(ptr::null_mut(), Ordering::AcqRel);
-        if !skb.is_null() {
-            // LastFrag of a logical packet — drain stats from skb->len
-            // (the kernel-side total including all paged frags) and hand
-            // the skb back to NAPI for recycling. The DMA unmap for THIS
-            // slot already happened above; for SG packets the
+        let raw_skb = state.tx.shadow[slot].swap(ptr::null_mut(), Ordering::AcqRel);
+        if let Some(skb) = crate::skb::DriverOwnedSkb::from_raw_nullable(raw_skb) {
+            // LastFrag of a logical packet — reclaim the disposition
+            // obligation from the shadow and hand the skb back to NAPI
+            // (stats drain happens inside `consume_tx`). The DMA unmap
+            // for THIS slot already happened above; for SG packets the
             // intermediate slots' unmaps happened in earlier loop iters.
-            ub::skb_consume_tx(state.ndev.load(Ordering::Acquire), skb);
+            skb.consume_tx(state.ndev.load(Ordering::Acquire));
         }
         // Clear the descriptor (preserve EOR if last slot).
         let mut opts1 = 0u32;

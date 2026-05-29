@@ -77,22 +77,34 @@ else
 	red "ndo_stop does NOT walk RX slots to free pages + unmap DMA — leak on rmmod"
 fi
 
-# 5. ndo_open rollback after the RX allocation point must also free the
-# pool. The allocation happens before IRQ register / PHY connect / hw_start,
-# so every later fallible step needs to route through the same cleanup
-# helper as ndo_stop. Task #60 split `request_irq` into a phase wrapper
-# `register_irq_handler` — accept either form for the IRQ-failure branch.
-if grep -qE 'fn[[:space:]]+free_rx_slots\(' "$ROOT/src/netdev.rs" &&
-   awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | \
-		grep -qE '(request_irq|register_irq_handler)\(.*\)[[:space:]]*\{' &&
-   awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | \
-		awk '/(request_irq|register_irq_handler)\(/,/return Err\(e\);/' | grep -q 'free_rx_slots(state)' &&
-   awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | \
-		awk '/bridge_phy_connect_and_reset/,/return Err\(e\);/' | grep -q 'free_rx_slots(state)' &&
-   awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | \
-		awk '/hw_start_8125b/,/return Err\(e\);/' | grep -q 'free_rx_slots(state)' &&
-   awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | \
-		awk '/bridge_phy_kick_state_machine/,/return Err\(e\);/' | grep -q 'free_rx_slots(state)'; then
+# 5. Post-allocation failure paths must release the RX pool. Task #61
+# replaced the open-coded `free_rx_slots(state)` calls in every failure
+# branch with an `RxPoolGuard` — its `Drop` calls `free_rx_slots` so any
+# `?` or `return Err(e)` between `RxPoolGuard::allocate` and the
+# success-path `rx_pool.release()` unwinds automatically. Accept either
+# the manual-cleanup form (legacy) or the RAII guard form.
+manual_ok=1
+awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | \
+		grep -qE '(request_irq|register_irq_handler)\(.*\)[[:space:]]*\{' || manual_ok=0
+awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | \
+		awk '/(request_irq|register_irq_handler)\(/,/return Err\(e\);/' | grep -q 'free_rx_slots(state)' || manual_ok=0
+awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | \
+		awk '/bridge_phy_connect_and_reset/,/return Err\(e\);/' | grep -q 'free_rx_slots(state)' || manual_ok=0
+awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | \
+		awk '/hw_start_8125b/,/return Err\(e\);/' | grep -q 'free_rx_slots(state)' || manual_ok=0
+awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | \
+		awk '/bridge_phy_kick_state_machine/,/return Err\(e\);/' | grep -q 'free_rx_slots(state)' || manual_ok=0
+
+raii_ok=1
+grep -qE 'struct RxPoolGuard' "$ROOT/src/netdev.rs" || raii_ok=0
+# Accept `impl Drop for RxPoolGuard` and `impl<...> Drop for RxPoolGuard<...>`.
+grep -qE 'impl(<[^>]+>)?[[:space:]]+Drop[[:space:]]+for[[:space:]]+RxPoolGuard' "$ROOT/src/netdev.rs" || raii_ok=0
+grep -q 'free_rx_slots(self.state)' "$ROOT/src/netdev.rs" || raii_ok=0
+awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | \
+		grep -q 'RxPoolGuard::allocate' || raii_ok=0
+
+if grep -qE 'fn[[:space:]]+free_rx_slots\(' "$ROOT/src/netdev.rs" \
+   && { [[ $manual_ok -eq 1 ]] || [[ $raii_ok -eq 1 ]]; }; then
 	grn "ndo_open post-allocation failure paths release RX jumbo slots"
 else
 	red "ndo_open has a post-RX-allocation failure path that does not free RX jumbo slots"

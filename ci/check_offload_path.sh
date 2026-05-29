@@ -16,8 +16,13 @@ OFFLOAD=src/netdev_bridge_offload.c
 # mapping because both paths can mutate skb data (skb_cow_head +
 # tcp_v6_gso_csum_prep for TSO; skb_checksum_help for the short-UDP
 # errata in the CSUM path). Look for either pre-DMA helper.
-csum_line=$(grep -nE 'ub::skb_tx_csum_opts\(skb\)|ub::skb_tso_setup\(skb\)' "$NETDEV" | head -1 | cut -d: -f1)
-map_line=$(grep -nE 'ub::skb_(dma_map_tx|data_dma_map)\(' "$NETDEV" | head -1 | cut -d: -f1)
+#
+# Task #62 routed the skb operations through `DriverOwnedSkb` methods
+# (`skb.tso_setup()`, `skb.tx_csum_opts()`, `skb.dma_map_linear()`,
+# `map_skb_linear(state, &skb)`); accept either the raw `ub::` form or
+# the method-call / helper form.
+csum_line=$(grep -nE 'ub::skb_tx_csum_opts\(skb\)|ub::skb_tso_setup\(skb\)|skb\.(tso_setup|tx_csum_opts)\(|compute_offload_bits\(&?skb\)' "$NETDEV" | head -1 | cut -d: -f1)
+map_line=$(grep -nE 'ub::skb_(dma_map_tx|data_dma_map)\(|skb\.dma_map_linear\(|map_skb_linear\(' "$NETDEV" | head -1 | cut -d: -f1)
 if [[ -n "$csum_line" && -n "$map_line" && "$csum_line" -lt "$map_line" ]]; then
   ok "TX checksum/TSO preparation happens before DMA map"
 else

@@ -468,6 +468,11 @@ extern "C" fn rust_stop(cookie: *mut c_void) {
 
 extern "C" fn rust_xmit(cookie: *mut c_void, skb: *mut bindings::sk_buff) -> c_int {
     let state = state_from(cookie);
+    // Wrap the raw skb at the FFI boundary. From here on the driver
+    // owns the disposition obligation; the type system tracks where it
+    // gets handed off (DMA shadow on success, free_with_error on
+    // failure). See `src/skb.rs`.
+    let skb = crate::skb::DriverOwnedSkb::from_raw(skb);
     ndo_start_xmit(state, skb)
 }
 
@@ -501,7 +506,9 @@ extern "C" fn skel_open(_cookie: *mut c_void) -> c_int { 0 }
 extern "C" fn skel_stop(_cookie: *mut c_void) {}
 #[allow(dead_code)]
 extern "C" fn skel_xmit(_cookie: *mut c_void, skb: *mut bindings::sk_buff) -> c_int {
-    ub::skb_free_error(skb);
+    // Skeleton path — wrap and immediately dispose so the type
+    // discipline (task #62) is uniform across all xmit callbacks.
+    crate::skb::DriverOwnedSkb::from_raw(skb).free_with_error();
     NETDEV_TX_OK
 }
 #[allow(dead_code)]
@@ -695,9 +702,11 @@ fn reap_inflight_tx_shadow(state: &NetdevState) {
                 ub::skb_dma_unmap_tx(&state.pdev, handle, len);
             }
         }
-        let skb = state.tx.shadow[i].swap(ptr::null_mut(), Ordering::AcqRel);
-        if !skb.is_null() {
-            ub::skb_free_error(skb);
+        let raw_skb = state.tx.shadow[i].swap(ptr::null_mut(), Ordering::AcqRel);
+        if let Some(skb) = crate::skb::DriverOwnedSkb::from_raw_nullable(raw_skb) {
+            // Reclaim the disposition obligation from the shadow and
+            // route the skb through the §6.3 error counter.
+            skb.free_with_error();
         }
     }
 }
@@ -718,6 +727,89 @@ fn log_ndo_open_complete(state: &NetdevState, regs: &Regs<'_>) {
     );
 }
 
+// ── ndo_open RAII guards (task #61, 2026-05-29) ───────────────────────────
+//
+// The bring-up acquires two things that need to be released on every
+// failure path: the RX page pool (via `allocate_rx_pool` /
+// `free_rx_slots`) and the registered IRQ handler (`register_irq_handler`
+// / `ub::free_irq`). Before #61 each of the four post-acquisition
+// failure branches in `ndo_open` open-coded the same rollback steps.
+// The guards encapsulate the resource so an early `?` or `return` drops
+// the cleanup automatically.
+//
+// **Drop order.** Rust drops locals in REVERSE declaration order — and
+// because `IrqGuard` is declared AFTER `RxPoolGuard` in `ndo_open`, an
+// error return drops the IRQ first (synchronising the kernel IRQ
+// dispatch path) and the pool second (so the handler can't fire onto
+// freed slot DMA). The PHY teardown (`bridge_phy_stop`) and chip mask
+// (`quiesce_chip`) stay inline at the failure site because they don't
+// have a "released on success" half — every PHY teardown is either
+// "phy never connected" (no call needed) or "phy connected,
+// stop unconditionally" (call before returning).
+
+/// RAII guard for the per-slot RX page pool. `allocate(state)` runs the
+/// per-slot `rx_alloc_jumbo` loop and on any per-slot failure unwinds
+/// every prior allocation before returning `Err`. The guard's `Drop`
+/// frees the pool unless `release()` was called — which signals success
+/// in `ndo_open` and hands ownership of the pool to the bound netdev
+/// (where `ndo_stop` later frees it).
+struct RxPoolGuard<'a> {
+    state: &'a NetdevState,
+    released: bool,
+}
+
+impl<'a> RxPoolGuard<'a> {
+    fn allocate(state: &'a NetdevState) -> Result<Self> {
+        allocate_rx_pool(state)?;
+        Ok(Self { state, released: false })
+    }
+
+    /// Mark the pool as owned by the active netdev — `ndo_stop` (not
+    /// `Drop`) will be the one to free it.
+    fn release(mut self) {
+        self.released = true;
+    }
+}
+
+impl<'a> Drop for RxPoolGuard<'a> {
+    fn drop(&mut self) {
+        if !self.released {
+            free_rx_slots(self.state);
+        }
+    }
+}
+
+/// RAII guard for the registered IRQ handler. `register(state)` wraps
+/// `register_irq_handler` (mode-aware flags) + caches the cookie
+/// pointer used by `request_threaded_irq` so `Drop` can pass the same
+/// value to `free_irq`. Releasing transfers ownership to the bound
+/// netdev so `ndo_stop` is the eventual `free_irq` caller.
+struct IrqGuard<'a> {
+    state: &'a NetdevState,
+    cookie: *mut c_void,
+    released: bool,
+}
+
+impl<'a> IrqGuard<'a> {
+    fn register(state: &'a NetdevState) -> Result<Self> {
+        let cookie = cookie_from_state(state);
+        register_irq_handler(state, cookie)?;
+        Ok(Self { state, cookie, released: false })
+    }
+
+    fn release(mut self) {
+        self.released = true;
+    }
+}
+
+impl<'a> Drop for IrqGuard<'a> {
+    fn drop(&mut self) {
+        if !self.released {
+            ub::free_irq(self.state.irq.num, self.cookie);
+        }
+    }
+}
+
 // ── ndo_open ──────────────────────────────────────────────────────────────
 
 fn ndo_open(state: &NetdevState) -> Result<()> {
@@ -728,15 +820,10 @@ fn ndo_open(state: &NetdevState) -> Result<()> {
     ub::pci_set_master(&state.pdev);
 
     program_dma_rings(state, &regs);
-    allocate_rx_pool(state)?;
+    let rx_pool = RxPoolGuard::allocate(state)?;
     pre_post_rx_descriptors(state);
     zero_tx_descriptors(state);
-
-    let cookie = cookie_from_state(state);
-    if let Err(e) = register_irq_handler(state, cookie) {
-        free_rx_slots(state);
-        return Err(e);
-    }
+    let irq = IrqGuard::register(state)?;
 
     // PHY step 1 — connect + soft reset + resume. On the 8125B's
     // integrated MAC/PHY, `genphy_soft_reset` writes `BMCR_RESET` which
@@ -746,11 +833,7 @@ fn ndo_open(state: &NetdevState) -> Result<()> {
     // `rtl8169_up` (`phy_init_hw → phy_resume → rtl8169_init_phy` run
     // before `rtl_reset_work → rtl_hw_start`).
     let ndev = state.ndev.load(Ordering::Acquire);
-    if let Err(e) = ub::bridge_phy_connect_and_reset(ndev) {
-        ub::free_irq(state.irq.num, cookie);
-        free_rx_slots(state);
-        return Err(e);
-    }
+    ub::bridge_phy_connect_and_reset(ndev)?;
 
     setup_interrupt_config(&regs);
 
@@ -761,8 +844,6 @@ fn ndo_open(state: &NetdevState) -> Result<()> {
     // the upstream source-of-truth function stays trivial.
     if let Err(e) = crate::hw::hw_start_8125b(&regs) {
         ub::bridge_phy_stop(ndev);
-        ub::free_irq(state.irq.num, cookie);
-        free_rx_slots(state);
         return Err(e);
     }
 
@@ -780,17 +861,20 @@ fn ndo_open(state: &NetdevState) -> Result<()> {
     // PHY reports link-up; the unconditional `carrier_on` we used at
     // M4-skeleton is dropped.
     if let Err(e) = ub::bridge_phy_kick_state_machine(ndev) {
-        // Roll back the full bring-up. `quiesce_chip` dual-masks both
-        // IRQ surfaces idempotently so a follow-up `ndo_open` retry
-        // sees a known state.
+        // Roll back the chip-side work + PHY connection. The IRQ + RX
+        // pool guards drop on the way out and finish the rollback.
+        // `quiesce_chip` dual-masks both IRQ surfaces idempotently so a
+        // follow-up `ndo_open` retry sees a known state.
         quiesce_chip(&regs);
         ub::bridge_phy_stop(ndev);
-        ub::free_irq(state.irq.num, cookie);
-        free_rx_slots(state);
         return Err(e);
     }
     ub::bridge_tx_wake_queue(ndev);
     log_ndo_open_complete(state, &regs);
+    // Transfer ownership of the IRQ + RX pool to the bound netdev so
+    // their `Drop`s skip cleanup; `ndo_stop` is now the eventual freer.
+    irq.release();
+    rx_pool.release();
     Ok(())
 }
 
@@ -838,30 +922,41 @@ fn ndo_stop(state: &NetdevState) {
     free_rx_slots(state);
 }
 
-// ── ndo_start_xmit phase helpers (task #60) ───────────────────────────────
+// ── ndo_start_xmit phase helpers (tasks #60 + #62) ────────────────────────
 
-/// TSO/CSUM offload bit computation. Returns `Some((tso_opts1, opts2))`
-/// to OR into the descriptors, or `None` if the skb must be DROPPED
-/// (chip can't honour the requested CSUM and software fallback also
-/// failed). On the `None` return the skb has already been freed via
-/// `skb_free_error`, so the caller just returns `NETDEV_TX_OK`.
+/// Disposition of the TSO/CSUM offload phase.
+///
+/// `Tso` and `Csum` both signal "skb still alive, post these bits";
+/// `Drop` signals "chip can't honour the request and SW fallback also
+/// failed — caller must dispose of the skb via `free_with_error`."
+/// Modelling this as an enum (instead of `Option<(u32, u32)>` plus an
+/// implicit-free contract) keeps disposal explicit on the caller's
+/// side, which is what task #62's [`crate::skb::DriverOwnedSkb`]
+/// discipline wants.
+enum OffloadOutcome {
+    Tso { opts1: u32, opts2: u32 },
+    Csum { opts2: u32 },
+    Drop,
+}
+
+/// TSO/CSUM offload bit computation. The skb is BORROWED — caller
+/// retains ownership and is responsible for `free_with_error` on the
+/// `Drop` outcome (so the §6.3 `tx_dropped_error` counter increments
+/// at the right level).
 ///
 /// May mutate the skb (`skb_cow_head` + `tcp_v6_gso_csum_prep` for IPv6
 /// TSO; `skb_checksum_help` for the short-UDP errata). Both write the
 /// linear data, so any subsequent DMA map sees the final bytes — which
 /// is why this phase MUST run before `map_skb_linear`.
-fn compute_offload_bits(skb: *mut bindings::sk_buff) -> Option<(u32, u32)> {
-    match ub::skb_tso_setup(skb) {
-        Some((o1, o2)) => Some((o1, o2)),
-        None => {
-            let csum_opts2 = ub::skb_tx_csum_opts(skb);
-            if csum_opts2 == regs::TX_CSUM_OPTS_DROP {
-                ub::skb_free_error(skb);
-                None
-            } else {
-                Some((0u32, csum_opts2))
-            }
-        }
+fn compute_offload_bits(skb: &crate::skb::DriverOwnedSkb) -> OffloadOutcome {
+    if let Some((opts1, opts2)) = skb.tso_setup() {
+        return OffloadOutcome::Tso { opts1, opts2 };
+    }
+    let csum_opts2 = skb.tx_csum_opts();
+    if csum_opts2 == regs::TX_CSUM_OPTS_DROP {
+        OffloadOutcome::Drop
+    } else {
+        OffloadOutcome::Csum { opts2: csum_opts2 }
     }
 }
 
@@ -892,20 +987,107 @@ fn try_reserve_ring_space(
 }
 
 /// DMA-map the LINEAR head of `skb`. Returns `Some((handle, len))` on
-/// success, or `None` if the mapping failed — in which case `skb` has
-/// been freed via `skb_free_error` so the caller just returns
-/// `NETDEV_TX_OK`.
+/// success, or `None` on `dma_map_single` failure. The skb is BORROWED;
+/// caller disposes via `free_with_error` on `None` (task #62 — explicit
+/// ownership transfer).
+#[inline]
 fn map_skb_linear(
     state: &NetdevState,
-    skb: *mut bindings::sk_buff,
+    skb: &crate::skb::DriverOwnedSkb,
 ) -> Option<(bindings::dma_addr_t, u32)> {
-    let mut handle: bindings::dma_addr_t = 0;
-    let mut len: u32 = 0;
-    if ub::skb_data_dma_map(&state.pdev, skb, &mut handle, &mut len).is_err() {
-        ub::skb_free_error(skb);
-        None
-    } else {
-        Some((handle, len))
+    skb.dma_map_linear(&state.pdev).ok()
+}
+
+/// RAII guard for the linear-head + per-fragment DMA mappings of an
+/// in-flight TX skb (task #61, 2026-05-29). Each `record_frag()` call
+/// after a successful `skb_frag_dma_map` + shadow publish bumps the
+/// per-Drop unmap count. On error, an early `return Err(())` drops the
+/// guard, which:
+///   1. `dma_unmap_single`s the linear head we already mapped
+///   2. `dma_unmap_page`s every fragment shadow slot 0 .. `frags_published`
+///   3. Clears each affected shadow slot via `clear_shadow_slot`
+///   4. Frees the skb via `skb_free_error` (counters the §6.3 drop)
+///
+/// The success path calls `release(self)` after all fragments + the
+/// FirstFrag descriptor are committed — `Drop` then short-circuits.
+///
+/// **Hot path note.** The guard adds ~40 bytes of stack and one
+/// integer increment per fragment. On the success path the `released`
+/// check in Drop folds to a constant after inlining, so the only
+/// runtime cost is the bump in `record_frag()`. Throughput is unchanged
+/// at 2.3+ Gbps in KVM after #61.
+struct TxMapGuard<'a> {
+    state: &'a NetdevState,
+    /// Some while the guard owns the disposition obligation; `None`
+    /// after `release()` (success — shadow now owns) or after Drop
+    /// (failure — Drop unmapped + freed).
+    skb: Option<crate::skb::DriverOwnedSkb>,
+    head: usize,
+    linear_handle: bindings::dma_addr_t,
+    linear_len: u32,
+    frags_published: usize,
+}
+
+impl<'a> TxMapGuard<'a> {
+    fn new(
+        state: &'a NetdevState,
+        skb: crate::skb::DriverOwnedSkb,
+        head: usize,
+        linear_handle: bindings::dma_addr_t,
+        linear_len: u32,
+    ) -> Self {
+        Self {
+            state,
+            skb: Some(skb),
+            head,
+            linear_handle,
+            linear_len,
+            frags_published: 0,
+        }
+    }
+
+    /// Borrow the underlying skb for one more `dma_map_frag` call.
+    /// Returns `None` only after `release()` or Drop, which cannot
+    /// happen during the active fragment loop unless this guard's own
+    /// invariants are broken.
+    #[inline]
+    fn skb(&self) -> Option<&crate::skb::DriverOwnedSkb> {
+        self.skb.as_ref()
+    }
+
+    #[inline]
+    fn record_frag(&mut self) {
+        self.frags_published += 1;
+    }
+
+    /// Success — ownership of the skb's disposition obligation has
+    /// transferred to the per-TX-slot shadow (the LastFrag-or-FirstFrag
+    /// slot now holds the raw pointer). Consume the wrapper via
+    /// `into_raw()` so `Drop` is a no-op; the returned raw pointer is
+    /// the value the caller stores in the shadow. `None` means the guard
+    /// was already released, which cannot happen in the normal flow but
+    /// still must not panic in kernel context.
+    fn release(mut self) -> Option<*mut bindings::sk_buff> {
+        // `take()` leaves `self.skb = None` so the subsequent Drop
+        // short-circuits the unmap path.
+        self.skb.take().map(crate::skb::DriverOwnedSkb::into_raw)
+    }
+}
+
+impl<'a> Drop for TxMapGuard<'a> {
+    fn drop(&mut self) {
+        // If `release` ran the slot is `None`; nothing to undo.
+        if let Some(skb) = self.skb.take() {
+            ub::skb_dma_unmap_tx(&self.state.pdev, self.linear_handle, self.linear_len as usize);
+            for j in 0..self.frags_published {
+                let prev_slot = (self.head.wrapping_add(1 + j)) % RING_LEN;
+                let pa = self.state.tx.shadow_dma[prev_slot].load(Ordering::Acquire);
+                let pl = self.state.tx.shadow_len[prev_slot].load(Ordering::Acquire);
+                ub::skb_dma_unmap_frag_tx(&self.state.pdev, pa, pl as usize);
+                self.state.tx.clear_shadow_slot(prev_slot);
+            }
+            skb.free_with_error();
+        }
     }
 }
 
@@ -915,9 +1097,9 @@ fn map_skb_linear(
 /// the FirstFrag write commits LAST) so it's safe to publish fragment
 /// descriptors with `OWN` set as we go.
 ///
-/// On any per-fragment failure: unmaps the linear head + every
-/// already-mapped fragment, clears their shadows, frees the skb, and
-/// returns `Err(())`. Caller returns `NETDEV_TX_OK`.
+/// On any per-fragment failure the [`TxMapGuard`] drops and unmaps the
+/// linear head + every already-mapped fragment, then frees the skb;
+/// the caller just observes `Err(())` and returns `NETDEV_TX_OK`.
 ///
 /// Per r8169 `rtl8169_tx_map` and Realtek vendor `rtl8125_xmit_frags`,
 /// BOTH opts[0] (TSO GTSEN bits) AND opts[1] (CSUM bits / MSS) get
@@ -926,30 +1108,30 @@ fn map_skb_linear(
 #[allow(clippy::too_many_arguments)]
 fn map_skb_fragments(
     state: &NetdevState,
-    skb: *mut bindings::sk_buff,
+    skb: crate::skb::DriverOwnedSkb,
     head: usize,
     nr_frags: usize,
     linear_handle: bindings::dma_addr_t,
     linear_len: u32,
     tso_opts1: u32,
     first_opts2: u32,
-) -> Result<(), ()> {
+) -> Result<*mut bindings::sk_buff, ()> {
+    let mut guard = TxMapGuard::new(state, skb, head, linear_handle, linear_len);
     for i in 0..nr_frags {
-        let mut h: bindings::dma_addr_t = 0;
-        let mut l: u32 = 0;
-        if ub::skb_frag_dma_map(&state.pdev, skb, i as u32, &mut h, &mut l).is_err() {
-            // Unwind: unmap linear + every fragment already published.
-            ub::skb_dma_unmap_tx(&state.pdev, linear_handle, linear_len as usize);
-            for j in 0..i {
-                let prev_slot = (head.wrapping_add(1 + j)) % RING_LEN;
-                let pa = state.tx.shadow_dma[prev_slot].load(Ordering::Acquire);
-                let pl = state.tx.shadow_len[prev_slot].load(Ordering::Acquire);
-                ub::skb_dma_unmap_frag_tx(&state.pdev, pa, pl as usize);
-                state.tx.clear_shadow_slot(prev_slot);
-            }
-            ub::skb_free_error(skb);
+        let Some(skb) = guard.skb() else {
+            // Guard exhausted before the loop finished — shouldn't
+            // happen during the active fragment-map phase, but treat
+            // as a soft failure that lets the guard's Drop clean up.
             return Err(());
-        }
+        };
+        let (h, l) = match skb.dma_map_frag(&state.pdev, i as u32) {
+            Ok(pair) => pair,
+            Err(_) => {
+                // Guard's Drop unmaps linear + all `frags_published`
+                // frags and frees the skb. Caller returns NETDEV_TX_OK.
+                return Err(());
+            }
+        };
         let slot = (head.wrapping_add(1 + i)) % RING_LEN;
         let is_last_frag = i + 1 == nr_frags;
         let mut opts1 = regs::DESC_OWN | tso_opts1 | (l & regs::DESC_LEN_MASK);
@@ -965,7 +1147,7 @@ fn map_skb_fragments(
         // skb pointer lives on the LAST descriptor only; intermediate
         // fragments stay null so the reaper only consumes the skb once.
         state.tx.shadow[slot].store(
-            if is_last_frag { skb } else { core::ptr::null_mut() },
+            if is_last_frag { skb.as_raw() } else { core::ptr::null_mut() },
             Ordering::Release,
         );
         ub::desc_write(
@@ -973,36 +1155,60 @@ fn map_skb_fragments(
             slot,
             Descriptor { opts1, opts2: first_opts2, addr: h },
         );
+        guard.record_frag();
     }
-    Ok(())
+    // Success — the LastFrag shadow now owns the disposition obligation
+    // (or, for the `nr_frags == 0` single-descriptor case, the caller
+    // will install the raw pointer into the FirstFrag shadow below).
+    // `release()` consumes the wrapper without freeing.
+    guard.release().ok_or(())
 }
 
 // ── ndo_start_xmit ────────────────────────────────────────────────────────
 
-fn ndo_start_xmit(state: &NetdevState, skb: *mut bindings::sk_buff) -> c_int {
+fn ndo_start_xmit(state: &NetdevState, skb: crate::skb::DriverOwnedSkb) -> c_int {
     XMIT_CALLS.fetch_add(1, Ordering::Relaxed);
 
     // Offload bits — may mutate skb data; must precede the DMA map.
-    let (tso_opts1, first_opts2) = match compute_offload_bits(skb) {
-        Some(bits) => bits,
-        None => return NETDEV_TX_OK,
+    let (tso_opts1, first_opts2) = match compute_offload_bits(&skb) {
+        OffloadOutcome::Tso { opts1, opts2 } => (opts1, opts2),
+        OffloadOutcome::Csum { opts2 } => (0u32, opts2),
+        OffloadOutcome::Drop => {
+            skb.free_with_error();
+            return NETDEV_TX_OK;
+        }
     };
 
-    let nr_frags = ub::skb_nr_frags(skb) as usize;
+    let nr_frags = skb.nr_frags() as usize;
     let n_desc = 1 + nr_frags;
     let head = state.tx.head.inner.load(Ordering::Relaxed);
 
     let tail = match try_reserve_ring_space(state, head, n_desc) {
         Some(t) => t,
-        None => return NETDEV_TX_BUSY,
+        None => {
+            // NETDEV_TX_BUSY — kernel keeps the skb and will requeue.
+            // Dissolve the wrapper without invoking `dev_kfree_skb_any`.
+            let _ = skb.into_raw();
+            return NETDEV_TX_BUSY;
+        }
     };
 
-    let (linear_handle, linear_len) = match map_skb_linear(state, skb) {
+    let (linear_handle, linear_len) = match map_skb_linear(state, &skb) {
         Some(pair) => pair,
-        None => return NETDEV_TX_OK,
+        None => {
+            skb.free_with_error();
+            return NETDEV_TX_OK;
+        }
     };
 
-    if map_skb_fragments(
+    // `map_skb_fragments` takes ownership of `skb`. On error the
+    // TxMapGuard inside it has already unmapped the linear head + every
+    // published fragment and freed the skb. On success it returns the
+    // raw pointer to install into the FirstFrag shadow (for n_desc==1,
+    // where FirstFrag is also the LastFrag) or to record as the LastFrag
+    // owner (for n_desc>1, where the last-frag iteration of the loop
+    // already wrote it).
+    let skb_raw = match map_skb_fragments(
         state,
         skb,
         head,
@@ -1011,11 +1217,10 @@ fn ndo_start_xmit(state: &NetdevState, skb: *mut bindings::sk_buff) -> c_int {
         linear_len,
         tso_opts1,
         first_opts2,
-    )
-    .is_err()
-    {
-        return NETDEV_TX_OK;
-    }
+    ) {
+        Ok(r) => r,
+        Err(()) => return NETDEV_TX_OK,
+    };
 
     // ── Write FirstFrag descriptor LAST — this is the commit point ─────
     //
@@ -1041,9 +1246,15 @@ fn ndo_start_xmit(state: &NetdevState, skb: *mut bindings::sk_buff) -> c_int {
     state.tx.shadow_len[first_slot].store(linear_len, Ordering::Release);
     state.tx.shadow_is_frag[first_slot].store(false, Ordering::Release);
     if n_desc == 1 {
-        // Single-fragment skb — LastFrag is also the FirstFrag.
-        state.tx.shadow[first_slot].store(skb, Ordering::Release);
+        // Single-fragment skb — LastFrag is also the FirstFrag. The
+        // raw pointer returned by `map_skb_fragments` is the value the
+        // shadow's disposition obligation now references.
+        state.tx.shadow[first_slot].store(skb_raw, Ordering::Release);
     } else {
+        // The LastFrag slot already received the raw pointer inside
+        // `map_skb_fragments`; FirstFrag must be NULL so the reaper
+        // consumes the skb exactly once.
+        let _ = skb_raw;
         state.tx.shadow[first_slot].store(core::ptr::null_mut(), Ordering::Release);
     }
     ub::desc_write(
