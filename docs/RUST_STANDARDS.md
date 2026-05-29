@@ -1,136 +1,192 @@
-# High-Performance Rust Coding Standards v2.0
+# rtl8125-rs Rust Driver / Firmware Standards
 
-**Hardware Sympathy & Modern Idioms — Rust 1.95+ / Edition 2024**
+**Kernel Rust first: correctness, lifecycle safety, hardware sympathy, and
+auditable unsafe boundaries.**
 
-> If it feels fast at small scale but collapses under load, the problem is design, not the compiler.
+The goal of this project is a production-quality RTL8125 driver written
+primarily in Rust, with a small audited C shim only where the kernel has no
+stable Rust API yet. The standards below are the review rubric for this repo.
+They adapt the operator-provided high-performance Rust guidance to the
+kernel-driver and firmware-adjacent environment we actually target.
 
-Rust enables writing code that's simultaneously safe and fast through zero-cost abstractions, but achieving peak performance requires understanding specific patterns. **The most impactful optimizations come from treating allocations, syscalls, cache locality, and scheduler interactions as first-class design constraints.** Modern CPUs spend most of their cycles waiting for memory; the cure is hardware sympathy, not clever instructions.
-
-This guide combines authoritative best practices from the Rust Performance Book, core team members, and real-world benchmarks with enforceable standards and practical patterns. Each section provides both the underlying performance rationale and clear MUST/SHOULD/AVOID directives for immediate application.
+For userspace tools, the original Rust performance guidance still applies:
+prefer borrowed data, bounded allocation, structured errors, buffered I/O,
+static dispatch in hot paths, and benchmarked claims. For the driver itself,
+kernel correctness and hardware lifecycle contracts take priority over
+userspace idioms.
 
 ## Operating Principles
 
-* **MUST** target Rust 1.95+ to access modern stdlib features (`LazyLock`, native async fn in traits, async closures, let-chains)
-* **MUST** profile before and after changes (CPU + allocations) and record results in PRs
-* **MUST** use release builds for performance evaluation
-* **MUST** treat allocations, syscalls, hashing, and scheduler interactions as design constraints, not afterthoughts
-* **SHOULD** apply hardware sympathy patterns (Section 15) for latency-critical or numerically-intensive workloads
-* **SHOULD** identify "hot paths" (see criteria in Section 17) and apply rigorous standards to them
-* **SHOULD** adopt Edition 2024 for new projects
+- **MUST** target the Rust toolchain supported by the validated kernel tree,
+  not latest stable by default. This repo currently validates through the
+  kernel build/Clippy path pinned in `ci/check_clippy.sh`.
+- **MUST** keep the crate `#![deny(unsafe_code)]`; all unsafe Rust belongs in
+  `src/unsafe_boundary.rs` and must be justified at the wrapper boundary.
+- **MUST** treat MMIO ordering, DMA ownership, cache-coherency sync, IRQ/NAPI
+  ordering, and teardown order as correctness contracts, not implementation
+  details.
+- **MUST** use release kernel builds and hardware-oriented evidence for
+  performance claims: traffic rate, drops, CPU use, IRQ rate, error counters,
+  soak duration, and bare-metal logs.
+- **MUST NOT** use `unwrap`, `expect`, `panic!`, runtime `assert!`,
+  `debug_assert!`, `todo!`, or equivalent panic-style exits in driver paths.
+  Error paths must return kernel errors, unwind via RAII guards, or leave
+  explicit recovery breadcrumbs.
+- **SHOULD** keep hot paths allocation-free except for expected kernel skb
+  allocation/copy points. Pre-allocate rings, shadows, and per-slot state.
+- **SHOULD** prefer small local domain types and RAII guards over comments
+  that describe ownership informally.
 
----
+## General Rust Guidance, With Kernel Applicability
 
-## Quick Reference: Do / Don't Table
+| Topic | Driver/Firmware rule | Userspace/tooling rule |
+| --- | --- | --- |
+| Ownership | Borrow state (`&NetdevState`), use domain wrappers (`DriverOwnedSkb`) for raw resources | Borrow `&T`, `&str`; avoid clone-to-compile |
+| Allocation | Pre-allocate rings/shadows; no surprise allocation in IRQ/NAPI/TX hot paths | Use `with_capacity`, `SmallVec`, allocator profiling |
+| Errors | Return `kernel::error::Result` or C errno; rollback with RAII | Use typed error enums and `?` |
+| Logging | Use low-rate `pr_info!`/`dev_info!`; no packet hot-path logging unless gated | Use structured `tracing` |
+| Async | N/A for driver core; NAPI/IRQ are the scheduling model | Native async features are fine in tooling |
+| Lazy statics | Use kernel-supported synchronization primitives only | Prefer `LazyLock`/`OnceLock` |
+| Dispatch | Static dispatch in packet/IRQ paths; no `dyn Trait` barriers | Same in hot paths |
+| Memory layout | Cache-pad independently mutated atomics; avoid false sharing | Same, plus SoA/chunks where useful |
+| I/O | N/A in driver core | Use buffered streaming I/O |
+| Benchmarking | Release kernel build plus hardware counters, traffic, drops, soaks | Criterion/alloc counts are fine for tools |
 
-| Topic              | Prefer                                | Avoid                                |
-| ------------------ | ------------------------------------- | ------------------------------------ |
-| Ownership          | `&T`, `&str`, `Cow`, `Arc<str>`       | `.clone()` to "make it compile"      |
-| Iteration          | Chained iterators, lazy pipelines     | `collect::<Vec<_>>()` then transform |
-| Collections        | `with_capacity`, `SmallVec` where apt | Repeated `push` without sizing       |
-| Hashing            | FxHash/AHash for trusted hot paths    | Default hasher for all internal data |
-| I/O                | `BufReader`/`BufWriter`, streaming    | Unbuffered I/O, intermediate Strings |
-| Errors             | `thiserror` enums + `?`               | `Result<T, String>` + `format!`      |
-| Logging            | `tracing` with structured fields      | Unstructured `println!/log!` blobs   |
-| Concurrency        | Scoped threads, bounded channels      | Copying large `String`s into tasks   |
-| Lazy statics       | `LazyLock`/`OnceLock` (std)           | `lazy_static!`, `once_cell` crate    |
-| Async traits       | Native `async fn` in traits           | `#[async_trait]` macro by default    |
-| Dispatch           | Static generics in hot paths          | `dyn Trait` as optimization barrier  |
-| Memory layout      | Cache-aligned independent atomics     | Adjacent atomics → false sharing     |
-| Numeric loops      | Branchless, SoA, `chunks_exact`       | Branches in inner loops, AoS         |
-| Allocator          | `mimalloc`/`jemalloc` for heavy alloc | Default for allocation-bound work    |
-| Conditionals       | `let`-chains, `let-else`              | Nested `if let` pyramids             |
-| Build              | LTO + reduced codegen units           | Default release profile              |
-| Bench discipline   | Criterion median/p95 + alloc counts   | "Feels faster" anecdotes             |
+## Kernel-Rust Caveats
 
----
+The high-performance Rust standards were written for userspace Rust with
+`std`. Kernel Rust differs:
 
-(Full document is the v2.0 standards file the operator provided 2026-05-25. The
-canonical text is preserved in this file verbatim — `docs/RUST_STANDARDS.md`
-is the source of truth for the rtl8125-rs Rust review rubric. Sections 1–21:
-ownership/borrowing, pre-allocation, iterator chains, collection selection,
-string handling, error handling, structured logging, dispatch,
-concurrency, async, hashing, I/O, build config, advanced patterns, data
-locality + hardware sympathy, benchmarking, hot-paths definition,
-tooling/lints, code-review checklist, Edition 2024 idioms, conclusion.)
+- **Toolchain**: do not require Rust 1.95+ or Edition 2024 features unless the
+  validated kernel tree supports them. New code must compile under the kernel
+  Rust toolchain selected by CI.
+- **Allocator**: allocator choice is not ours. Use kernel allocation APIs,
+  `KBox::init` for large in-place initialization, and DMA APIs appropriate to
+  the resource. Do not build large ring/state arrays on the kernel stack.
+- **Logging**: `tracing` is not available in the driver. Use kernel logging
+  sparingly and avoid high-frequency logs in NAPI, IRQ, and TX paths.
+- **Async/concurrency**: kernel modules are not userspace async programs.
+  Concurrency is driven by IRQ context, softirq/NAPI, process context, RTNL,
+  and device teardown. Document which context owns each mutation.
+- **Statics**: `LazyLock`, `OnceLock`, and userspace global patterns are
+  tooling guidance only unless the kernel crate provides an equivalent.
 
-## How this driver applies the standards
+## Hot Paths
 
-### Kernel-Rust caveats (where the standards diverge from userspace)
+The following paths are hot and must receive the strictest review:
 
-The standards target userspace Rust with `std`. Kernel-Rust differs in
-important ways already noted in the doc itself (no `std`, custom allocator,
-no `LazyLock` in the same form, no `tracing` crate, etc.). For this driver:
+1. **`napi::poll`**: RX completion plus TX reaping.
+   - Pass `&NetdevState`; never clone or own large state.
+   - Walk rings by index; no heap allocation beyond expected RX skb build.
+   - Keep `tx.head`, `tx.tail`, and `rx.tail` cache-padded through
+     `TxRingState` / `RxRingState`.
+   - Preserve the NAPI contract: budget 0 is TX-cleanup only; re-arm IRQs
+     only after `napi_complete_done`.
+2. **`netdev::ndo_start_xmit`**: TX submission.
+   - Compute offload bits before DMA mapping.
+   - Keep at least one descriptor slot empty.
+   - Commit fragment descriptors before the first descriptor.
+   - Store `tx.head` before ringing the TX doorbell.
+3. **`raw_irq_handler`**: interrupt path.
+   - Do minimum work: read status, ack/mask the correct surface, schedule
+     NAPI, return.
+   - Branch on the probe-selected `IrqMode`; never guess the IRQ surface.
 
-- **Allocator** — kernel-side allocator selection is not under our control;
-  use `KBox::new(value, GFP_KERNEL)` / `kernel::dma::CoherentAllocation` and
-  pre-allocate sizes (M3 ring sizes already follow this).
-- **Logging** — `tracing` isn't available; `pr_info!`/`dev_info!` plus
-  per-tracepoint events are what we have. Plan §6.4 calls for tracepoints
-  on the hot path — that lands at M4/M5.
-- **Async** — kernel modules are not `async` in the userspace sense; NAPI
-  poll + IRQ handlers are the equivalent. Sections 9–10 apply only to
-  userspace tooling we write later (e.g. test rigs).
-- **`LazyLock`/`OnceLock`** — replace with `Mutex<Option<T>>` or
-  `kernel::sync::Arc` patterns as the kernel crate offers them.
+## Driver Safety Contracts
 
-### Hot paths in this driver (Section 17 application)
+- **MMIO**: raw MMIO is restricted to `mmio.rs` and `unsafe_boundary.rs`.
+  Register helpers must encode chip semantics clearly enough to review against
+  r8169/vendor sources.
+- **DMA**: every map has a single corresponding unmap on all success and
+  rollback paths. Streaming RX pages must sync for CPU/device where required.
+- **Descriptors**: shadow state owns metadata the chip may clobber, including
+  TX DMA handle/len and fragment type. Descriptor publish order is part of the
+  hardware contract.
+- **IRQ/NAPI**: IRQ masking, ACK, NAPI schedule, completion, and re-arm order
+  are load-bearing. Static checks must cover these orderings.
+- **Teardown**: netdev unregister must occur before devres releases the BAR.
+  Teardown paths must be idempotent because explicit remove and Drop can both
+  observe the same resources.
+- **Stack usage**: large arrays and per-ring state must be initialized
+  in-place on the heap with pin-init patterns; no stack-built `NetdevState`.
 
-The following code paths are HOT and demand strict standards adherence:
+## Ownership And Lifecycle
 
-1. **`napi::poll`** — RX completion + TX completion reaping (per packet).
-   - **Borrow over clone**: pass `&NetdevState`, never own.
-   - **Iterator discipline**: walk RX/TX rings via index, no allocations.
-   - **Cache padding**: per-direction atomic indices (`tx.head/tail`,
-     `rx.tail`) must be cache-line padded (`CachePadded` equivalent) —
-     currently satisfied in `TxRingState` / `RxRingState`.
-   - **Static dispatch**: no `dyn Trait` in poll path.
-2. **`netdev::ndo_start_xmit`** — TX submission (per packet).
-   - Same cache-padding requirement on `tx.head`.
-   - Pre-allocate TX shadow array (already done at probe — `[AtomicPtr; N]`).
-3. **`netdev::raw_irq_handler`** — IRQ handler (per interrupt).
-   - Minimum work: read+ack ISR, mask further IRQs, schedule NAPI.
-   - Currently follows this discipline.
+- Use RAII guards for acquired resources that need rollback: IRQ handlers, RX
+  pools, DMA mappings, or future firmware/session handles.
+- Use domain wrappers for raw ownership crossing FFI boundaries. Today
+  `DriverOwnedSkb` is the skb ownership boundary; direct consume/free helper
+  calls outside that wrapper are regressions.
+- Resource release functions must be idempotent when they can be reached from
+  both explicit lifecycle hooks and Drop.
+- Slow-path state split is encouraged when it makes ownership clearer:
+  `TxRingState`, `RxRingState`, `IrqState`, and `PhyState` are examples.
+- Comments may explain contracts, but CI/static checks should enforce the
+  important ones.
 
-Counters in `src/netdev_bridge_counters.c` (`tx_received`,
-`tx_consumed`, `tx_busy_exception`, `tx_dropped_error`,
-`rx_handed_to_stack`, `rx_dropped_error`) are sharded per-CPU via
-`u64 __percpu *` storage with `this_cpu_inc(*b->X)` on the hot path
-(a single decorated INC on x86 with no cache-line bouncing). The
-ethtool / snapshot reader sums across `for_each_possible_cpu` —
-acceptable cost for a non-hot-path readout. Lifecycle helpers
-`r8125_bridge_counters_alloc` / `_free` allocate and free all six
-counters in lockstep; the wiring is enforced by
-`ci/check_counter_infrastructure.sh`.
+## Unsafe And C Shim Boundaries
 
-### Mandatory enforcement (Section 18) — what CI already does
+- All unsafe Rust lives in `src/unsafe_boundary.rs`; every wrapper documents
+  pointer lifetime, ownership, context, and post-call validity.
+- The C shim is not a second driver. It may provide kernel-facing wrappers for
+  APIs missing from kernel Rust, but chip policy and descriptor logic belong in
+  Rust.
+- Each `src/netdev_bridge*.c` file must declare and stay within a hard LOC cap.
+  `ci/check_cshim_loc_caps.sh` enforces this so review size stays bounded.
+- C shim helpers must keep counter side effects colocated with the kernel
+  operation they account for.
 
-- `ci/check_unsafe_allowlist.sh` enforces the unsafe-allowlist + crate-root
-  `#![deny(unsafe_code)]` + non-increasing census + raw-MMIO containment.
-- `ci/check_dco_assistedby.sh` enforces the §9.2 DCO / Assisted-by policy.
-- `ci/check_clippy.sh` runs `make CLIPPY=1` (the kernel-Rust build's
-  in-tree Clippy — **not** `cargo clippy`) and fails on any
-  `warning:`-prefixed lint. Skips cleanly when the validated
-  toolchain (rustc-1.93 + clippy-driver-1.93) is absent.
-- `ci/check_cache_padding.sh` enforces that non-array `Atomic*` fields
-  in cross-context state structs (`NetdevState`, `TxRingState`,
-  `RxRingState`, `IrqState`, `PhyState`) are wrapped in
-  `CachePadded<...>` or carry an explicit `// NOT-PADDED:` annotation
-  on a nearby comment line documenting why padding is unnecessary.
-- `ci/check_counter_infrastructure.sh` enforces that the six §6.3
-  disposition counters are wired through storage, increments,
-  snapshot, and `ethtool -S`.
+## Validation And TDD Gates
 
-### When in doubt
+Every non-trivial driver change should add or update a narrow static/runtime
+gate before or with the implementation. Current mandatory gates include:
 
-Re-read this file before opening a PR that touches `src/napi.rs`,
-`src/netdev.rs`, `src/pci.rs`, or `src/unsafe_boundary.rs`. The §6.3
-ownership contract in `src/netdev_bridge.h` is the orthogonal correctness
-discipline; this file is the **performance** discipline. Both apply.
+- `ci/check_unsafe_allowlist.sh`: unsafe containment, raw-MMIO containment,
+  and non-increasing unsafe census.
+- `ci/check_clippy.sh`: kernel-build Clippy, not `cargo clippy`.
+- `ci/check_cache_padding.sh`: non-array atomics in cross-context state must
+  be `CachePadded` or explicitly annotated `// NOT-PADDED:`.
+- `ci/check_counter_infrastructure.sh`: six disposition counters wired through
+  storage, increments, snapshot, and ethtool.
+- `ci/check_napi_contract.sh`: NAPI budget, IRQ masking, and TX queue
+  hysteresis ordering.
+- `ci/check_no_panic_paths.sh`: no `unwrap`, `expect`, `panic!`,
+  runtime `assert!`, `unreachable!`, `todo!`, or `debug_assert!` in driver
+  Rust sources.
+- `ci/check_bare_metal_stack_teardown.sh`: heap in-place `NetdevState`
+  initialization and remove-before-devres teardown.
+- `ci/check_skb_ownership.sh`: `DriverOwnedSkb` linear ownership discipline.
+- `ci/check_cshim_loc_caps.sh`: bounded C shim translation units.
 
----
+Hardware validation should cover probe/remove, `rmmod` while up, sustained
+traffic, jumbo MTU, MSI/MSI-X and INTx fallback, ASPM/suspend/resume, error
+injection, and at least one bare-metal soak. Report concrete dates, kernel
+config, hardware, traffic profile, counters, and observed failures.
 
-(For the canonical full text of v2.0 with all 21 sections, see the original
-operator-supplied document — the operator stores it locally; this file
-captures the gist plus the rtl8125-rs-specific application notes above.
-When the full v2.0 text is needed verbatim — e.g. for a third-party
-reviewer — fetch it from the operator's source.)
+## Observability
+
+- Disposition counters are correctness evidence, not just telemetry:
+  `tx_received == tx_consumed + tx_busy_exception + tx_dropped_error` must
+  hold at quiesce.
+- Logs must be low-rate and actionable. Packet hot-path logging requires a
+  reviewed debug gate.
+- When possible, add counters or static checks instead of prose-only claims.
+
+## Firmware-Oriented Addendum
+
+If this code grows firmware/no-OS components, apply the stricter subset:
+
+- no heap unless explicitly budgeted and failure-tested;
+- bounded loops or watchdog-friendly progress points;
+- explicit panic strategy and no unwinding assumptions;
+- volatile MMIO wrappers for every register access;
+- documented endian, alignment, and packed-structure rules;
+- interrupt critical sections with bounded hold time;
+- deterministic startup/shutdown order and brownout/reset recovery behavior.
+
+## When In Doubt
+
+Re-read this file before touching `src/napi.rs`, `src/netdev.rs`,
+`src/pci.rs`, `src/skb.rs`, `src/unsafe_boundary.rs`, or the C shim.
+The safest driver code is boring: small ownership domains, explicit hardware
+contracts, static gates for the contract, and hardware evidence for claims.

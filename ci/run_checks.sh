@@ -35,6 +35,9 @@ echo
 echo "== clean implementation-contract docs =="
 bash "$CI/check_clean_contract_docs.sh" || rc=1
 echo
+echo "== no panic-style driver exits =="
+bash "$CI/check_no_panic_paths.sh" || rc=1
+echo
 echo "== bare-metal stack / teardown regression guard =="
 bash "$CI/check_bare_metal_stack_teardown.sh" || rc=1
 echo

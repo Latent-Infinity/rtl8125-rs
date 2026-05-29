@@ -87,7 +87,6 @@ impl DriverOwnedSkb {
     /// the cshim wrappers, which itself is the unsafe FFI surface.
     #[inline]
     pub(crate) fn from_raw(raw: *mut bindings::sk_buff) -> Self {
-        debug_assert!(!raw.is_null(), "DriverOwnedSkb::from_raw given null");
         Self { raw }
     }
 

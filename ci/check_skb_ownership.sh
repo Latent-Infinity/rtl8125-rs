@@ -15,7 +15,7 @@
 #   2. The consume helpers (`ub::skb_consume_tx`, `ub::skb_deliver_rx`,
 #      `ub::skb_free_error`) are only called from `src/skb.rs`. Direct
 #      use from `netdev.rs` / `napi.rs` would bypass the type wrapper.
-#   3. The `from_raw` constructor (debug-assert: non-null) is only
+#   3. The `from_raw` constructor (contract: non-null) is only
 #      called at the FFI entry points: `rust_xmit` and `skel_xmit` (the
 #      skeleton fallback). The RX path goes through `build_rx` /
 #      `from_raw_nullable` so failures surface as `Option::None`.
