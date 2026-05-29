@@ -19,6 +19,8 @@
  *
  * Lives in its own translation unit so `netdev_bridge.c` stays within
  * its 400-line review cap.
+ *
+ * Hard cap: 200 LOC. Enforced by ci/check_cshim_loc_caps.sh.
  */
 
 #include "netdev_bridge_internal.h"

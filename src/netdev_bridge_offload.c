@@ -11,6 +11,8 @@
  * (enum rtl_tx_desc_bit_1 lines 605-620, rtl_rx_desc_bit lines 622-638)
  * AND the Realtek vendor r8125_n.c source (r8125.h lines 1878-1892).
  * The two agree.
+ *
+ * Hard cap: 400 LOC. Enforced by ci/check_cshim_loc_caps.sh.
  */
 
 #include "netdev_bridge_internal.h"

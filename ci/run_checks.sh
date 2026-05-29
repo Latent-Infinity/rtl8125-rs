@@ -41,6 +41,9 @@ echo
 echo "== DriverOwnedSkb ownership discipline (task #62) =="
 bash "$CI/check_skb_ownership.sh" || rc=1
 echo
+echo "== cshim per-file LOC caps (task #63) =="
+bash "$CI/check_cshim_loc_caps.sh" || rc=1
+echo
 echo "== M6 design gates (skip vacuously until impl lands) =="
 bash "$CI/check_msix_static.sh" || rc=1
 bash "$CI/check_isr_v2_paired.sh" || rc=1

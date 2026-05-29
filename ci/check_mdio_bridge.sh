@@ -43,11 +43,4 @@ grep -q 'fn valid_mii_reg' "$R" \
   && ok "Rust MDIO entry points share validation/error helpers" \
   || bad "Rust MDIO entry points should use shared validation/error helpers"
 
-netdev_lines=$(wc -l < "$NETDEV_C")
-if [[ "$netdev_lines" -le 400 ]]; then
-  ok "netdev_bridge.c stays within 400-line review cap ($netdev_lines)"
-else
-  bad "netdev_bridge.c exceeds 400-line review cap ($netdev_lines)"
-fi
-
 exit $fail

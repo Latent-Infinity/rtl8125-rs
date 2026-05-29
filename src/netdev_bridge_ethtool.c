@@ -19,6 +19,8 @@
  * versions, and don't need a separate filesystem mount. The whole
  * surface is ~25 LOC, kept in this file to leave netdev_bridge.c
  * within its 400-line review cap.
+ *
+ * Hard cap: 200 LOC. Enforced by ci/check_cshim_loc_caps.sh.
  */
 
 #include "netdev_bridge_internal.h"

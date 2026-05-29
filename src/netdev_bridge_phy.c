@@ -4,6 +4,8 @@
  *
  * The C side owns mii_bus + phy_device because those kernel surfaces are
  * not stable Rust APIs yet. Rust owns the BAR and supplies MDIO callbacks.
+ *
+ * Hard cap: 300 LOC. Enforced by ci/check_cshim_loc_caps.sh.
  */
 
 #include "netdev_bridge_internal.h"

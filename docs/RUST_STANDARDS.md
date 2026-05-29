@@ -80,12 +80,12 @@ The following code paths are HOT and demand strict standards adherence:
 1. **`napi::poll`** — RX completion + TX completion reaping (per packet).
    - **Borrow over clone**: pass `&NetdevState`, never own.
    - **Iterator discipline**: walk RX/TX rings via index, no allocations.
-   - **Cache padding**: per-direction atomic indices (`tx_head/tail`,
-     `rx_tail`) must be cache-line padded (`CachePadded` equivalent) —
-     currently satisfied in `NetdevState`.
+   - **Cache padding**: per-direction atomic indices (`tx.head/tail`,
+     `rx.tail`) must be cache-line padded (`CachePadded` equivalent) —
+     currently satisfied in `TxRingState` / `RxRingState`.
    - **Static dispatch**: no `dyn Trait` in poll path.
 2. **`netdev::ndo_start_xmit`** — TX submission (per packet).
-   - Same cache-padding requirement on `tx_head`.
+   - Same cache-padding requirement on `tx.head`.
    - Pre-allocate TX shadow array (already done at probe — `[AtomicPtr; N]`).
 3. **`netdev::raw_irq_handler`** — IRQ handler (per interrupt).
    - Minimum work: read+ack ISR, mask further IRQs, schedule NAPI.
@@ -112,7 +112,8 @@ counters in lockstep; the wiring is enforced by
   `warning:`-prefixed lint. Skips cleanly when the validated
   toolchain (rustc-1.93 + clippy-driver-1.93) is absent.
 - `ci/check_cache_padding.sh` enforces that non-array `Atomic*` fields
-  in cross-context structs (currently `NetdevState`) are wrapped in
+  in cross-context state structs (`NetdevState`, `TxRingState`,
+  `RxRingState`, `IrqState`, `PhyState`) are wrapped in
   `CachePadded<...>` or carry an explicit `// NOT-PADDED:` annotation
   on a nearby comment line documenting why padding is unnecessary.
 - `ci/check_counter_infrastructure.sh` enforces that the six §6.3
