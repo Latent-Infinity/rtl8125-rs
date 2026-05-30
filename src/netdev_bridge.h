@@ -188,6 +188,11 @@ void r8125_bridge_unregister_and_free(struct net_device *ndev);
  */
 int r8125_bridge_irq_pin_cpu(unsigned int irq, int cpu);
 
+/* DMA read barrier after an RX descriptor's OWN bit clears. Mirrors
+ * r8169's rtl_rx ordering: descriptor fields and DMA-written bytes are
+ * not read until the device's OWN-clear publish is visible. */
+void r8125_bridge_dma_rmb(void);
+
 /* ──────────────────────────────────────────────────────────────────────
  *  Flow-control + NAPI-arming helpers — the §6.3 invariants live here.
  * ────────────────────────────────────────────────────────────────────── */

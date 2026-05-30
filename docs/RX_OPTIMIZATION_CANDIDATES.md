@@ -1,8 +1,7 @@
 # RX hot-path optimization candidates (post-#79)
 
-**Status (2026-05-30):** Candidates **A**, **B**, **F**, **G**
-SHIPPED on KVM (commits pending review). Candidate **C** deferred
-for ARM porting work. Candidate **H** skipped (LLVM likely elides
+**Status (2026-05-30):** Candidates **A**, **B**, **C**, **F**, **G**
+SHIPPED on KVM. Candidate **H** skipped (LLVM likely elides
 the bounds check; trade-off not worth `unsafe` surface for marginal
 gain). The decision tree at the bottom of this file is still active
 for the Gateway re-measurement (task #80) outcome — it determines
@@ -166,7 +165,7 @@ will).
 **Recommendation:** if Gateway shows residual gap, this is the
 biggest single-step win. Pair with Candidate A as one commit.
 
-## Candidate C — `dma_rmb()` barrier after OWN check ★★★
+## Candidate C — `dma_rmb()` barrier after OWN check ✅ shipped 2026-05-30
 
 **Effort: 5 minutes. Risk: zero. Expected gain: zero on x86, correctness on weak-ordering archs.**
 
@@ -193,9 +192,9 @@ check, which could read stale bytes.
 On x86 (TSO memory model) loads are not reordered with other
 loads, so this is purely a portability fix for ARM64/RISC-V.
 
-Add an `unsafe_boundary::dma_rmb()` wrapper (compiles to a NOP
-on x86, to `dmb ishld` on ARM), call between OWN check and
-the rest of the descriptor reads.
+Implemented as `unsafe_boundary::dma_rmb()`, backed by the cshim's
+`r8125_bridge_dma_rmb()` wrapper around Linux `dma_rmb()`. The static
+RX gate now requires it between the OWN check and descriptor length read.
 
 ## Candidate D — `napi_gro_frags` zero-copy ★★
 

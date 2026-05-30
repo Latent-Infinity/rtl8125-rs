@@ -93,6 +93,17 @@ process_rx_body=$(
 		in_fn && /^}/ { exit }
 	' "$napi_rs"
 )
+
+own_line=$(grep -n 'desc.opts1 & regs::DESC_OWN' <<<"$process_rx_body" | head -n1 | cut -d: -f1)
+rmb_line=$(grep -n 'ub::dma_rmb()' <<<"$process_rx_body" | head -n1 | cut -d: -f1)
+len_line=$(grep -n 'let len = (desc.opts1 & regs::DESC_LEN_MASK)' <<<"$process_rx_body" | head -n1 | cut -d: -f1)
+if [[ -n "$own_line" && -n "$rmb_line" && -n "$len_line" ]] \
+   && (( own_line < rmb_line && rmb_line < len_line )); then
+	grn "NAPI RX poll orders descriptor reads behind dma_rmb after OWN clears"
+else
+	red "NAPI RX poll must call ub::dma_rmb() after OWN clears and before descriptor field reads"
+fi
+
 if grep -q 'ub::bridge_rx_one_packet(' <<<"$process_rx_body"; then
 	grn "NAPI RX poll calls bridge_rx_one_packet super-call"
 else

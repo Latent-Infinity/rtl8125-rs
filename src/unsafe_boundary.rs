@@ -154,6 +154,7 @@ extern "C" {
     fn r8125_bridge_napi_schedule(ndev: *mut bindings::net_device);
     fn r8125_bridge_napi_complete_done(ndev: *mut bindings::net_device, work_done: c_int);
     fn r8125_bridge_irq_pin_cpu(irq: u32, cpu: c_int) -> c_int;
+    fn r8125_bridge_dma_rmb();
     fn r8125_bridge_tx_stop_queue(ndev: *mut bindings::net_device);
     fn r8125_bridge_tx_wake_queue(ndev: *mut bindings::net_device);
     fn r8125_bridge_tx_disable(ndev: *mut bindings::net_device);
@@ -593,6 +594,17 @@ pub(crate) fn bridge_napi_complete_done(ndev: *mut bindings::net_device, work_do
 pub(crate) fn bridge_irq_pin_cpu(irq: u32, cpu: c_int) -> c_int {
     // SAFETY: see fn-level contract.
     unsafe { r8125_bridge_irq_pin_cpu(irq, cpu) }
+}
+
+/// DMA read barrier for the RX descriptor OWN-bit handoff.
+///
+/// # SAFETY: the C shim calls Linux `dma_rmb()`, which has no pointer or
+/// ownership preconditions. The ordering contract is caller-side: call
+/// after the device clears OWN and before reading other descriptor fields
+/// or DMA-written bytes.
+pub(crate) fn dma_rmb() {
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_dma_rmb() };
 }
 
 pub(crate) fn bridge_tx_stop_queue(ndev: *mut bindings::net_device) {

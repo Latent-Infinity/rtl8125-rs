@@ -209,3 +209,16 @@ touching unsafe added.
 
 Candidate M (`tx_queue_len` 1000 → 256) is cshim-side only and
 introduces no Rust unsafe.
+
+## 2026-05-30 — RX descriptor dma_rmb bump 48 → 49
+
+Added `dma_rmb()` safe wrapper in `src/unsafe_boundary.rs`. Calls the
+new cshim `r8125_bridge_dma_rmb`, which invokes Linux `dma_rmb()` after
+the RX descriptor OWN bit clears and before Rust reads descriptor
+length/checksum fields or DMA-written bytes.
+
+This mirrors r8169's `rtl_rx` ordering and closes the weak-memory
+correctness gap documented as Candidate C in
+`docs/RX_OPTIMIZATION_CANDIDATES.md`. The helper has no pointer or
+ownership preconditions; the safety contract is ordering-only and is
+enforced by `ci/check_rx_skb_build.sh`.

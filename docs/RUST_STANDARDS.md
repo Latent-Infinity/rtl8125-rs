@@ -153,8 +153,9 @@ gate before or with the implementation. Current mandatory gates include:
 - `ci/check_napi_contract.sh`: NAPI budget, IRQ masking, and TX queue
   hysteresis ordering.
 - `ci/check_rx_skb_build.sh`: RX skb-build hot path uses the NAPI-local
-  allocator only from NAPI RX poll, and skb helpers without direct
-  `sk_buff` tail/len mutation.
+  allocator only from NAPI RX poll, uses skb helpers without direct
+  `sk_buff` tail/len mutation, and orders post-OWN descriptor reads behind
+  the DMA read barrier.
 - `ci/check_no_panic_paths.sh`: no `unwrap`, `expect`, `panic!`,
   runtime `assert!`, `unreachable!`, `todo!`, or `debug_assert!` in driver
   Rust sources.

@@ -105,6 +105,10 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
         if desc.opts1 & regs::DESC_OWN != 0 {
             break;
         }
+        // Pair with the device's OWN-clear publish before reading
+        // descriptor fields or the DMA buffer contents. r8169 uses
+        // the same dma_rmb() barrier after DescOwn clears.
+        ub::dma_rmb();
         // Lower 14 bits of opts1 are the RX frame length (incl. CRC; chip
         // typically strips CRC — same convention as r8169). Cap at the
         // buffer size for safety.

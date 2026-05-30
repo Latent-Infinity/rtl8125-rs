@@ -26,6 +26,7 @@
 #include <linux/interrupt.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
+#include <asm/barrier.h>
 
 #define BRIDGE_NAPI_WEIGHT	64
 
@@ -279,6 +280,12 @@ int r8125_bridge_irq_pin_cpu(unsigned int irq, int cpu)
 	return irq_set_affinity_and_hint(irq, cpumask_of(cpu));
 }
 EXPORT_SYMBOL_GPL(r8125_bridge_irq_pin_cpu);
+
+void r8125_bridge_dma_rmb(void)
+{
+	dma_rmb();
+}
+EXPORT_SYMBOL_GPL(r8125_bridge_dma_rmb);
 
 /* ── Flow-control + NAPI helpers ────────────────────────────────────── */
 
