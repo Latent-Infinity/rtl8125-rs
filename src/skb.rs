@@ -4,20 +4,21 @@
 //! ## DriverOwnedSkb (task #62, 2026-05-29)
 //!
 //! [`DriverOwnedSkb`] is the minimum-viable domain type at the
-//! `*mut bindings::sk_buff` ↔ Rust boundary. It is the type returned by
-//! `bridge_skb_build_rx` (RX path) and the type into which the
-//! `rust_xmit` callback's raw skb pointer is immediately wrapped (TX
-//! path). Every skb operation the driver performs goes through one of
-//! its inherent methods — `dma_map_linear`, `dma_map_frag`,
-//! `tso_setup`, `tx_csum_opts`, `rx_csum_set`, `nr_frags` — so the
-//! underlying raw pointer never leaks into arbitrary Rust code.
+//! `*mut bindings::sk_buff` <-> Rust boundary. The RX path is handled
+//! entirely inside the C shim by `r8125_bridge_rx_one_packet`, so this
+//! wrapper now covers the TX ownership path: the `rust_xmit` callback's
+//! raw skb pointer is immediately wrapped, mapped, either submitted to
+//! the TX ring or freed, and later consumed by the TX reaper. Every TX
+//! skb operation the Rust driver performs goes through one of its
+//! inherent methods — `dma_map_linear`, `dma_map_frag`, `tso_setup`,
+//! `tx_csum_opts`, `nr_frags` — so the underlying raw pointer never
+//! leaks into arbitrary Rust code.
 //!
-//! Consumption is by-value: exactly one of [`DriverOwnedSkb::deliver_rx`]
-//! / [`DriverOwnedSkb::consume_tx`] / [`DriverOwnedSkb::free_with_error`] /
-//! [`DriverOwnedSkb::into_raw`] disposes of the wrapper. The `#[must_use]`
-//! attribute warns at compile time when a value is dropped without being
-//! consumed; that path is also a kmemleak-visible skb leak in the
-//! debug+Rust guest kernel.
+//! Consumption is by-value: exactly one of [`DriverOwnedSkb::consume_tx`],
+//! [`DriverOwnedSkb::free_with_error`], or [`DriverOwnedSkb::into_raw`]
+//! disposes of the wrapper. The `#[must_use]` attribute warns at compile
+//! time when a value is dropped without being consumed; that path is also
+//! a kmemleak-visible skb leak in the debug+Rust guest kernel.
 //!
 //! ## What §6.3 type-state lands here later (refactor pending — M5)
 //!
@@ -36,8 +37,8 @@
 //! M5 follow-up alongside the NAPI-stability work (plan §7 M5), where
 //! the type discipline pays its rent in
 //! `tx_received == tx_consumed + tx_busy_exception + tx_dropped_error`
-//! correctness under load. [`DriverOwnedSkb`] is the entry point both
-//! state machines build on.
+//! correctness under load. [`DriverOwnedSkb`] is the entry point for
+//! that TX state machine.
 
 use kernel::bindings;
 use kernel::error::Result;
@@ -48,22 +49,22 @@ use kernel::sync::aref::ARef;
 use crate::unsafe_boundary as ub;
 
 /// An `sk_buff` the driver owns exclusively for the duration of the
-/// borrow. Wraps the raw `*mut bindings::sk_buff` returned by either
-/// `bridge_skb_build_rx` (RX) or received as a parameter by the
-/// `rust_xmit` callback (TX).
+/// borrow. Wraps the raw `*mut bindings::sk_buff` received as a
+/// parameter by the `rust_xmit` callback, or reclaimed from a TX shadow
+/// slot on completion/rollback.
 ///
 /// **Consumption discipline.** Exactly one of the methods marked
 /// `(consumes)` below MUST be called on every value, or the skb leaks
 /// (`#[must_use]` warns at compile time, kmemleak catches the leak at
 /// runtime). The intermediate borrow methods (`dma_map_*`, `tso_setup`,
-/// `tx_csum_opts`, `nr_frags`, `rx_csum_set`) take `&self` so the
+/// `tx_csum_opts`, `nr_frags`) take `&self` so the
 /// caller can compose them before deciding the disposition.
 ///
 /// **Hot path.** Constructor + Drop are zero-cost: the wrapper is a
 /// `repr(transparent)` newtype around `*mut sk_buff`. All method bodies
 /// are one-line forwards to `unsafe_boundary` — `#[inline]` makes them
 /// fold into the call site.
-#[must_use = "DriverOwnedSkb must be consumed via deliver_rx / consume_tx / free_with_error / into_raw"]
+#[must_use = "DriverOwnedSkb must be consumed via consume_tx / free_with_error / into_raw"]
 #[repr(transparent)]
 pub(crate) struct DriverOwnedSkb {
     raw: *mut bindings::sk_buff,
@@ -75,24 +76,21 @@ impl DriverOwnedSkb {
     /// # SAFETY contract (caller-side, since this leaves `unsafe_boundary`)
     ///
     /// `raw` must be a non-null `*mut sk_buff` for which the driver
-    /// holds the sole reference. The two callers are:
-    ///
-    /// 1. The `rust_xmit` callback — kernel hands ownership in.
-    /// 2. The NAPI poll RX path — `bridge_skb_build_rx` just returned
-    ///    a fresh allocation (caller must check non-null first via
-    ///    [`from_raw_nullable`]).
+    /// holds the sole reference. The direct callers are FFI xmit entry
+    /// points where the kernel has handed ownership to the driver.
     ///
     /// `from_raw` is named without `unsafe` because the only way to
-    /// obtain a `*mut sk_buff` outside `unsafe_boundary` is from one of
-    /// the cshim wrappers, which itself is the unsafe FFI surface.
+    /// obtain a `*mut sk_buff` outside `unsafe_boundary` is from a
+    /// kernel callback argument or from a TX shadow slot previously
+    /// populated by [`Self::into_raw`].
     #[inline]
     pub(crate) fn from_raw(raw: *mut bindings::sk_buff) -> Self {
         Self { raw }
     }
 
-    /// Wrap a possibly-null result from `bridge_skb_build_rx`. Returns
-    /// `None` on null; the caller remains responsible for the RX error
-    /// counter because no skb exists to consume.
+    /// Wrap a possibly-null TX shadow pointer. Returns `None` for empty
+    /// slots; otherwise the caller has reclaimed the disposition
+    /// obligation and must consume the wrapper.
     #[inline]
     pub(crate) fn from_raw_nullable(raw: *mut bindings::sk_buff) -> Option<Self> {
         if raw.is_null() {
@@ -100,25 +98,6 @@ impl DriverOwnedSkb {
         } else {
             Some(Self { raw })
         }
-    }
-
-    /// Construct a freshly-built RX skb wrapping `len` bytes copied from
-    /// `buf`. Returns `None` on cshim allocation failure (caller must
-    /// account that via `rx_drop_error`).
-    ///
-    /// NAPI RX path only: the cshim uses `napi_alloc_skb`, so callers must
-    /// already be running from `napi::poll` / `process_rx_completions`.
-    ///
-    /// This is the typed entry point for the NAPI RX path; together
-    /// with `rust_xmit`'s direct `from_raw` it makes the two call sites
-    /// where the driver acquires a `DriverOwnedSkb` explicit.
-    #[inline]
-    pub(crate) fn build_rx(
-        ndev: *mut bindings::net_device,
-        buf: *const core::ffi::c_void,
-        len: usize,
-    ) -> Option<Self> {
-        Self::from_raw_nullable(ub::skb_build_rx(ndev, buf, len))
     }
 
     /// Number of paged fragments (TX path). 0 for linear-only skbs.
@@ -175,14 +154,6 @@ impl DriverOwnedSkb {
         Ok((handle, len))
     }
 
-    /// Inspect the RX descriptor's `opts1` and set `skb->ip_summed` if
-    /// the chip validated the L4 checksum. No-op if the descriptor
-    /// reports no L4 CSUM result or any fail bit.
-    #[inline]
-    pub(crate) fn rx_csum_set(&self, desc_opts1: u32) {
-        ub::skb_rx_csum_set(self.raw, desc_opts1);
-    }
-
     /// Borrow the underlying raw pointer without consuming the wrapper.
     /// Used for the per-TX-slot shadow store inside the fragment-map
     /// loop, where the SAME skb pointer is the disposition obligation
@@ -214,13 +185,6 @@ impl DriverOwnedSkb {
         self.raw
     }
 
-    /// `(consumes)` Hand off to GRO. §6.3 RX disposition (a).
-    /// `rx_handed_to_stack++` happens inside the cshim helper.
-    #[inline]
-    pub(crate) fn deliver_rx(self, napi: *mut bindings::napi_struct) {
-        ub::skb_deliver_rx(napi, self.raw);
-    }
-
     /// `(consumes)` TX completion path — give the skb back to NAPI
     /// for recycling. §6.3 TX disposition (a). `tx_consumed++` happens
     /// inside the cshim helper.
@@ -231,10 +195,6 @@ impl DriverOwnedSkb {
 
     /// `(consumes)` TX error disposition — `dev_kfree_skb_any` under
     /// the hood and `tx_dropped_error++` inside the cshim helper.
-    ///
-    /// RX allocation failures have no skb to free and must use
-    /// `rx_drop_error(ndev)` directly. A future RX-owned error wrapper
-    /// can route through the cshim's dedicated RX drop helper.
     #[inline]
     pub(crate) fn free_with_error(self) {
         ub::skb_free_error(self.raw);

@@ -153,7 +153,7 @@ extern "C" {
 
     fn r8125_bridge_napi_schedule(ndev: *mut bindings::net_device);
     fn r8125_bridge_napi_complete_done(ndev: *mut bindings::net_device, work_done: c_int);
-    fn r8125_bridge_napi(ndev: *mut bindings::net_device) -> *mut bindings::napi_struct;
+    fn r8125_bridge_irq_pin_cpu(irq: u32, cpu: c_int) -> c_int;
     fn r8125_bridge_tx_stop_queue(ndev: *mut bindings::net_device);
     fn r8125_bridge_tx_wake_queue(ndev: *mut bindings::net_device);
     fn r8125_bridge_tx_disable(ndev: *mut bindings::net_device);
@@ -170,21 +170,9 @@ extern "C" {
         len: usize,
     );
     fn r8125_bridge_tx_busy_exception(ndev: *mut bindings::net_device);
-    fn r8125_bridge_skb_build_rx(
-        ndev: *mut bindings::net_device,
-        buf: *const c_void,
-        len: usize,
-    ) -> *mut bindings::sk_buff;
-    fn r8125_bridge_skb_deliver_rx(
-        napi: *mut bindings::napi_struct,
-        skb: *mut bindings::sk_buff,
-    );
-    fn r8125_bridge_rx_drop_error(ndev: *mut bindings::net_device);
 
     // ── HW checksum offload + stats (M4-perf, task 48) ──────────────────
     fn r8125_bridge_skb_tx_csum_opts(skb: *mut bindings::sk_buff) -> u32;
-    fn r8125_bridge_skb_rx_csum_set(skb: *mut bindings::sk_buff, desc_opts1: u32);
-    fn r8125_bridge_account_rx(ndev: *mut bindings::net_device, bytes: u32);
 
     // ── Scatter-gather + TSO (M4-perf phase 2, task 49) ─────────────────
     fn r8125_bridge_skb_nr_frags(skb: *mut bindings::sk_buff) -> u32;
@@ -231,14 +219,16 @@ extern "C" {
         cpu: *mut c_void,
         dma: bindings::dma_addr_t,
     );
-    fn r8125_bridge_rx_sync_for_cpu(
-        dev: *mut bindings::device,
+
+    // RX super-call (Candidate B, RX_OPTIMIZATION_CANDIDATES.md §B).
+    // Collapses 5 per-packet FFI crossings into 1. On allocation
+    // failure, the cshim bumps rx_dropped_error and re-syncs for device.
+    fn r8125_bridge_rx_one_packet(
+        ndev: *mut bindings::net_device,
         dma: bindings::dma_addr_t,
+        buf: *const core::ffi::c_void,
         len: usize,
-    );
-    fn r8125_bridge_rx_sync_for_device(
-        dev: *mut bindings::device,
-        dma: bindings::dma_addr_t,
+        desc_opts1: u32,
     );
 }
 
@@ -441,28 +431,25 @@ pub(crate) fn rx_free_jumbo(
     unsafe { r8125_bridge_rx_free_jumbo(dev, cpu, dma) };
 }
 
-/// Sync the slot's DMA mapping FOR THE CPU before NAPI reads `len`
-/// bytes. No-op on cache-coherent archs; required on ARM/RISC-V.
-pub(crate) fn rx_sync_for_cpu(
-    pdev: &kernel::sync::aref::ARef<pci::Device>,
+/// RX super-call: sync_for_cpu + skb build + csum set + napi_gro_receive +
+/// sync_for_device, all inside one cshim function. Saves 4 FFI crossings
+/// per RX packet vs the previous Rust-side chain. See
+/// `docs/RX_OPTIMIZATION_CANDIDATES.md` §B.
+///
+/// # SAFETY: `ndev` is the registered net_device (lifetime via
+/// `NetdevHandle`); `dma` came from a prior `rx_alloc_jumbo`; `buf`
+/// is the slot's CPU-side virtual address from the same allocation;
+/// `len` ≤ chip-reported frame length, ≤ `JUMBO_16K_BYTES`.
+/// Callable only from NAPI poll context.
+pub(crate) fn bridge_rx_one_packet(
+    ndev: *mut bindings::net_device,
     dma: bindings::dma_addr_t,
+    buf: *const core::ffi::c_void,
     len: usize,
+    desc_opts1: u32,
 ) {
-    let dev = bridge_dma_device(pdev);
-    // SAFETY: `dma` was returned from a prior `rx_alloc_jumbo` on the
-    // same `pdev`; `len` is bounded by the chip-reported frame length
-    // which is capped at `JUMBO_16K_BYTES` by the chip's RxMaxSize.
-    unsafe { r8125_bridge_rx_sync_for_cpu(dev, dma, len) };
-}
-
-/// Sync FOR THE DEVICE before the slot's descriptor is re-posted.
-pub(crate) fn rx_sync_for_device(
-    pdev: &kernel::sync::aref::ARef<pci::Device>,
-    dma: bindings::dma_addr_t,
-) {
-    let dev = bridge_dma_device(pdev);
-    // SAFETY: as `rx_sync_for_cpu`.
-    unsafe { r8125_bridge_rx_sync_for_device(dev, dma) };
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_rx_one_packet(ndev, dma, buf, len, desc_opts1) };
 }
 
 // ── NetdevState pointer-juggling helpers (keep unsafe in this file) ──────
@@ -581,29 +568,6 @@ pub(crate) fn tx_busy_exception(ndev: *mut bindings::net_device) {
     unsafe { r8125_bridge_tx_busy_exception(ndev) };
 }
 
-pub(crate) fn skb_build_rx(
-    ndev: *mut bindings::net_device,
-    buf: *const c_void,
-    len: usize,
-) -> *mut bindings::sk_buff {
-    // SAFETY: NAPI RX path only. The cshim uses napi_alloc_skb on the
-    // net_device's embedded napi_struct, so this must be reached from
-    // napi::poll after rx_sync_for_cpu. The caller guarantees `buf..buf+len`
-    // is CPU-readable and `len <= RX_BUF_LEN`.
-    unsafe { r8125_bridge_skb_build_rx(ndev, buf, len) }
-}
-
-pub(crate) fn skb_deliver_rx(napi: *mut bindings::napi_struct, skb: *mut bindings::sk_buff) {
-    // SAFETY: napi is the bridge's napi_struct (still alive in the poll
-    // call); skb was just built by skb_build_rx — driver-owned.
-    unsafe { r8125_bridge_skb_deliver_rx(napi, skb) };
-}
-
-pub(crate) fn rx_drop_error(ndev: *mut bindings::net_device) {
-    // SAFETY: ndev is alive and registered while NAPI poll runs.
-    unsafe { r8125_bridge_rx_drop_error(ndev) };
-}
-
 // ── NAPI / queue / carrier helpers ────────────────────────────────────────
 
 pub(crate) fn bridge_napi_schedule(ndev: *mut bindings::net_device) {
@@ -617,10 +581,18 @@ pub(crate) fn bridge_napi_complete_done(ndev: *mut bindings::net_device, work_do
     unsafe { r8125_bridge_napi_complete_done(ndev, work_done) };
 }
 
-pub(crate) fn bridge_napi(ndev: *mut bindings::net_device) -> *mut bindings::napi_struct {
-    // SAFETY: cshim returns &napi_struct embedded in the bridge state
-    // which has the same lifetime as the netdev.
-    unsafe { r8125_bridge_napi(ndev) }
+/// Suggest IRQ CPU affinity for the chip's MSI-X / MSI / INTx vector.
+/// Latency-aligned default (Candidate L of
+/// `docs/RX_OPTIMIZATION_CANDIDATES.md`). Best-effort: the kernel may
+/// override the hint via `/proc/irq/N/smp_affinity` or `irqbalance`
+/// policy. Returns the kernel errno (0 on success).
+///
+/// # SAFETY: trivial — calling kernel `irq_set_affinity_and_hint` via
+/// a cshim wrapper that builds the cpumask itself. No Rust lifetime
+/// concerns.
+pub(crate) fn bridge_irq_pin_cpu(irq: u32, cpu: c_int) -> c_int {
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_irq_pin_cpu(irq, cpu) }
 }
 
 pub(crate) fn bridge_tx_stop_queue(ndev: *mut bindings::net_device) {
@@ -777,28 +749,6 @@ pub(crate) fn skb_free_error(skb: *mut bindings::sk_buff) {
 pub(crate) fn skb_tx_csum_opts(skb: *mut bindings::sk_buff) -> u32 {
     // SAFETY: see fn-level contract.
     unsafe { r8125_bridge_skb_tx_csum_opts(skb) }
-}
-
-/// Inspect the RX descriptor's `opts1` and set `skb->ip_summed` if the
-/// chip validated the checksum. No-op if the descriptor reports no L4
-/// CSUM result or any fail bit.
-///
-/// # SAFETY: `skb` was just built by `skb_build_rx`; the driver holds
-/// the unique reference.
-pub(crate) fn skb_rx_csum_set(skb: *mut bindings::sk_buff, desc_opts1: u32) {
-    // SAFETY: see fn-level contract.
-    unsafe { r8125_bridge_skb_rx_csum_set(skb, desc_opts1) };
-}
-
-/// Bump `netdev->stats.rx_{packets,bytes}` after a successfully built
-/// + delivered skb. Called from NAPI poll RX path.
-///
-/// # SAFETY: `ndev` is the registered net_device; lifetime is bounded
-/// by `NetdevHandle::drop` which unregisters before the kernel-side
-/// `struct net_device` memory is freed.
-pub(crate) fn bridge_account_rx(ndev: *mut bindings::net_device, bytes: u32) {
-    // SAFETY: see fn-level contract.
-    unsafe { r8125_bridge_account_rx(ndev, bytes) };
 }
 
 // ── Scatter-gather + TSO safe wrappers (M4-perf phase 2, task 49) ───────

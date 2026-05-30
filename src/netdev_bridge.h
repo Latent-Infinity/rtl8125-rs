@@ -179,6 +179,15 @@ int r8125_bridge_register(struct net_device *ndev);
  * register; do not also call free() afterwards. */
 void r8125_bridge_unregister_and_free(struct net_device *ndev);
 
+/*
+ * Pin the MSI-X (or MSI/INTx) vector `irq` to `cpu` via
+ * `irq_set_affinity_and_hint`. Latency-aligned default
+ * (Candidate L of RX_OPTIMIZATION_CANDIDATES.md). Returns 0 on
+ * success or a negative errno; the kernel auto-clears the hint at
+ * `free_irq`.
+ */
+int r8125_bridge_irq_pin_cpu(unsigned int irq, int cpu);
+
 /* ──────────────────────────────────────────────────────────────────────
  *  Flow-control + NAPI-arming helpers — the §6.3 invariants live here.
  * ────────────────────────────────────────────────────────────────────── */
@@ -231,16 +240,26 @@ void r8125_bridge_skb_dma_unmap_frag_tx(struct device *dev,
  *  mainline's per-slot strategy. Implementation: netdev_bridge_rx_pool.c.
  *
  *  Lifecycle: `ndo_open` calls `rx_alloc_jumbo` per ring slot; `ndo_stop`
- *  calls `rx_free_jumbo` for each. The sync calls live on the NAPI poll
- *  RX path (before/after the CPU touches the slot's bytes).
+ *  calls `rx_free_jumbo` for each. The NAPI RX super-call below owns the
+ *  streaming-DMA sync discipline while copying bytes out of a completed
+ *  slot.
  * ────────────────────────────────────────────────────────────────────── */
 int  r8125_bridge_rx_alloc_jumbo(struct device *dev, void **out_cpu,
 				 dma_addr_t *out_dma);
 void r8125_bridge_rx_free_jumbo(struct device *dev, void *cpu,
 				dma_addr_t dma);
-void r8125_bridge_rx_sync_for_cpu(struct device *dev, dma_addr_t dma,
-				   size_t len);
-void r8125_bridge_rx_sync_for_device(struct device *dev, dma_addr_t dma);
+
+/*
+ * `r8125_bridge_rx_one_packet` — RX super-call (Candidate B,
+ * docs/RX_OPTIMIZATION_CANDIDATES.md). Collapses sync_for_cpu +
+ * skb_build_rx + skb_rx_csum_set + skb_deliver_rx + sync_for_device
+ * (5 FFI crossings) into 1 cshim call per RX packet. Bumps
+ * `rx_dropped_error` internally if skb allocation fails. Callable only
+ * from NAPI poll context.
+ */
+void r8125_bridge_rx_one_packet(struct net_device *ndev,
+				dma_addr_t dma, const void *buf,
+				size_t len, u32 desc_opts1);
 
 /*
  * Free an skb on the TX-error path (validation reject, DMA-map failure,
@@ -254,32 +273,6 @@ void r8125_bridge_skb_free_error(struct sk_buff *skb);
 /* Count a NETDEV_TX_BUSY return where the kernel retains skb ownership.
  * Call only on the documented exceptional ring-full race path. */
 void r8125_bridge_tx_busy_exception(struct net_device *ndev);
-
-/*
- * Build an skb wrapping a freshly-DMA'd RX buffer. Pre-allocated by the
- * driver at ndo_open and never reused while hardware has it — see §6.3
- * RX-path table.
- *
- * Pre   : `buf` is CPU-readable after the Rust RX path has called
- *         `r8125_bridge_rx_sync_for_cpu` for this streaming DMA slot;
- *         `len` is the valid byte count.
- * Post  : returns a new skb whose linear data is a copy of `buf`.
- *         Page-pool / `napi_build_skb` zero-copy can replace this later.
- *         Returns NULL on alloc failure (rare).
- *
- * Counter: NO change here. The disposition counter increments when the
- *          skb is handed to the stack (`rx_handed_to_stack`) or freed
- *          on error (`rx_dropped_error`).
- */
-struct sk_buff *r8125_bridge_skb_build_rx(struct net_device *ndev,
-					  const void *buf, size_t len);
-
-/*
- * Hand the skb to the network stack via `napi_gro_receive`. This is the
- * §6.3 step-4 transfer that is unconditional — no failure return that
- * requires the caller to free. Counter: rx_handed_to_stack++.
- */
-void r8125_bridge_skb_deliver_rx(struct napi_struct *napi, struct sk_buff *skb);
 
 /* ──────────────────────────────────────────────────────────────────────
  *  HW checksum offload (M4-perf, task 48).
@@ -322,11 +315,10 @@ u32 r8125_bridge_skb_tx_csum_opts(struct sk_buff *skb);
  */
 void r8125_bridge_skb_rx_csum_set(struct sk_buff *skb, u32 desc_opts1);
 
-/* Bump netdev->stats from inside the cshim. The Rust hot-path
- * doesn't have access to `struct net_device` members; counter
- * mutation lives here. */
+/* Bump TX netdev stats from inside the cshim. RX accounting lives in
+ * `r8125_bridge_rx_one_packet`, next to `napi_gro_receive`, so the
+ * Rust RX hot path makes a single cshim call per packet. */
 void r8125_bridge_account_tx(struct net_device *ndev, unsigned int bytes);
-void r8125_bridge_account_rx(struct net_device *ndev, unsigned int bytes);
 
 /* ──────────────────────────────────────────────────────────────────────
  *  Scatter-gather TX + TSO (M4-perf phase 2, task #49).
@@ -364,14 +356,6 @@ bool r8125_bridge_skb_tso_setup(struct sk_buff *skb,
  * from skb->len and hands the skb back to NAPI for recycling. */
 void r8125_bridge_skb_consume_tx(struct net_device *ndev, struct sk_buff *skb);
 
-/* Free an skb on the RX-error path (e.g. CRC error, truncated). Counter:
- * rx_dropped_error++. */
-void r8125_bridge_skb_drop_rx(struct sk_buff *skb);
-
-/* Count an RX drop when no skb exists to free (for example allocation
- * failure in r8125_bridge_skb_build_rx). */
-void r8125_bridge_rx_drop_error(struct net_device *ndev);
-
 /* ──────────────────────────────────────────────────────────────────────
  *  Counter snapshot — §6.3 invariant `tx_received == tx_consumed +
  *  tx_busy_exception + tx_dropped_error`. CI smoke test reads this at
@@ -387,10 +371,6 @@ struct r8125_bridge_counters {
 };
 void r8125_bridge_counters_snapshot(struct net_device *ndev,
 				    struct r8125_bridge_counters *out);
-
-/* Accessor for the `napi_struct` embedded in the bridge — needed by Rust
- * to call `r8125_bridge_skb_deliver_rx` from the poll callback. */
-struct napi_struct *r8125_bridge_napi(struct net_device *ndev);
 
 /* ──────────────────────────────────────────────────────────────────────
  *  PHY plumbing (plan §7 M4-traffic, task #46).

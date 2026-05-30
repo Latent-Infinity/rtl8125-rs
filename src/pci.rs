@@ -289,6 +289,31 @@ impl pci::Driver for R8125Driver {
                         if intx_only { ", forced by intx_only" } else { "" }
                     );
 
+                    // Candidate L (RX_OPTIMIZATION_CANDIDATES.md §L):
+                    // suggest CPU affinity for the IRQ. Pin to CPU 0
+                    // by default — irqbalance + operator can override
+                    // via /proc/irq/N/smp_affinity. Reduces tail-latency
+                    // spikes from softirq cross-CPU migration AND keeps
+                    // the per-CPU NAPI page-frag cache warm. Best-effort:
+                    // if the kernel rejects (e.g. CPU 0 offline), we
+                    // log and proceed — the driver still works.
+                    let pin_rc = unsafe_boundary::bridge_irq_pin_cpu(
+                        irq_num as u32, 0,
+                    );
+                    if pin_rc == 0 {
+                        dev_info!(
+                            pdev,
+                            "RTL8125 IRQ {} affinity hint set to CPU 0\n",
+                            irq_num
+                        );
+                    } else {
+                        dev_info!(
+                            pdev,
+                            "RTL8125 IRQ {} affinity hint failed: rc={} (driver still functional)\n",
+                            irq_num, pin_rc
+                        );
+                    }
+
                     // Tier 3c: `aspm_force_off=1` operator intent.
                     // Chip-side ASPM is already disabled by default
                     // (`force_aspm=0` clears Config5 ASPM_en in

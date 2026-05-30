@@ -4,21 +4,20 @@
 # Static gate for the `DriverOwnedSkb` type discipline (task #62).
 #
 # The wrapper enforces linear ownership of `*mut bindings::sk_buff` between
-# the FFI boundary (where the kernel hands us the pointer, or where the
-# cshim builds a new skb for us) and the consume site (one of
-# `consume_tx`, `deliver_rx`, `free_with_error`, or `into_raw`). The
+# the FFI boundary (where the kernel hands us a TX skb pointer) and the
+# consume site (one of `consume_tx`, `free_with_error`, or `into_raw`). The
 # gates below catch regressions that would break the invariants:
 #
 #   1. The struct is `#[must_use]` and `#[repr(transparent)]`, with no
 #      `Drop` impl (a `Drop` would mask leaks instead of surfacing them
 #      via `#[must_use]` / kmemleak).
-#   2. The consume helpers (`ub::skb_consume_tx`, `ub::skb_deliver_rx`,
-#      `ub::skb_free_error`) are only called from `src/skb.rs`. Direct
+#   2. The consume helpers (`ub::skb_consume_tx`, `ub::skb_free_error`)
+#      are only called from `src/skb.rs`. Direct
 #      use from `netdev.rs` / `napi.rs` would bypass the type wrapper.
 #   3. The `from_raw` constructor (contract: non-null) is only
 #      called at the FFI entry points: `rust_xmit` and `skel_xmit` (the
-#      skeleton fallback). The RX path goes through `build_rx` /
-#      `from_raw_nullable` so failures surface as `Option::None`.
+#      skeleton fallback). The TX reaper uses `from_raw_nullable` when it
+#      swaps optional shadow slots.
 #   4. Every public method on the wrapper carries a doc comment so the
 #      consumes / borrows contract is visible at the call site.
 #
@@ -59,7 +58,7 @@ fi
 # site bypasses the type wrapper. The dead-code `skel_xmit` is allowed
 # to use `from_raw` + `free_with_error` (which routes through skb.rs).
 violation=0
-for fn in skb_consume_tx skb_deliver_rx skb_free_error; do
+for fn in skb_consume_tx skb_free_error; do
 	# Allow calls only in skb.rs (where the wrapper delegates) and in
 	# unsafe_boundary.rs (which exposes the raw FFI wrapper).
 	hits=$(grep -hE "ub::${fn}\(" "$NETDEV" "$NAPI" 2>/dev/null | wc -l)
@@ -69,12 +68,13 @@ for fn in skb_consume_tx skb_deliver_rx skb_free_error; do
 	fi
 done
 if [[ "$violation" -eq 0 ]]; then
-	grn "consume helpers (skb_consume_tx / deliver_rx / free_with_error) only flow through DriverOwnedSkb"
+	grn "consume helpers (skb_consume_tx / free_with_error) only flow through DriverOwnedSkb"
 fi
 
 # 3. Direct `from_raw` use is restricted to the FFI entry points
-# (`rust_xmit`, `skel_xmit`). All other acquisitions go via
-# `build_rx` (RX path) or `from_raw_nullable` (TX reaper, ndo_stop reap).
+# (`rust_xmit`, `skel_xmit`). TX shadow reclaims use
+# `from_raw_nullable` because intermediate SG slots intentionally carry
+# a null skb pointer.
 from_raw_callers=$(grep -hnE 'DriverOwnedSkb::from_raw\(' "$NETDEV" "$NAPI" 2>/dev/null | wc -l)
 expected=$(awk '
 	/extern "C" fn (rust_xmit|skel_xmit)/{ in_fn=1 }

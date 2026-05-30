@@ -16,22 +16,25 @@
  * page chunk (`R8125_RX_PAGE_ORDER = 2`, so 4 × PAGE_SIZE on x86)
  * dma-mapped FROM_DEVICE. Rust holds the CPU pointer + DMA handle in its
  * `RxSlot` shadow; the caller frees the pair via
- * `r8125_bridge_rx_free_jumbo`. The intermediate dma_sync helpers exist
- * for the streaming-DMA discipline (`dma_sync_single_for_cpu` before the
- * NAPI poll reads the slot's bytes, `dma_sync_single_for_device` before
- * the descriptor is re-posted). On cache-coherent archs (x86, x86_64
- * with IOMMU off) the sync calls are no-ops, but keeping them in the
- * source makes the discipline visible and lets the same code work on
- * ARM/RISC-V.
+ * `r8125_bridge_rx_free_jumbo`. The NAPI RX super-call below performs
+ * the streaming-DMA ownership transitions (`dma_sync_single_for_cpu`
+ * before copying bytes, `dma_sync_single_for_device` before the slot is
+ * re-posted). On cache-coherent archs (x86, x86_64 with IOMMU off) the
+ * sync calls are no-ops, but keeping them in the source makes the
+ * discipline visible and lets the same code work on ARM/RISC-V.
  *
- * Hard cap: this file stays under 200 LOC. Anything bigger gets split.
+ * Hard cap: 200 LOC. Enforced by ci/check_cshim_loc_caps.sh. The RX
+ * super-call lives here because it owns the RX streaming-DMA syncs.
  */
 
 #include "netdev_bridge_internal.h"
 
 #include <linux/dma-mapping.h>
+#include <linux/etherdevice.h>
 #include <linux/gfp.h>
 #include <linux/mm.h>
+#include <linux/prefetch.h>
+#include <linux/skbuff.h>
 
 /*
  * `R8125_RX_PAGE_ORDER` covers `JUMBO_16K_BYTES = 16384`. Must equal
@@ -115,35 +118,56 @@ void r8125_bridge_rx_free_jumbo(struct device *dev, void *cpu, dma_addr_t dma)
 EXPORT_SYMBOL_GPL(r8125_bridge_rx_free_jumbo);
 
 /*
- * `r8125_bridge_rx_sync_for_cpu` — call BEFORE the NAPI poll reads
- *                                  RX bytes for a completed slot.
+ * `r8125_bridge_rx_one_packet` — RX super-call (Candidate B of
+ *                                docs/RX_OPTIMIZATION_CANDIDATES.md).
  *
- * Streaming-DMA discipline: the chip wrote bytes via DMA, so the CPU
- * cache may hold stale lines for that address range. `dma_sync` flushes
- * the cache (or no-op on coherent archs). `len` is the chip-reported
- * frame length so we only sync the portion that was actually written.
+ * Collapses the five previous FFI crossings per RX packet
+ * (sync_for_cpu → skb_build_rx → skb_rx_csum_set → skb_deliver_rx →
+ * sync_for_device) into a single C function. At MTU 1500 line rate
+ * (~166 K pps) this saves ~660 K boundary crossings/second.
+ *
+ * Same idiomatic shape r8169_main.c `rtl_rx` uses inline; the
+ * difference is that we expose it as one exported entry point to
+ * the Rust NAPI poll caller. If skb allocation fails, this function
+ * bumps the §6.3 `rx_dropped_error` counter and still returns the
+ * DMA slot to device ownership before returning.
+ *
+ * Callable only from NAPI poll context (uses `napi_alloc_skb`).
  */
-void r8125_bridge_rx_sync_for_cpu(struct device *dev, dma_addr_t dma,
-				   size_t len)
+void r8125_bridge_rx_one_packet(struct net_device *ndev,
+				dma_addr_t dma, const void *buf,
+				size_t len, u32 desc_opts1)
 {
-	dma_sync_single_for_cpu(dev, dma, len, DMA_FROM_DEVICE);
-}
-EXPORT_SYMBOL_GPL(r8125_bridge_rx_sync_for_cpu);
+	struct r8125_bridge *b = netdev_priv(ndev);
+	struct device *d = &b->pdev->dev;
+	struct sk_buff *skb;
+	unsigned int rx_len;
 
-/*
- * `r8125_bridge_rx_sync_for_device` — call BEFORE re-posting a slot's
- *                                     descriptor for the chip.
- *
- * The CPU may have read the buffer (via `__skb_put_data` in
- * `r8125_bridge_skb_build_rx`); subsequent DMA from the chip into the
- * same buffer needs the cache invalidated again. We sync the WHOLE
- * buffer because the chip can fill any portion of it next time.
- */
-void r8125_bridge_rx_sync_for_device(struct device *dev, dma_addr_t dma)
-{
-	dma_sync_single_for_device(dev, dma, R8125_RX_JUMBO_BUF_SIZE,
+	dma_sync_single_for_cpu(d, dma, len, DMA_FROM_DEVICE);
+
+	skb = napi_alloc_skb(&b->napi, len + NET_IP_ALIGN);
+	if (unlikely(!skb)) {
+		this_cpu_inc(*b->rx_dropped_error);
+		dma_sync_single_for_device(d, dma, R8125_RX_JUMBO_BUF_SIZE,
+					   DMA_FROM_DEVICE);
+		return;
+	}
+	skb_reserve(skb, NET_IP_ALIGN);
+	prefetch(buf);
+	__skb_put_data(skb, buf, len);
+	skb->protocol = eth_type_trans(skb, ndev);
+	r8125_bridge_skb_rx_csum_set(skb, desc_opts1);
+
+	rx_len = skb->len;
+	this_cpu_inc(*b->rx_handed_to_stack);
+	/* Per-CPU rx_packets/rx_bytes via Candidate G's
+	 * NETDEV_PCPU_STAT_TSTATS setup at bridge_alloc. */
+	dev_sw_netstats_rx_add(ndev, rx_len);
+	napi_gro_receive(&b->napi, skb);
+
+	dma_sync_single_for_device(d, dma, R8125_RX_JUMBO_BUF_SIZE,
 				   DMA_FROM_DEVICE);
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_rx_sync_for_device);
+EXPORT_SYMBOL_GPL(r8125_bridge_rx_one_packet);
 
 MODULE_LICENSE("GPL v2");

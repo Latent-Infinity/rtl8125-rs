@@ -8,20 +8,22 @@
  * has no stable Rust API today: net_device + net_device_ops + NAPI +
  * sk_buff plumbing (plan §5.2 / §5.3).
  *
- * Hard cap: ≤ 400 LOC including comments. See cshim/README.md.
+ * Hard cap: 400 LOC including comments. Candidate G/L/M additions fit
+ * under the original cap after the dead RX helper exports were removed.
+ * See cshim/README.md.
  *
- * Every ndo callback below is a one-line delegation to the Rust vtable.
- * Counter increments are the only "business logic" performed here; they
- * sit next to the sk_buff helper calls so the §6.3 accounting invariant
- * stays in one file.
+ * Every ndo callback below is a thin delegation to the Rust vtable.
+ * Kernel object setup stays here; packet-side counter increments live
+ * next to the skb operations they account for.
  */
 
 #include "netdev_bridge_internal.h"
 
 #include <linux/atomic.h>
+#include <linux/cpumask.h>
 #include <linux/dma-mapping.h>
 #include <linux/etherdevice.h>
-#include <linux/prefetch.h>
+#include <linux/interrupt.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
 
@@ -152,6 +154,25 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	ndev->min_mtu = ETH_MIN_MTU;
 	ndev->max_mtu = 9000;
 
+	/* Candidate G (RX_OPTIMIZATION_CANDIDATES.md §G): per-CPU
+	 * netstats. With `NETDEV_PCPU_STAT_TSTATS` the kernel uses
+	 * `dev_get_tstats64` to sum per-CPU rx_packets/rx_bytes/
+	 * tx_packets/tx_bytes; the hot path calls
+	 * `dev_sw_netstats_{rx,tx}_add` which is a single per-CPU
+	 * INC + ADD instead of a shared-cache-line WRITE_ONCE pair.
+	 * Same idiom r8169 uses (`r8169_main.c:5828`). Eliminates the
+	 * `ndev->stats.{rx,tx}_packets` cache-line contention. */
+	ndev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS;
+
+	/* Candidate M (RX_OPTIMIZATION_CANDIDATES.md §M): drop the
+	 * default 1000-deep TX queue to 256. At 2.35 Gbps line rate a
+	 * 1000-packet backlog is ~3.4 ms of bufferbloat — bad for the
+	 * heterogeneous-load-balancer tail-latency goal. 256 caps the
+	 * worst-case TX queueing delay at ~870 us while still leaving
+	 * room for short bursts. r8169 keeps 1000 as kernel default;
+	 * we deliberately diverge for latency.  */
+	ndev->tx_queue_len = 256;
+
 	/* HW offload feature advertisement. opts bits + skb-side setup
 	 * are in netdev_bridge_offload.c (csum + TSO encoders), and the
 	 * driver advertises the matching kernel-side capability flags
@@ -229,6 +250,36 @@ void r8125_bridge_unregister_and_free(struct net_device *ndev)
 }
 EXPORT_SYMBOL_GPL(r8125_bridge_unregister_and_free);
 
+/*
+ * `r8125_bridge_irq_pin_cpu` — Candidate L
+ * (RX_OPTIMIZATION_CANDIDATES.md §L).
+ *
+ * Suggest to the kernel + `irqbalance` that this MSI-X vector
+ * should be serviced on a specific CPU. Reduces tail latency from
+ * softirq cross-CPU migration AND keeps the per-CPU NAPI page-frag
+ * cache warm (helps Candidate B's `napi_alloc_skb` fast path).
+ *
+ * The kernel-internal hint can be overridden by an explicit
+ * `/proc/irq/N/smp_affinity` write or by `irqbalance` if it
+ * deliberately ignores hints — both are operator choices we
+ * respect. We just provide a sensible default.
+ *
+ * `irq_set_affinity_and_hint` returns 0 on success; on failure we
+ * log and proceed (no fatal). The hint is automatically cleared by
+ * the kernel when `free_irq` runs.
+ */
+int r8125_bridge_irq_pin_cpu(unsigned int irq, int cpu)
+{
+	if (cpu < 0 || cpu >= nr_cpu_ids || !cpu_online(cpu))
+		return -EINVAL;
+	/* `cpumask_of(cpu)` returns a `const struct cpumask *` from the
+	 * kernel's pre-allocated per-CPU table — no stack-frame growth
+	 * (an inline `struct cpumask` would push us past
+	 * `-Wframe-larger-than=1024` on `NR_CPUS=8192` builds). */
+	return irq_set_affinity_and_hint(irq, cpumask_of(cpu));
+}
+EXPORT_SYMBOL_GPL(r8125_bridge_irq_pin_cpu);
+
 /* ── Flow-control + NAPI helpers ────────────────────────────────────── */
 
 void r8125_bridge_tx_stop_queue(struct net_device *ndev)
@@ -277,14 +328,6 @@ void r8125_bridge_tx_disable(struct net_device *ndev)
 }
 EXPORT_SYMBOL_GPL(r8125_bridge_tx_disable);
 
-struct napi_struct *r8125_bridge_napi(struct net_device *ndev)
-{
-	struct r8125_bridge *b = netdev_priv(ndev);
-
-	return &b->napi;
-}
-EXPORT_SYMBOL_GPL(r8125_bridge_napi);
-
 /* ── sk_buff helpers + counter side-effects (§6.3) ─────────────────── */
 
 void r8125_bridge_skb_dma_unmap_tx(struct device *dev, dma_addr_t handle,
@@ -312,70 +355,6 @@ void r8125_bridge_tx_busy_exception(struct net_device *ndev)
 	this_cpu_inc(*b->tx_busy_exception);
 }
 EXPORT_SYMBOL_GPL(r8125_bridge_tx_busy_exception);
-
-/*
- * RX skb build — hot path called per packet from NAPI poll. Uses
- * `napi_alloc_skb` (per-CPU NAPI page-frag cache) instead of
- * `netdev_alloc_skb` (full slab path) — the same choice r8169_main.c
- * makes at `rtl_rx`. This keeps per-packet RX allocation on the
- * NAPI-local page-frag path instead of the full slab path.
- *
- * `prefetch(buf)` hides the DRAM-fetch latency of the chip's just-
- * written buffer so the upcoming linear copy finds the cache hot.
- *
- * `__skb_put_data` skips the `skb_tailroom()` bounds check inside
- * `skb_put_data` while still using the kernel helper that updates the
- * skb tail and length consistently. Safe here because we allocated
- * `len` bytes exactly.
- *
- * `NET_IP_ALIGN` is `0` on x86; keeping the reserve call is a
- * portability no-op (matters on ARM/RISC-V where alignment fixes
- * are non-trivial).
- */
-struct sk_buff *r8125_bridge_skb_build_rx(struct net_device *ndev,
-					  const void *buf, size_t len)
-{
-	struct r8125_bridge *b = netdev_priv(ndev);
-	struct sk_buff *skb;
-
-	skb = napi_alloc_skb(&b->napi, len + NET_IP_ALIGN);
-	if (!skb)
-		return NULL;
-	skb_reserve(skb, NET_IP_ALIGN);
-	prefetch(buf);
-	__skb_put_data(skb, buf, len);
-	skb->protocol = eth_type_trans(skb, ndev);
-	return skb;
-}
-EXPORT_SYMBOL_GPL(r8125_bridge_skb_build_rx);
-
-void r8125_bridge_skb_deliver_rx(struct napi_struct *napi, struct sk_buff *skb)
-{
-	struct r8125_bridge *b = container_of(napi, struct r8125_bridge, napi);
-
-	this_cpu_inc(*b->rx_handed_to_stack);
-	napi_gro_receive(napi, skb);
-}
-EXPORT_SYMBOL_GPL(r8125_bridge_skb_deliver_rx);
-
-void r8125_bridge_skb_drop_rx(struct sk_buff *skb)
-{
-	struct net_device *ndev = skb->dev;
-	struct r8125_bridge *b = ndev ? netdev_priv(ndev) : NULL;
-
-	if (b)
-		this_cpu_inc(*b->rx_dropped_error);
-	dev_kfree_skb_any(skb);
-}
-EXPORT_SYMBOL_GPL(r8125_bridge_skb_drop_rx);
-
-void r8125_bridge_rx_drop_error(struct net_device *ndev)
-{
-	struct r8125_bridge *b = netdev_priv(ndev);
-
-	this_cpu_inc(*b->rx_dropped_error);
-}
-EXPORT_SYMBOL_GPL(r8125_bridge_rx_drop_error);
 
 /* r8125_bridge_counters_snapshot lives in netdev_bridge_counters.c. */
 

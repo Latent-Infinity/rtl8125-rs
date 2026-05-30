@@ -12,7 +12,7 @@
 #
 # We check, for each:
 #   1. it appears as a u64 field in struct r8125_bridge (storage)
-#   2. it has at least one WRITE_ONCE increment site in the cshim sources
+#   2. it has at least one this_cpu_inc increment site in the cshim sources
 #   3. it's read out via r8125_bridge_counters_snapshot
 #   4. it's exposed by ethtool -S via r8125_bridge_ethtool_strings
 #
@@ -35,6 +35,11 @@ OFFLOAD_C="$ROOT/src/netdev_bridge_offload.c"
 ETHTOOL_C="$ROOT/src/netdev_bridge_ethtool.c"
 COUNTERS_C="$ROOT/src/netdev_bridge_counters.c"
 BRIDGE_H="$ROOT/src/netdev_bridge.h"
+# `rx_handed_to_stack` and `rx_dropped_error` increment sites moved
+# into `r8125_bridge_rx_one_packet` (Candidate B,
+# RX_OPTIMIZATION_CANDIDATES.md §B) on 2026-05-30 — search the
+# RX-pool TU too.
+RX_POOL_C="$ROOT/src/netdev_bridge_rx_pool.c"
 
 for c in "${COUNTERS[@]}"; do
 	# 1. struct field present as percpu pointer (post-#45 storage shape).
@@ -42,8 +47,8 @@ for c in "${COUNTERS[@]}"; do
 		red "missing 'u64 __percpu *$c;' field in struct r8125_bridge ($INTERNAL)"
 		continue
 	fi
-	# 2. at least one this_cpu_inc increment site in either bridge .c
-	if ! grep -qE "this_cpu_inc\(\*b->$c\)" "$BRIDGE_C" "$OFFLOAD_C"; then
+	# 2. at least one this_cpu_inc increment site in any of the bridge .c TUs
+	if ! grep -qE "this_cpu_inc\(\*b->$c\)" "$BRIDGE_C" "$OFFLOAD_C" "$RX_POOL_C"; then
 		red "no this_cpu_inc(*b->$c) increment site found"
 		continue
 	fi

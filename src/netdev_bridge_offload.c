@@ -127,25 +127,14 @@ void r8125_bridge_skb_rx_csum_set(struct sk_buff *skb, u32 desc_opts1)
 }
 EXPORT_SYMBOL_GPL(r8125_bridge_skb_rx_csum_set);
 
-/* netdev->stats is a `struct net_device_stats` containing u_long counters.
- * We update without an extra lock — RTNL serialises ndo_open/stop, NAPI poll
- * runs per-CPU, xmit holds the TX queue lock. The READ_ONCE/WRITE_ONCE
- * discipline matches the §6.3 counter helpers in netdev_bridge.c. M5
- * task #45 turns these into per-CPU sharded counters. */
-
 void r8125_bridge_account_tx(struct net_device *ndev, unsigned int bytes)
 {
-	WRITE_ONCE(ndev->stats.tx_packets, READ_ONCE(ndev->stats.tx_packets) + 1);
-	WRITE_ONCE(ndev->stats.tx_bytes,   READ_ONCE(ndev->stats.tx_bytes)   + bytes);
+	/* Per-CPU tx_packets/tx_bytes via Candidate G's
+	 * NETDEV_PCPU_STAT_TSTATS setup at bridge_alloc. r8169 uses the
+	 * same helper at rtl8169_tx_handler (r8169_main.c:4769). */
+	dev_sw_netstats_tx_add(ndev, 1, bytes);
 }
 EXPORT_SYMBOL_GPL(r8125_bridge_account_tx);
-
-void r8125_bridge_account_rx(struct net_device *ndev, unsigned int bytes)
-{
-	WRITE_ONCE(ndev->stats.rx_packets, READ_ONCE(ndev->stats.rx_packets) + 1);
-	WRITE_ONCE(ndev->stats.rx_bytes,   READ_ONCE(ndev->stats.rx_bytes)   + bytes);
-}
-EXPORT_SYMBOL_GPL(r8125_bridge_account_rx);
 
 /* ── Scatter-gather + TSO (M4-perf phase 2, task 49) ─────────────────── */
 

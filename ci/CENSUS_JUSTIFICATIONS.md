@@ -124,3 +124,88 @@ Net `unsafe { … }` count moves 53 → 54 in `src/unsafe_boundary.rs`:
 Net: +4 added − 3 removed = +1. The new helpers are all mechanical
 FFI wrappers around C cshim functions that themselves perform the
 allocation, mapping, and free; no MMIO-touching unsafe is introduced.
+
+## 2026-05-30 — RX Optimization Candidate A decrement 54 → 53
+
+`bridge_account_rx(ndev, bytes)` removed from `src/unsafe_boundary.rs`.
+RX packet/byte accounting now lives next to `napi_gro_receive` inside
+`r8125_bridge_rx_one_packet`, so the RX hot path makes one fewer FFI
+crossing per packet. See `docs/RX_OPTIMIZATION_CANDIDATES.md` §A for
+the rationale.
+
+TX accounting (`bridge_account_tx` / `r8125_bridge_account_tx`) is
+unchanged: xmit calls it once per skb (not per packet), so the FFI
+cost is bounded and the symbol stays as-is.
+
+## 2026-05-30 — RX Optimization Candidate B decrement 53 → 47
+
+`bridge_rx_one_packet` super-call (Candidate B of
+docs/RX_OPTIMIZATION_CANDIDATES.md) collapses five per-packet FFI
+crossings into one cshim entry point. Net effect on the Rust unsafe
+boundary: **7 wrappers removed**, **1 wrapper added** = census
+53 → 47.
+
+Removed Rust safe wrappers + extern declarations
+(`src/unsafe_boundary.rs`):
+
+- `skb_build_rx` / `r8125_bridge_skb_build_rx` — replaced by
+  cshim-internal `napi_alloc_skb` inside `bridge_rx_one_packet`.
+- `skb_deliver_rx` / `r8125_bridge_skb_deliver_rx` — replaced by
+  cshim-internal `napi_gro_receive`.
+- `rx_drop_error` / `r8125_bridge_rx_drop_error` — cshim handles
+  the §6.3 `rx_dropped_error` bump internally on alloc failure.
+- `rx_sync_for_cpu` / `r8125_bridge_rx_sync_for_cpu` — replaced by
+  cshim-internal `dma_sync_single_for_cpu`.
+- `rx_sync_for_device` / `r8125_bridge_rx_sync_for_device` —
+  replaced by cshim-internal `dma_sync_single_for_device`.
+- `bridge_napi` / `r8125_bridge_napi` — `bridge_rx_one_packet` gets
+  `&b->napi` directly via `netdev_priv`.
+- `skb_rx_csum_set` / extern decl — the cshim symbol stays but is
+  now called C-side only from inside `bridge_rx_one_packet`.
+
+The corresponding `DriverOwnedSkb` methods (`build_rx`,
+`rx_csum_set`, `deliver_rx`) were also removed from `src/skb.rs`;
+the type is now TX-only.
+
+Added Rust safe wrapper + extern declaration (+1):
+
+- `bridge_rx_one_packet` / `r8125_bridge_rx_one_packet` —
+  super-call.
+
+Net change to the unsafe surface: **-6 items**. The C cshim
+symbols/prototypes that became dead were removed instead of kept as
+private ABI.
+
+## 2026-05-30 — RX Optimization Candidates F + G (no census change)
+
+Candidates F (hoist `state.ndev.load` out of NAPI RX loop) and G
+(per-CPU `dev_sw_netstats_{rx,tx}_add` + `NETDEV_PCPU_STAT_TSTATS`)
+shipped without changing the unsafe surface. Both are inside the
+cshim or inside existing safe Rust code; no new wrappers, no extern
+decl changes. Census remains 47.
+
+The `rx_packets`/`rx_bytes`/`tx_packets`/`tx_bytes` counters now
+live in per-CPU storage allocated by the kernel core when
+`pcpu_stat_type` is set at bridge_alloc; the kernel sums across
+CPUs on stats-read via `dev_get_tstats64`. The application-visible
+`ip -s link show enp5s0` output is unchanged in semantics.
+
+Candidate H was skipped (LLVM bounds-check elision is sufficient;
+`unsafe` surface trade-off not worth marginal gain). See
+`docs/RX_OPTIMIZATION_CANDIDATES.md`.
+
+## 2026-05-30 — RX Optimization Candidate L bump 47 → 48
+
+Added `bridge_irq_pin_cpu(irq, cpu)` safe wrapper in
+`src/unsafe_boundary.rs`. Calls the new cshim
+`r8125_bridge_irq_pin_cpu` which calls `irq_set_affinity_and_hint`
+to nudge the kernel + irqbalance toward keeping the chip's MSI-X
+vector on a specific CPU. Latency-aligned default for the
+heterogeneous-LB use case (see docs/RX_OPTIMIZATION_CANDIDATES.md
+§L).
+
+Net change: +1 unsafe wrapper (mechanical FFI call). No MMIO
+touching unsafe added.
+
+Candidate M (`tx_queue_len` 1000 → 256) is cshim-side only and
+introduces no Rust unsafe.

@@ -3,10 +3,9 @@
 #
 # RX skb-build hot-path contract.
 #
-# `r8125_bridge_skb_build_rx` runs once per received packet from NAPI poll.
-# It must use the NAPI-local skb allocator and kernel skb helpers rather than
-# open-coding sk_buff internals. The helper keeps the code fast without making
-# this C shim depend on avoidable layout details.
+# `r8125_bridge_rx_one_packet` runs once per received packet from NAPI poll.
+# It must perform streaming-DMA syncs, use the NAPI-local skb allocator, and
+# use kernel skb helpers rather than open-coding sk_buff internals.
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -15,56 +14,78 @@ rc=0
 red() { printf '\033[1;31mFAIL\033[0m %s\n' "$*"; rc=1; }
 grn() { printf '\033[1;32mPASS\033[0m %s\n' "$*"; }
 
-bridge="$ROOT/src/netdev_bridge.c"
-skb_rs="$ROOT/src/skb.rs"
 napi_rs="$ROOT/src/napi.rs"
-ub_rs="$ROOT/src/unsafe_boundary.rs"
+bridge="$ROOT/src/netdev_bridge_rx_pool.c"
 body=$(
 	awk '
-		/^struct sk_buff \*r8125_bridge_skb_build_rx\(/ { in_fn=1 }
+		/^void r8125_bridge_rx_one_packet\(/ { in_fn=1 }
 		in_fn { print }
 		in_fn && /^}/ { exit }
 	' "$bridge"
 )
 
 if [[ -z "$body" ]]; then
-	red "r8125_bridge_skb_build_rx body not found"
+	red "r8125_bridge_rx_one_packet body not found"
 	exit "$rc"
 fi
 
-if grep -q 'napi_alloc_skb(&b->napi' <<<"$body"; then
-	grn "RX skb build uses NAPI-local allocator"
+if grep -q 'dma_sync_single_for_cpu(d, dma, len, DMA_FROM_DEVICE)' <<<"$body" \
+   && grep -q 'dma_sync_single_for_device(d, dma, R8125_RX_JUMBO_BUF_SIZE' <<<"$body"; then
+	grn "RX super-call keeps streaming-DMA CPU/device ownership syncs"
 else
-	red "RX skb build must use napi_alloc_skb(&b->napi, ...)"
+	red "RX super-call must sync for CPU before copy and for device before return"
+fi
+
+if grep -q 'napi_alloc_skb(&b->napi' <<<"$body"; then
+	grn "RX super-call uses NAPI-local allocator"
+else
+	red "RX super-call must use napi_alloc_skb(&b->napi, ...)"
 fi
 
 if grep -q 'prefetch(buf)' <<<"$body"; then
-	grn "RX skb build prefetches the freshly-DMAed buffer"
+	grn "RX super-call prefetches the freshly-DMAed buffer"
 else
-	red "RX skb build should prefetch(buf) before the linear copy"
+	red "RX super-call should prefetch(buf) before the linear copy"
 fi
 
 if grep -q '__skb_put_data(skb, buf, len)' <<<"$body"; then
-	grn "RX skb build uses kernel helper for unchecked copy/tail update"
+	grn "RX super-call uses kernel helper for unchecked copy/tail update"
 else
-	red "RX skb build must use __skb_put_data(skb, buf, len)"
+	red "RX super-call must use __skb_put_data(skb, buf, len)"
 fi
 
 if grep -q 'netdev_alloc_skb' <<<"$body"; then
-	red "RX skb build regressed to netdev_alloc_skb"
+	red "RX super-call regressed to netdev_alloc_skb"
 else
-	grn "RX skb build avoids netdev_alloc_skb slow path"
+	grn "RX super-call avoids netdev_alloc_skb slow path"
 fi
 
 if grep -qE 'skb->(tail|len)[[:space:]]*[+]?=' <<<"$body"; then
-	red "RX skb build mutates skb tail/len directly"
+	red "RX super-call mutates skb tail/len directly"
 else
-	grn "RX skb build avoids direct skb tail/len mutation"
+	grn "RX super-call avoids direct skb tail/len mutation"
 fi
 
-build_rx_callers=$(
-	grep -RIn 'DriverOwnedSkb::build_rx(' "$ROOT/src" --include='*.rs' 2>/dev/null || true
-)
+cpu_line=$(grep -n 'dma_sync_single_for_cpu' <<<"$body" | head -n1 | cut -d: -f1)
+alloc_line=$(grep -n 'napi_alloc_skb(&b->napi' <<<"$body" | head -n1 | cut -d: -f1)
+copy_line=$(grep -n '__skb_put_data(skb, buf, len)' <<<"$body" | head -n1 | cut -d: -f1)
+csum_line=$(grep -n 'r8125_bridge_skb_rx_csum_set' <<<"$body" | head -n1 | cut -d: -f1)
+gro_line=$(grep -n 'napi_gro_receive(&b->napi, skb)' <<<"$body" | head -n1 | cut -d: -f1)
+device_line=$(grep -n 'dma_sync_single_for_device' <<<"$body" | tail -n1 | cut -d: -f1)
+if [[ -n "$cpu_line" && -n "$alloc_line" && -n "$copy_line" && -n "$csum_line" && -n "$gro_line" && -n "$device_line" ]] \
+   && (( cpu_line < alloc_line && alloc_line < copy_line && copy_line < csum_line && csum_line < gro_line && gro_line < device_line )); then
+	grn "RX super-call preserves sync/build/csum/GRO/device-sync order"
+else
+	red "RX super-call order must be sync_for_cpu -> alloc/copy -> csum -> GRO -> sync_for_device"
+fi
+
+if grep -q 'rx_dropped_error' <<<"$body" \
+   && grep -q 'return;' <<<"$body"; then
+	grn "RX super-call accounts allocation failure before returning"
+else
+	red "RX super-call must account skb allocation failure before returning"
+fi
+
 process_rx_body=$(
 	awk '
 		/^fn process_rx_completions\(/ { in_fn=1 }
@@ -72,20 +93,10 @@ process_rx_body=$(
 		in_fn && /^}/ { exit }
 	' "$napi_rs"
 )
-if [[ "$build_rx_callers" == "$napi_rs:"* ]] \
-   && [[ $(wc -l <<<"$build_rx_callers") -eq 1 ]] \
-   && grep -q 'DriverOwnedSkb::build_rx(' <<<"$process_rx_body"; then
-	grn "DriverOwnedSkb::build_rx is only called from NAPI RX poll"
+if grep -q 'ub::bridge_rx_one_packet(' <<<"$process_rx_body"; then
+	grn "NAPI RX poll calls bridge_rx_one_packet super-call"
 else
-	red "DriverOwnedSkb::build_rx must only be called from NAPI RX poll"
-	printf '%s\n' "$build_rx_callers"
-fi
-
-if grep -q 'NAPI RX path only' "$skb_rs" \
-   && grep -q 'NAPI RX path only' "$ub_rs"; then
-	grn "RX skb-build NAPI-context contract is documented at Rust boundary"
-else
-	red "RX skb-build NAPI-context contract must be documented in skb.rs and unsafe_boundary.rs"
+	red "NAPI RX poll must call ub::bridge_rx_one_packet - see RX_OPTIMIZATION_CANDIDATES.md §B"
 fi
 
 exit "$rc"

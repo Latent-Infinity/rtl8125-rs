@@ -95,6 +95,10 @@ pub(crate) const TX_START_THRS: usize = 64;
 fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
     let mut work_done = 0usize;
     let mut rx_tail = state.rx.tail.inner.load(Ordering::Acquire);
+    // Candidate F (RX_OPTIMIZATION_CANDIDATES.md §F): hoist the
+    // `ndev` atomic load out of the per-packet loop. `ndev` is
+    // invariant across the whole NAPI poll call — load it once.
+    let ndev = state.ndev.load(Ordering::Acquire);
     while work_done < budget_u {
         let desc = ub::desc_read(state.rx.desc, rx_tail);
         // Hardware sets OWN; if still set, this slot isn't filled yet — stop.
@@ -107,38 +111,28 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
         let len = (desc.opts1 & regs::DESC_LEN_MASK) as usize;
         let len = core::cmp::min(len, RX_BUF_LEN);
 
-        let ndev = state.ndev.load(Ordering::Acquire);
         let slot = state.rx_slot(rx_tail);
         if len > 0 {
-            ub::rx_sync_for_cpu(&state.pdev, slot.dma, len);
-            let buf_ptr = slot.cpu.cast_const();
-            // Wrap the freshly-built skb at the boundary. `build_rx`
-            // returns `None` if the cshim ran out of memory; the §6.3
-            // `rx_dropped_error` counter is bumped via `rx_drop_error`
-            // (task #62 domain-type discipline).
-            match crate::skb::DriverOwnedSkb::build_rx(ndev, buf_ptr, len) {
-                Some(skb) => {
-                    // Ask the chip-side opts1 if HW verified the L4 checksum;
-                    // set skb->ip_summed accordingly so the stack doesn't
-                    // re-compute on every RX packet.
-                    skb.rx_csum_set(desc.opts1);
-                    let napi = ub::bridge_napi(ndev);
-                    skb.deliver_rx(napi);
-                    ub::bridge_account_rx(ndev, len as u32);
-                }
-                None => {
-                    // No skb exists to free, but the §6.3 disposition
-                    // counter still needs to record the RX allocation
-                    // failure.
-                    ub::rx_drop_error(ndev);
-                }
-            }
+            // RX super-call (RX_OPTIMIZATION_CANDIDATES.md §B):
+            // collapses sync_for_cpu + skb_build + csum_set +
+            // deliver_rx + sync_for_device into one cshim call.
+            // Cuts 4 FFI crossings per packet vs the previous chain.
+            // The cshim handles `rx_dropped_error` accounting on
+            // alloc failure; nothing else for the Rust side to do.
+            ub::bridge_rx_one_packet(
+                ndev,
+                slot.dma,
+                slot.cpu.cast_const(),
+                len,
+                desc.opts1,
+            );
         }
 
         // Re-post the descriptor with the slot's existing DMA address.
-        // Sync FOR DEVICE before re-posting so the chip sees an
-        // invalidated cache for the next DMA.
-        ub::rx_sync_for_device(&state.pdev, slot.dma);
+        // For `len > 0`, `bridge_rx_one_packet` always returns the DMA
+        // slot to device ownership, even on allocation failure. For
+        // `len == 0`, Rust never reads from the DMA buffer, so ownership
+        // remained with the device and no sync-for-device is required.
         let mut opts1 = regs::DESC_OWN | RX_DESC_BUF_LEN;
         if rx_tail == RING_LEN - 1 {
             opts1 |= regs::DESC_EOR;
