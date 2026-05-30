@@ -106,6 +106,9 @@ impl DriverOwnedSkb {
     /// `buf`. Returns `None` on cshim allocation failure (caller must
     /// account that via `rx_drop_error`).
     ///
+    /// NAPI RX path only: the cshim uses `napi_alloc_skb`, so callers must
+    /// already be running from `napi::poll` / `process_rx_completions`.
+    ///
     /// This is the typed entry point for the NAPI RX path; together
     /// with `rust_xmit`'s direct `from_raw` it makes the two call sites
     /// where the driver acquires a `DriverOwnedSkb` explicit.

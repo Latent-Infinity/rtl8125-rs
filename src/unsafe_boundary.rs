@@ -586,8 +586,10 @@ pub(crate) fn skb_build_rx(
     buf: *const c_void,
     len: usize,
 ) -> *mut bindings::sk_buff {
-    // SAFETY: cshim copies `len` bytes from `buf`; we guarantee
-    // `buf..buf+len` is CPU-readable and `len <= RX_BUF_LEN`.
+    // SAFETY: NAPI RX path only. The cshim uses napi_alloc_skb on the
+    // net_device's embedded napi_struct, so this must be reached from
+    // napi::poll after rx_sync_for_cpu. The caller guarantees `buf..buf+len`
+    // is CPU-readable and `len <= RX_BUF_LEN`.
     unsafe { r8125_bridge_skb_build_rx(ndev, buf, len) }
 }
 

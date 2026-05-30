@@ -16,6 +16,9 @@ red() { printf '\033[1;31mFAIL\033[0m %s\n' "$*"; rc=1; }
 grn() { printf '\033[1;32mPASS\033[0m %s\n' "$*"; }
 
 bridge="$ROOT/src/netdev_bridge.c"
+skb_rs="$ROOT/src/skb.rs"
+napi_rs="$ROOT/src/napi.rs"
+ub_rs="$ROOT/src/unsafe_boundary.rs"
 body=$(
 	awk '
 		/^struct sk_buff \*r8125_bridge_skb_build_rx\(/ { in_fn=1 }
@@ -57,6 +60,32 @@ if grep -qE 'skb->(tail|len)[[:space:]]*[+]?=' <<<"$body"; then
 	red "RX skb build mutates skb tail/len directly"
 else
 	grn "RX skb build avoids direct skb tail/len mutation"
+fi
+
+build_rx_callers=$(
+	grep -RIn 'DriverOwnedSkb::build_rx(' "$ROOT/src" --include='*.rs' 2>/dev/null || true
+)
+process_rx_body=$(
+	awk '
+		/^fn process_rx_completions\(/ { in_fn=1 }
+		in_fn { print }
+		in_fn && /^}/ { exit }
+	' "$napi_rs"
+)
+if [[ "$build_rx_callers" == "$napi_rs:"* ]] \
+   && [[ $(wc -l <<<"$build_rx_callers") -eq 1 ]] \
+   && grep -q 'DriverOwnedSkb::build_rx(' <<<"$process_rx_body"; then
+	grn "DriverOwnedSkb::build_rx is only called from NAPI RX poll"
+else
+	red "DriverOwnedSkb::build_rx must only be called from NAPI RX poll"
+	printf '%s\n' "$build_rx_callers"
+fi
+
+if grep -q 'NAPI RX path only' "$skb_rs" \
+   && grep -q 'NAPI RX path only' "$ub_rs"; then
+	grn "RX skb-build NAPI-context contract is documented at Rust boundary"
+else
+	red "RX skb-build NAPI-context contract must be documented in skb.rs and unsafe_boundary.rs"
 fi
 
 exit "$rc"
