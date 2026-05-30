@@ -21,6 +21,7 @@
 #include <linux/atomic.h>
 #include <linux/dma-mapping.h>
 #include <linux/etherdevice.h>
+#include <linux/prefetch.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
 
@@ -312,16 +313,37 @@ void r8125_bridge_tx_busy_exception(struct net_device *ndev)
 }
 EXPORT_SYMBOL_GPL(r8125_bridge_tx_busy_exception);
 
+/*
+ * RX skb build — hot path called per packet from NAPI poll. Uses
+ * `napi_alloc_skb` (per-CPU NAPI page-frag cache) instead of
+ * `netdev_alloc_skb` (full slab path) — the same choice r8169_main.c
+ * makes at `rtl_rx`. This keeps per-packet RX allocation on the
+ * NAPI-local page-frag path instead of the full slab path.
+ *
+ * `prefetch(buf)` hides the DRAM-fetch latency of the chip's just-
+ * written buffer so the upcoming linear copy finds the cache hot.
+ *
+ * `__skb_put_data` skips the `skb_tailroom()` bounds check inside
+ * `skb_put_data` while still using the kernel helper that updates the
+ * skb tail and length consistently. Safe here because we allocated
+ * `len` bytes exactly.
+ *
+ * `NET_IP_ALIGN` is `0` on x86; keeping the reserve call is a
+ * portability no-op (matters on ARM/RISC-V where alignment fixes
+ * are non-trivial).
+ */
 struct sk_buff *r8125_bridge_skb_build_rx(struct net_device *ndev,
 					  const void *buf, size_t len)
 {
+	struct r8125_bridge *b = netdev_priv(ndev);
 	struct sk_buff *skb;
 
-	skb = netdev_alloc_skb(ndev, len + NET_IP_ALIGN);
+	skb = napi_alloc_skb(&b->napi, len + NET_IP_ALIGN);
 	if (!skb)
 		return NULL;
 	skb_reserve(skb, NET_IP_ALIGN);
-	skb_put_data(skb, buf, len);
+	prefetch(buf);
+	__skb_put_data(skb, buf, len);
 	skb->protocol = eth_type_trans(skb, ndev);
 	return skb;
 }

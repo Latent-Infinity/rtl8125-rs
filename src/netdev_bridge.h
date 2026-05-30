@@ -223,8 +223,8 @@ void r8125_bridge_skb_dma_unmap_frag_tx(struct device *dev,
 /* ──────────────────────────────────────────────────────────────────────
  *  Jumbo RX-pool: per-slot streaming-DMA allocator (M6 sub-feature #2).
  *
- *  The M4 baseline used a single coherent allocation sized for 256 ×
- *  2 KiB. Jumbo (RX buffers up to 16 KiB) doesn't fit that pattern —
+ *  The earlier 2 KiB coherent-ring design used one allocation sized for
+ *  256 slots. Jumbo (RX buffers up to 16 KiB) doesn't fit that pattern —
  *  4 MiB contiguous DMA-coherent is unreliable on fragmented systems.
  *  These helpers move the pool to one streaming-DMA page chunk per
  *  slot (`alloc_pages(order=2)` + `dma_map_page`), matching r8169
@@ -260,13 +260,14 @@ void r8125_bridge_tx_busy_exception(struct net_device *ndev);
  * driver at ndo_open and never reused while hardware has it — see §6.3
  * RX-path table.
  *
- * Pre   : `buf` is CPU-readable (post-`dma_unmap_single` from
- *         `DataDirection::FromDevice`) and `len` is the valid byte count.
- * Post  : returns a new skb whose data points into a copy of `buf` (M4
- *         baseline — page-pool / `napi_build_skb` zero-copy comes later).
+ * Pre   : `buf` is CPU-readable after the Rust RX path has called
+ *         `r8125_bridge_rx_sync_for_cpu` for this streaming DMA slot;
+ *         `len` is the valid byte count.
+ * Post  : returns a new skb whose linear data is a copy of `buf`.
+ *         Page-pool / `napi_build_skb` zero-copy can replace this later.
  *         Returns NULL on alloc failure (rare).
  *
- * Counter: NO change here. The dispostion counter increments when the
+ * Counter: NO change here. The disposition counter increments when the
  *          skb is handed to the stack (`rx_handed_to_stack`) or freed
  *          on error (`rx_dropped_error`).
  */

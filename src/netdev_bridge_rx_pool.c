@@ -4,9 +4,9 @@
  *                          for the r8125_rust jumbo path (M6 sub-feature #2,
  *                          plan §7 M6).
  *
- * The M4 baseline uses a single `CoherentAllocation<RxBuffer>` with
- * `RX_BUF_LEN = 2048`. That's 256 × 2 KiB = 512 KiB of contiguous DMA-
- * coherent memory — fine, but doesn't scale to jumbo: 256 × 16 KiB
+ * The earlier 2 KiB coherent-ring design used one
+ * `CoherentAllocation<RxBuffer>` for 256 slots. That is 512 KiB of
+ * contiguous DMA-coherent memory and doesn't scale to jumbo: 256 × 16 KiB
  * = 4 MiB contiguous is an order-10 allocation and reliably fails on
  * fragmented systems. r8169 mainline avoids the problem by using
  * `alloc_pages` per slot with `dma_map_page` (streaming DMA). We follow
@@ -134,7 +134,7 @@ EXPORT_SYMBOL_GPL(r8125_bridge_rx_sync_for_cpu);
  * `r8125_bridge_rx_sync_for_device` — call BEFORE re-posting a slot's
  *                                     descriptor for the chip.
  *
- * The CPU may have read the buffer (via `skb_put_data` in
+ * The CPU may have read the buffer (via `__skb_put_data` in
  * `r8125_bridge_skb_build_rx`); subsequent DMA from the chip into the
  * same buffer needs the cache invalidated again. We sync the WHOLE
  * buffer because the chip can fill any portion of it next time.

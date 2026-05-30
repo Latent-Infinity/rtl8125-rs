@@ -131,6 +131,8 @@ The following paths are hot and must receive the strictest review:
 - The C shim is not a second driver. It may provide kernel-facing wrappers for
   APIs missing from kernel Rust, but chip policy and descriptor logic belong in
   Rust.
+- C shim hot paths should use kernel helper APIs that encode object invariants
+  instead of mutating kernel structure internals directly.
 - Each `src/netdev_bridge*.c` file must declare and stay within a hard LOC cap.
   `ci/check_cshim_loc_caps.sh` enforces this so review size stays bounded.
 - C shim helpers must keep counter side effects colocated with the kernel
@@ -150,6 +152,8 @@ gate before or with the implementation. Current mandatory gates include:
   storage, increments, snapshot, and ethtool.
 - `ci/check_napi_contract.sh`: NAPI budget, IRQ masking, and TX queue
   hysteresis ordering.
+- `ci/check_rx_skb_build.sh`: RX skb-build hot path uses the NAPI-local
+  allocator and skb helpers without direct `sk_buff` tail/len mutation.
 - `ci/check_no_panic_paths.sh`: no `unwrap`, `expect`, `panic!`,
   runtime `assert!`, `unreachable!`, `todo!`, or `debug_assert!` in driver
   Rust sources.

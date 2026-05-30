@@ -17,6 +17,9 @@ echo
 echo "== checksum/stat offload path =="
 bash "$CI/check_offload_path.sh" || rc=1
 echo
+echo "== RX skb-build hot path =="
+bash "$CI/check_rx_skb_build.sh" || rc=1
+echo
 echo "== build wrapper / BTF path =="
 bash "$CI/check_build_makefile.sh" || rc=1
 echo
