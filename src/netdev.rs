@@ -595,7 +595,9 @@ fn pre_post_rx_descriptors(state: &NetdevState) {
         if i == RING_LEN - 1 {
             opts1 |= regs::DESC_EOR;
         }
-        ub::desc_write(
+        // Initial RX ownership handoff follows the same ordering as NAPI
+        // reposts: addr/opts2 first, then dma_wmb(), then OWN in opts1.
+        ub::desc_publish_own(
             state.rx.desc,
             i,
             Descriptor { opts1, opts2: 0, addr: dma },
@@ -606,17 +608,22 @@ fn pre_post_rx_descriptors(state: &NetdevState) {
 /// Zero the TX descriptor ring; first `xmit` populates each slot
 /// on-demand. EOR on the wrap slot is the only persistent bit we keep
 /// across opens (so the chip wraps back to slot 0).
+#[inline]
+fn clear_tx_descriptor(state: &NetdevState, slot: usize) {
+    let mut opts1 = 0u32;
+    if slot == RING_LEN - 1 {
+        opts1 |= regs::DESC_EOR;
+    }
+    ub::desc_write(
+        state.tx.desc,
+        slot,
+        Descriptor { opts1, opts2: 0, addr: 0 },
+    );
+}
+
 fn zero_tx_descriptors(state: &NetdevState) {
     for i in 0..RING_LEN {
-        let mut opts1 = 0u32;
-        if i == RING_LEN - 1 {
-            opts1 |= regs::DESC_EOR;
-        }
-        ub::desc_write(
-            state.tx.desc,
-            i,
-            Descriptor { opts1, opts2: 0, addr: 0 },
-        );
+        clear_tx_descriptor(state, i);
     }
 }
 
@@ -1005,7 +1012,7 @@ fn map_skb_linear(
 /// guard, which:
 ///   1. `dma_unmap_single`s the linear head we already mapped
 ///   2. `dma_unmap_page`s every fragment shadow slot 0 .. `frags_published`
-///   3. Clears each affected shadow slot via `clear_shadow_slot`
+///   3. Clears each pre-staged fragment descriptor and shadow slot
 ///   4. Frees the skb via `skb_free_error` (counters the §6.3 drop)
 ///
 /// The success path calls `release(self)` after all fragments + the
@@ -1083,6 +1090,7 @@ impl<'a> Drop for TxMapGuard<'a> {
                 let prev_slot = (self.head.wrapping_add(1 + j)) % RING_LEN;
                 let pa = self.state.tx.shadow_dma[prev_slot].load(Ordering::Acquire);
                 let pl = self.state.tx.shadow_len[prev_slot].load(Ordering::Acquire);
+                clear_tx_descriptor(self.state, prev_slot);
                 ub::skb_dma_unmap_frag_tx(&self.state.pdev, pa, pl as usize);
                 self.state.tx.clear_shadow_slot(prev_slot);
             }
@@ -1098,8 +1106,9 @@ impl<'a> Drop for TxMapGuard<'a> {
 /// descriptors with `OWN` set as we go.
 ///
 /// On any per-fragment failure the [`TxMapGuard`] drops and unmaps the
-/// linear head + every already-mapped fragment, then frees the skb;
-/// the caller just observes `Err(())` and returns `NETDEV_TX_OK`.
+/// linear head + every already-mapped fragment, clears any pre-staged
+/// fragment descriptors, then frees the skb; the caller just observes
+/// `Err(())` and returns `NETDEV_TX_OK`.
 ///
 /// Per r8169 `rtl8169_tx_map` and Realtek vendor `rtl8125_xmit_frags`,
 /// BOTH opts[0] (TSO GTSEN bits) AND opts[1] (CSUM bits / MSS) get
@@ -1225,12 +1234,8 @@ fn ndo_start_xmit(state: &NetdevState, skb: crate::skb::DriverOwnedSkb) -> c_int
     // ── Write FirstFrag descriptor LAST — this is the commit point ─────
     //
     // The chip only starts walking once it sees OWN|FS on slot[0]. By
-    // writing the head LAST (after all fragment descriptors), the chip
-    // observes a fully-populated chain when it picks up the head.
-    // Whole-struct volatile commit (`ub::desc_write`) is sufficient on
-    // x86: TSO ordering + PCIe ordering ensure the descriptor commits
-    // atomically from the chip's perspective. (Two-phase commit was
-    // tried and ruled out — see `docs/RTL8125B_TSO_NOTES.md`.)
+    // publishing the head LAST (after all fragment descriptors), the
+    // chip observes a fully-populated chain when it picks up the head.
     let first_slot = head % RING_LEN;
     let mut first_opts1 =
         regs::DESC_OWN | regs::DESC_TX_FS | (linear_len & regs::DESC_LEN_MASK);
@@ -1257,7 +1262,9 @@ fn ndo_start_xmit(state: &NetdevState, skb: crate::skb::DriverOwnedSkb) -> c_int
         let _ = skb_raw;
         state.tx.shadow[first_slot].store(core::ptr::null_mut(), Ordering::Release);
     }
-    ub::desc_write(
+    // Publish OWN|FS only after addr/opts2 and earlier fragment
+    // descriptors are visible to the device.
+    ub::desc_publish_own(
         state.tx.desc,
         first_slot,
         Descriptor {

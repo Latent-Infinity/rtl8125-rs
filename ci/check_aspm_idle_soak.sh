@@ -28,6 +28,8 @@ set -uo pipefail
 
 IFACE=${IFACE:-enp5s0}
 PEER=${PEER:-10.0.0.1}
+LOCAL_IP=${LOCAL_IP:-10.0.0.2}
+LOCAL_PREFIX=${LOCAL_PREFIX:-24}
 SOAK_HOURS=${SOAK_HOURS:-24}
 SOAK_SECS=$((SOAK_HOURS * 3600))
 SAMPLE_INTERVAL=${SAMPLE_INTERVAL:-300}     # dmesg-sample interval, 5 min default
@@ -49,7 +51,7 @@ if [[ $(cat "/sys/class/net/$IFACE/operstate") != "up" ]]; then
 	sudo ip link set "$IFACE" up
 	sleep 6
 fi
-sudo ip addr add 10.0.0.2/24 dev "$IFACE" 2>/dev/null || true
+sudo ip addr add "$LOCAL_IP/$LOCAL_PREFIX" dev "$IFACE" 2>/dev/null || true
 
 if ! ping -c 1 -W 2 -I "$IFACE" "$PEER" >/dev/null 2>&1; then
 	red "FAIL: peer $PEER not reachable at start of soak" | tee -a "$LOG"

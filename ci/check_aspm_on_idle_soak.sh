@@ -25,6 +25,8 @@ set -uo pipefail
 
 IFACE=${IFACE:-enp5s0}
 PEER=${PEER:-10.0.0.1}
+LOCAL_IP=${LOCAL_IP:-10.0.0.2}
+LOCAL_PREFIX=${LOCAL_PREFIX:-24}
 BDF=${BDF:-0000:05:00.0}
 BUILD_DIR=${BUILD_DIR:-/tmp/r8125_rust_build}
 SOAK_HOURS=${SOAK_HOURS:-24}
@@ -49,15 +51,43 @@ if ! sudo insmod "$BUILD_DIR/src/r8125_rust.ko" force_aspm=1; then
 fi
 sudo ip link set "$IFACE" up
 sleep 8
-sudo ip addr add 10.0.0.2/24 dev "$IFACE" 2>/dev/null || true
+sudo ip addr add "$LOCAL_IP/$LOCAL_PREFIX" dev "$IFACE" 2>/dev/null || true
 
 # Force aggressive ASPM policy externally too.
 echo powersupersave | sudo tee /sys/module/pcie_aspm/parameters/policy >/dev/null
 
+# Engage per-device ASPM L1 explicitly. The pcie_aspm policy alone
+# doesn't reliably flip the link to L1 Enabled even when both bridge
+# and endpoint advertise L1 (kernel chooses based on per-device flags
+# + quirks). Writing `1` to the endpoint's l1_aspm sysfs file engages
+# L1 negotiation, which propagates the bridge's side too.
+#
+# The sysfs file only exists post-2020 kernels with CONFIG_PCIEASPM
+# AND on environments where the bridge advertises ASPM L1 in LnkCap
+# — so it's missing in KVM/VFIO guests (synthetic bridge advertises
+# L0s only) and on hardware whose BIOS disables ASPM. We write
+# best-effort and warn cleanly when it's not writable.
+if [[ -w "/sys/bus/pci/devices/$BDF/link/l1_aspm" ]]; then
+	echo 1 | sudo tee "/sys/bus/pci/devices/$BDF/link/l1_aspm" >/dev/null 2>&1
+	sleep 1
+	grn "Wrote 1 to /sys/bus/pci/devices/$BDF/link/l1_aspm" | tee -a "$LOG"
+elif [[ -e "/sys/bus/pci/devices/$BDF/link/l1_aspm" ]]; then
+	# File exists but not user-writable (root-only).
+	echo 1 2>/dev/null | sudo tee "/sys/bus/pci/devices/$BDF/link/l1_aspm" >/dev/null 2>&1 \
+		&& grn "Engaged L1 via sudo write to .../link/l1_aspm" | tee -a "$LOG" \
+		|| yel "WARN: .../link/l1_aspm write failed" | tee -a "$LOG"
+	sleep 1
+else
+	yel "WARN: $BDF has no /link/l1_aspm sysfs file — bridge probably doesn't advertise L1" | tee -a "$LOG"
+	yel "  This is expected inside KVM/VFIO guests and on hardware with ASPM disabled in BIOS." | tee -a "$LOG"
+fi
+
 # Verify ASPM is now actually enabled on the device.
-if sudo lspci -s "$BDF" -vv 2>&1 | grep -q 'ASPM L1 Enabled\|LnkCtl:.*L1\b' &&
-   ! sudo lspci -s "$BDF" -vv 2>&1 | grep -q 'LnkCtl:.*ASPM Disabled'; then
+if sudo lspci -s "$BDF" -vv 2>&1 | grep -q 'LnkCtl:.*ASPM L1 Enabled' ||
+   sudo lspci -s "$BDF" -vv 2>&1 | grep -q 'LnkCtl:.*L0s L1 Enabled'; then
 	grn "ASPM L1 confirmed enabled on the device" | tee -a "$LOG"
+elif sudo lspci -s "$BDF" -vv 2>&1 | grep -q 'LnkCtl:.*L0s Enabled'; then
+	yel "WARN: only L0s engaged on the link (bridge may not advertise L1)" | tee -a "$LOG"
 else
 	yel "WARN: lspci does not show 'ASPM L1 Enabled' explicitly:" | tee -a "$LOG"
 	sudo lspci -s "$BDF" -vv 2>&1 | grep -E 'LnkCtl|LnkSta|ASPM' | tee -a "$LOG"

@@ -1,9 +1,11 @@
 # M7 prep — Upstream / Out-of-Tree decision
 
-**Status (2026-05-26): research only**. M5 ASPM soak running on the
-chip; M6 implementation queued. This document is the research dossier
-for the M7 maintainer conversation, written ahead of time so it's
-ready when the project is.
+**Status (2026-05-29): research only**. M5 ASPM soak still running
+(24 h ETA 2026-05-30 ~03:05 UTC); M6 #1 and #2 LANDED. This document
+is the **internal** research dossier for the M7 maintainer
+conversation. The **outbound** dossier (what we'd actually send to
+maintainers) is the lighter-weight
+[`M7_PRE_RFC_DOSSIER.md`](M7_PRE_RFC_DOSSIER.md).
 
 The plan §7 M7 frames the decision as one of three exits:
 1. Submit a driver RFC to netdev
@@ -153,8 +155,14 @@ abstraction would be:
 5. Then refactor our driver to use these. Maybe 50% of the cshim
    collapses; the offload encoders and chip-specific helpers stay.
 
-Realistic timeline: **6-12 months** of patch iteration with
+Realistic timeline: **12-18+ months** of patch iteration with
 maintainers before any of those abstractions are in mainline.
+Calibrated against `kernel::block` ([`M7_BLOCK_CADENCE.md`](M7_BLOCK_CADENCE.md)):
+RFC May 2023 → first merge Aug 2024 (15 months) → "complete"
+follow-up series still landing Feb 2026 (33+ months). Smaller
+surfaces, fewer prerequisites, or plural-author teams can push
+toward the low end; solo authors stall (FUJITA Tomonori 2023
+net_device proposal stalled at v2).
 
 ### Exit (c) — Maintained out-of-tree module
 

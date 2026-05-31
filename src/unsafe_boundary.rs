@@ -154,7 +154,13 @@ extern "C" {
     fn r8125_bridge_napi_schedule(ndev: *mut bindings::net_device);
     fn r8125_bridge_napi_complete_done(ndev: *mut bindings::net_device, work_done: c_int);
     fn r8125_bridge_irq_pin_cpu(irq: u32, cpu: c_int) -> c_int;
+    fn r8125_bridge_irq_pin_auto(
+        pdev: *mut bindings::pci_dev,
+        irq: u32,
+        out_cpu: *mut c_int,
+    ) -> c_int;
     fn r8125_bridge_dma_rmb();
+    fn r8125_bridge_dma_wmb();
     fn r8125_bridge_tx_stop_queue(ndev: *mut bindings::net_device);
     fn r8125_bridge_tx_wake_queue(ndev: *mut bindings::net_device);
     fn r8125_bridge_tx_disable(ndev: *mut bindings::net_device);
@@ -523,19 +529,36 @@ pub(crate) fn desc_read(ring: *mut Descriptor, idx: usize) -> Descriptor {
 }
 
 /// Write one hardware descriptor at `ring[idx]` (volatile, whole-struct).
-/// Used for **all** TX descriptors (head + fragments) and RX descriptors.
-/// The TX path writes fragment descriptors before the FirstFrag descriptor,
-/// so the chip only sees OWN|FS after the rest of the chain is populated.
-/// An explicit addr→opts2→fence→opts1 split (to match r8169's `dma_wmb()`
-/// discipline) was implemented and A/B-tested on 2026-05-26; it did not
-/// improve TSO once the segment-count cap landed. See
-/// `docs/RTL8125B_TSO_NOTES.md`.
+///
+/// Use only when the descriptor is not being published to the device with
+/// `DESC_OWN` as the synchronization point. For OWN-set TX heads and RX
+/// reposts, use [`desc_publish_own`] so `addr`/`opts2` become visible before
+/// `opts1` hands ownership to the chip.
 pub(crate) fn desc_write(ring: *mut Descriptor, idx: usize, value: Descriptor) {
     // SAFETY: as `desc_read`. The volatile pairs with the device's MMIO
     // read of the descriptor after we kick TX (or after hardware re-reads
     // an OWN-set RX slot).
     unsafe {
         core::ptr::write_volatile(ring.add(idx), value);
+    }
+}
+
+/// Publish an OWN-set descriptor with r8169-style DMA ordering.
+///
+/// Writes `addr` and `opts2`, issues `dma_wmb()`, then writes `opts1`.
+/// The final `opts1` write is the ownership transfer: on weakly ordered
+/// systems the chip must not observe `DESC_OWN` before the matching DMA
+/// address and secondary options are visible.
+pub(crate) fn desc_publish_own(ring: *mut Descriptor, idx: usize, value: Descriptor) {
+    // SAFETY: caller guarantees idx < N+1 of the ring this pointer indexes.
+    // These are descriptor-ring volatile writes, not MMIO. `dma_wmb()` is the
+    // device-ordering boundary between the non-OWN fields and the OWN publish.
+    unsafe {
+        let desc = ring.add(idx);
+        core::ptr::addr_of_mut!((*desc).addr).write_volatile(value.addr);
+        core::ptr::addr_of_mut!((*desc).opts2).write_volatile(value.opts2);
+        dma_wmb();
+        core::ptr::addr_of_mut!((*desc).opts1).write_volatile(value.opts1);
     }
 }
 
@@ -596,6 +619,24 @@ pub(crate) fn bridge_irq_pin_cpu(irq: u32, cpu: c_int) -> c_int {
     unsafe { r8125_bridge_irq_pin_cpu(irq, cpu) }
 }
 
+/// Pick the first online CPU on `pdev`'s NUMA node and pin `irq`
+/// there. Returns `(rc, cpu)` — `rc == 0` means success and `cpu`
+/// is the CPU that was actually chosen (useful for the dmesg log).
+/// Candidate #4 of `docs/RX_OPTIMIZATION_CANDIDATES.md`.
+///
+/// # SAFETY: as `bridge_irq_pin_cpu` plus: `pdev` must be a live
+/// `pci_dev` (the caller is probe-time, so probe's
+/// `pci::Device<Bound>` guarantees this).
+pub(crate) fn bridge_irq_pin_auto(
+    pdev: *mut bindings::pci_dev,
+    irq: u32,
+) -> (c_int, c_int) {
+    let mut cpu_chosen: c_int = -1;
+    // SAFETY: see fn-level contract.
+    let rc = unsafe { r8125_bridge_irq_pin_auto(pdev, irq, &mut cpu_chosen) };
+    (rc, cpu_chosen)
+}
+
 /// DMA read barrier for the RX descriptor OWN-bit handoff.
 ///
 /// # SAFETY: the C shim calls Linux `dma_rmb()`, which has no pointer or
@@ -605,6 +646,17 @@ pub(crate) fn bridge_irq_pin_cpu(irq: u32, cpu: c_int) -> c_int {
 pub(crate) fn dma_rmb() {
     // SAFETY: see fn-level contract.
     unsafe { r8125_bridge_dma_rmb() };
+}
+
+/// DMA write barrier used by [`desc_publish_own`]. Sister to `dma_rmb` —
+/// see Candidate #1 of `docs/RX_OPTIMIZATION_CANDIDATES.md`.
+///
+/// # SAFETY: same as `dma_rmb` — no pointer or ownership preconditions.
+/// The ordering contract is caller-side: use it between the descriptor's
+/// non-OWN fields and the `opts1` write that sets `DESC_OWN`.
+pub(crate) fn dma_wmb() {
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_dma_wmb() };
 }
 
 pub(crate) fn bridge_tx_stop_queue(ndev: *mut bindings::net_device) {

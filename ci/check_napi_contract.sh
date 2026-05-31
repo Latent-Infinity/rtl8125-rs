@@ -123,7 +123,9 @@ else
 fi
 
 # -- 7. stop-side hysteresis -------------------------------------------------
-if echo "$xmit_body" | grep -qE 'if free_after < TX_STOP_THRS'; then
+# Accept either the direct `if free_after < TX_STOP_THRS { ... }` form
+# or an equivalent local boolean used to feed the stop call.
+if echo "$xmit_body" | grep -qE 'free_after < TX_STOP_THRS'; then
 	grn "xmit: preemptive tx_stop_queue is guarded by 'free_after < TX_STOP_THRS'"
 else
 	red "xmit: preemptive stop not guarded by 'free_after < TX_STOP_THRS'"

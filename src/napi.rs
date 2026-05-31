@@ -141,7 +141,8 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
         if rx_tail == RING_LEN - 1 {
             opts1 |= regs::DESC_EOR;
         }
-        ub::desc_write(
+        // Publish OWN only after addr/opts2 are visible to the device.
+        ub::desc_publish_own(
             state.rx.desc,
             rx_tail,
             Descriptor { opts1, opts2: 0, addr: slot.dma },

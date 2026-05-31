@@ -188,10 +188,27 @@ void r8125_bridge_unregister_and_free(struct net_device *ndev);
  */
 int r8125_bridge_irq_pin_cpu(unsigned int irq, int cpu);
 
+/*
+ * Pick the first online CPU on `pdev`'s NUMA node and pin `irq` there.
+ * On UMA hosts this collapses to "lowest-numbered online CPU."
+ * `out_cpu` receives the chosen CPU on success (may be NULL). Returns
+ * 0 on success or a negative errno. See Candidate #4 of
+ * `docs/RX_OPTIMIZATION_CANDIDATES.md`.
+ */
+int r8125_bridge_irq_pin_auto(struct pci_dev *pdev, unsigned int irq,
+			      int *out_cpu);
+
 /* DMA read barrier after an RX descriptor's OWN bit clears. Mirrors
  * r8169's rtl_rx ordering: descriptor fields and DMA-written bytes are
  * not read until the device's OWN-clear publish is visible. */
 void r8125_bridge_dma_rmb(void);
+
+/* DMA write barrier before publishing a descriptor with the DescOwn bit
+ * set. Pair with the chip's view: without this, the chip could observe
+ * `opts1`'s OWN-set before the matching `addr`/`opts2` stores are
+ * visible on weakly-ordered archs (ARM, RISC-V). r8169 uses dma_wmb()
+ * at the equivalent points. */
+void r8125_bridge_dma_wmb(void);
 
 /* ──────────────────────────────────────────────────────────────────────
  *  Flow-control + NAPI-arming helpers — the §6.3 invariants live here.

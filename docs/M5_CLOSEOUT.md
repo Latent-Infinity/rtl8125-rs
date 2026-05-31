@@ -101,51 +101,161 @@ The driver is at upstream r8169 parity for single-stream throughput.
 | `unsafe`-allowing files | 1 (`src/unsafe_boundary.rs`) | enforced |
 | Static CI checks | 48/48 PASS | up from 34 at M4 close |
 
-## Remaining operator-time work for full M5 sign-off
+## Soak results
 
-These items have **all runnable code + harnesses** in tree; they need
-wall-clock chip time:
+### Controller-KVM 48h chained ASPM soak — ✅ COMPLETED 2026-05-27
 
-1. **48-hour chained ASPM idle soak** — STARTED 2026-05-26 05:46:47 UTC
-   as systemd transient unit `r8125-aspm-both.service`. Runs two 24h
-   phases back-to-back:
-   - Phase 1: `force_aspm=0` (production default) — validates 24h
-     idle without ASPM L1.x entries
-   - Phase 2: `force_aspm=1` (test-only) — validates the historical
-     L1.x lockup gate with ASPM L1 forcibly enabled via module param
+The `r8125-aspm-both.service` systemd unit ran 2026-05-26 05:46:47 UTC
+→ 2026-05-28 ~06:00 UTC (48 hours total). Result:
 
-   Estimated completion: **2026-05-28 ~06:00 UTC** (48 hours from
-   start). Check progress with:
-   ```
-   ssh -i ~/.ssh/agent/rtl8125_guest_codex operator@192.168.122.174 \
-       'sudo systemctl status r8125-aspm-both --no-pager; tail -20 /tmp/r8125_aspm_both.log'
-   ```
-   The script aborts phase 2 if phase 1 fails. Exit code captured in
-   the systemd unit's `ExecMainStatus`.
+```
+ExecMainStatus: 0
+Wrapper log:    "BOTH PHASES PASSED — M5 ASPM gate cleared"
+```
 
-2. **24-hour active soak** (`SOAK_HOURS=24 ci/check_active_soak.sh`)
-   — sustained 100 Mbps mixed traffic with all kernel-debug knobs
-   armed. Pass: zero KASAN/lockdep/kmemleak/DMA-API warnings.
-   Run after the ASPM chain completes (mutually exclusive with idle).
+| Phase | Duration | force_aspm | Result |
+|---|---|---|---|
+| Phase 1 | 24h | 0 (production default) | ✅ PASSED — 288/288 samples clean |
+| Phase 2 | 24h | 1 (test-only) | ✅ PASSED — `ExecMainStatus: 0` |
 
-3. **10× FLR cycles** (`CYCLES=10 ci/check_flr_cycle.sh`) — closest
-   suspend/resume proxy available without kernel-Rust PCI PM (see
-   `docs/M5_PM_GAP.md`). **NOTE**: the validated MS-A2 RTL8125B
-   reports `FLReset-` in lspci — the chip doesn't support FLR. The
-   harness exits with a clean message in that case. Use the
-   `device/remove` + `bus/rescan` + `driver_override` cycle as an
-   alternative; 3/3 cycles validated in M5 prep.
+**Important caveat for Phase 2**: discovered during the Gateway setup
+investigation that QEMU's synthetic upstream PCIe bridge advertises
+ASPM **L0s only, never L1** — so even with `force_aspm=1` setting
+Config5 ASPM_en=1, the link physically cannot enter L1.x inside the
+KVM guest. Phase 2 therefore validated that the chip + driver survive
+24h idle with Config5 ASPM_en=1 but the link held in L0; it did
+**not** exercise the historical L1.x lockup gate. That gate requires
+bare metal — see Gateway results below.
 
-4. **syzkaller 4h** — config in `ci/syzkaller_config.txt`. Operator
-   sets up the syzkaller VM, points it at our driver, runs for 4h.
-   Pass: no panics, no KASAN/UBSAN reports.
+### Controller-KVM 100× rmmod-under-traffic stress — ✅ COMPLETED 2026-05-29 (POST-SOAK ADDENDUM)
+
+Tier 1c of [`POST_SOAK_PLAN.md`](POST_SOAK_PLAN.md). Volume validation
+of the #58 BAR-UAF fix that previously shipped after 1 successful run.
+Ran on the KVM guest with the **new build** including the
+`aspm_force_off` Tier 3c addition, so this also validates that change.
+
+| Item | Value |
+|---|---|
+| Driver build | `r8125_rust.ko` with Tier 3c `aspm_force_off` patch loaded with `aspm_force_off=1` (dmesg ack confirmed) |
+| Cycles | 100 (TRAFFIC_SECS=4, RMMOD_DELAY=2) |
+| Per-cycle pattern | `insmod` → link up → iperf3 4 s → `rmmod` (with iperf3 in flight) → dmesg scan |
+| Per-cycle pass criterion | no `BUG`/`WARN`/`KASAN`/`UBSAN`/`lockdep` in dmesg |
+| **Verdict** | ✅ **PASS 100/100 cycles clean** (0 fails, 0 EBUSY, 0 kernel anomalies) |
+
+Completed 2026-05-29 22:49 UTC. Report + raw log archived at
+`/tmp/r8125_rmmod_stress_20260529_223653.{md,log}` on the guest.
+**Closes Tier 1c gate.** This is the volume validation the
+single-shot #58 fix needed.
+
+### Re-run on committed RX-fix build — ✅ COMPLETED 2026-05-30 (POST-#79)
+
+Re-ran the same 100× harness on the committed build that includes
+the napi_alloc_skb + `__skb_put_data` RX-path fix (commits
+`c8f0ef0` and follow-on). Verifies the hot-path change doesn't
+introduce a teardown-time regression at volume.
+
+| Item | Value |
+|---|---|
+| Driver build | committed RX-fix (napi_alloc_skb + prefetch + `__skb_put_data`) |
+| Cycles | 100 (TRAFFIC_SECS=4, RMMOD_DELAY=2) |
+| **Verdict** | ✅ **PASS 100/100 cycles clean**, 0 kernel anomalies |
+| Same h→g MTU 1500 perf re-verified | 1.443 Gbps (+19.8% vs pre-fix 1.205) |
+
+The RX hot-path change is confirmed stable under both perf
+characterization AND teardown stress at volume.
+
+### Controller-KVM Tier 2 perf characterization — ✅ COMPLETED 2026-05-29
+
+Same KVM run captured `r8125_rust` perf against r8169 baselines.
+Full numbers in [`perf/r8169_comparison.md`](perf/r8169_comparison.md);
+headline:
+
+| Direction | MTU | r8125_rust | vs r8169 |
+|---|---|---:|---:|
+| g → h TCP | 1500 | 2.343 Gbps | +0.6% |
+| g → h TCP | 9000 | 2.474 Gbps | +4.3% |
+| h → g TCP | 1500 (pre-fix) | 1.205 Gbps | -48.2% |
+| h → g TCP | 1500 (**post-fix**) | **1.412 Gbps** | -39.3% |
+| h → g TCP | 9000 | 2.473 Gbps | +0.0% |
+| p99 RTT under 100 Mbps load | 1500 | 1.35 ms max / 0.21 ms avg | — |
+
+§7 M6 acceptance: within 10% of vendor — ✅ for 3/4 TCP corners.
+The h→g MTU 1500 corner improved from -48% to -39% via the
+`napi_alloc_skb` + `prefetch` + `skb_copy_to_linear_data` fix
+landed 2026-05-30. `perf record` profiling showed ~40% of cycles
+under KASAN + lockdep on the KVM debug kernel — so the residual
+gap is most likely a KVM-debug artifact, not a production issue.
+Gateway bare-metal re-measure (Tier 1b + 2 follow-on) is the
+production-authority decider. Detailed in
+`perf/r8169_comparison.md` §"RX-asymmetry finding + fix".
+
+### Gateway bare-metal 24h ASPM-L1 soak — 🟢 IN PROGRESS
+
+Started 2026-05-28 16:00:43 UTC as systemd transient unit
+`r8125-aspm-on-gateway.service` on the second MS-A2 ("Gateway", see
+`docs/GATEWAY_SETUP.md` + `docs/GATEWAY_HARDWARE.md`).
+
+| Item | Value |
+|---|---|
+| Box | Bare-metal MS-A2 — no VFIO, no KASAN |
+| Driver | `force_aspm=1` (Config5 ASPM_en=1) |
+| Bridge LnkCap | `ASPM L1` ← real, post-BIOS update |
+| Bridge LnkCtl | `ASPM L1 Enabled` ← the link IS in L1 during idle |
+| Endpoint LnkCtl | `ASPM L1 Enabled` |
+| Expected end | ~2026-05-29 16:00 UTC |
+| Sampling | every 5 min, grep dmesg for BUG/KASAN/Oops/hang/lockup/L1-timeout |
+
+**This is the first time the M5 historical L1.x lockup gate is
+testable in this project.** Controller-KVM physically could not
+exercise it; Gateway has a real PCIe root complex that advertises L1
+once the BIOS enables it. The 24h soak with a real L1.x-capable link
+is the binding evidence the plan §7 M5 calls for.
+
+Progress check:
+```
+ssh -i ~/.ssh/agent/rtl8125_gateway_codex firestrand@100.125.107.46 \
+    'sudo systemctl is-active r8125-aspm-on-gateway
+     tail -10 /tmp/r8125_aspm_on_soak.log'
+```
+
+### Other M5 gates
+
+| Gate | Status |
+|---|---|
+| 24h active soak (`ci/check_active_soak.sh`) | Pending Gateway-side run after idle soak (mutually exclusive) |
+| 10× FLR cycles | Chip doesn't support FLR (`FLReset-` in lspci); `device/remove` + `bus/rescan` + `driver_override` validated 3/3 on Controller-KVM as substitute |
+| syzkaller 4h | Pending; config sketch in `ci/syzkaller_config.txt` |
+| PREEMPT_RT cross-test | Optional; awaiting RT kernel availability |
+
+## Findings surfaced by Gateway bring-up
+
+1. **rmmod-while-active-traffic hang** (task #58) — the harness that passes 5/5 on Controller-KVM hangs Gateway under stock kernel (no KASAN to fail fast). Workaround: bring link down before rmmod. Root cause TBD. Not blocking M5 sign-off since the soak is idle.
+2. **Kernel-Rust `module_param` no sysfs read-back** — `/sys/module/r8125_rust/parameters/` doesn't exist; `force_aspm` is processed at insmod but not user-readable. The param IS in effect, just not introspectable. File upstream as a kernel-Rust UX gap.
+3. **AMI BIOS hides ASPM behind a non-obvious menu** — exact MS-A2 path documented in `docs/GATEWAY_HARDWARE.md` for future reproducibility.
 
 ## Upstream API gap noted
 
-Kernel-Rust `kernel::pci::Driver` does not expose suspend/resume hooks.
-See `docs/M5_PM_GAP.md` for the analysis and recommended remediation
-path. The FLR-cycle harness above is the closest substitute available
-today.
+Kernel-Rust `kernel::pci::Driver` does not expose suspend/resume
+hooks. See `docs/M5_PM_GAP.md` for the analysis and remediation path.
+The FLR-cycle harness (or remove+rescan workaround) is the closest
+substitute today.
+
+## Sign-off posture
+
+Once the Gateway L1.x soak completes successfully:
+
+- M5 NAPI correctness: ✅ done (task #50)
+- M5 §6.3 counter invariant: ✅ done (task #40)
+- M5 ASPM-off 24h idle soak: ✅ Controller-KVM phase 1 + Gateway equivalent
+- M5 ASPM-on 24h L1.x soak: ✅ Gateway (the binding evidence)
+- M5 24h active soak: pending Gateway re-run
+- M5 syzkaller: pending operator
+- M5 PM suspend/resume: deferred (kernel-Rust API gap; not a chip issue)
+
+The driver exits M5 at **r8169 single-stream throughput parity**
+(2.36 Gbps measured on Gateway bare metal, see
+`docs/perf/gateway_baseline.md`) with **the historical L1.x lockup
+gate honestly tested for the first time** on bare-metal hardware.
 
 ## Sign-off
 

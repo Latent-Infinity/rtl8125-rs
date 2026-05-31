@@ -289,29 +289,58 @@ impl pci::Driver for R8125Driver {
                         if intx_only { ", forced by intx_only" } else { "" }
                     );
 
-                    // Candidate L (RX_OPTIMIZATION_CANDIDATES.md §L):
-                    // suggest CPU affinity for the IRQ. Pin to CPU 0
-                    // by default — irqbalance + operator can override
-                    // via /proc/irq/N/smp_affinity. Reduces tail-latency
-                    // spikes from softirq cross-CPU migration AND keeps
-                    // the per-CPU NAPI page-frag cache warm. Best-effort:
-                    // if the kernel rejects (e.g. CPU 0 offline), we
-                    // log and proceed — the driver still works.
-                    let pin_rc = unsafe_boundary::bridge_irq_pin_cpu(
-                        irq_num as u32, 0,
-                    );
-                    if pin_rc == 0 {
-                        dev_info!(
-                            pdev,
-                            "RTL8125 IRQ {} affinity hint set to CPU 0\n",
-                            irq_num
-                        );
-                    } else {
-                        dev_info!(
-                            pdev,
-                            "RTL8125 IRQ {} affinity hint failed: rc={} (driver still functional)\n",
-                            irq_num, pin_rc
-                        );
+                    // Candidate L + #4 — IRQ affinity policy.
+                    //
+                    // The `irq_pin_cpu` module param selects:
+                    //   255  → auto: pick first online CPU on the chip's
+                    //          NUMA node (PCI-local). UMA hosts collapse
+                    //          to lowest-numbered online CPU.
+                    //   254  → skip; leave to irqbalance.
+                    //   0..253 → explicit CPU index; must be online.
+                    //
+                    // Default is 255 (auto). Operator can override via
+                    // module param OR per-IRQ `/proc/irq/N/smp_affinity`.
+                    // Best-effort: kernel rejection (e.g. offline CPU)
+                    // is logged and we proceed — driver still works.
+                    let pin_policy =
+                        *crate::module_parameters::irq_pin_cpu.value();
+                    let (pin_rc, chosen_cpu) = match pin_policy {
+                        255 => unsafe_boundary::bridge_irq_pin_auto(
+                            unsafe_boundary::pci_dev_raw(pdev),
+                            irq_num as u32,
+                        ),
+                        254 => {
+                            dev_info!(
+                                pdev,
+                                "RTL8125 IRQ {} affinity hint skipped (irq_pin_cpu=254)\n",
+                                irq_num
+                            );
+                            (0, -1)
+                        }
+                        n => {
+                            let cpu = core::ffi::c_int::from(n);
+                            (
+                                unsafe_boundary::bridge_irq_pin_cpu(
+                                    irq_num as u32, cpu,
+                                ),
+                                cpu,
+                            )
+                        }
+                    };
+                    if pin_policy != 254 {
+                        if pin_rc == 0 {
+                            dev_info!(
+                                pdev,
+                                "RTL8125 IRQ {} affinity hint set to CPU {} (policy={})\n",
+                                irq_num, chosen_cpu, pin_policy
+                            );
+                        } else {
+                            dev_info!(
+                                pdev,
+                                "RTL8125 IRQ {} affinity hint failed: rc={} policy={} (driver still functional)\n",
+                                irq_num, pin_rc, pin_policy
+                            );
+                        }
                     }
 
                     // Tier 3c: `aspm_force_off=1` operator intent.

@@ -222,3 +222,35 @@ correctness gap documented as Candidate C in
 `docs/RX_OPTIMIZATION_CANDIDATES.md`. The helper has no pointer or
 ownership preconditions; the safety contract is ordering-only and is
 enforced by `ci/check_rx_skb_build.sh`.
+
+## 2026-05-31 — RX Opt #1 bump 49 → 51
+
+Added `dma_wmb()` safe wrapper in `src/unsafe_boundary.rs`, calling
+the new cshim `r8125_bridge_dma_wmb` (which calls Linux `dma_wmb()`).
+Also added `desc_publish_own`, the reviewed descriptor publisher that
+writes `addr` and `opts2`, calls `dma_wmb()`, then writes `opts1` as
+the OWN-bit handoff.
+
+Call sites:
+
+- `src/napi.rs::process_rx_completions` — OWN-set RX re-post.
+- `src/netdev.rs::ndo_start_xmit` — FirstFrag publish that releases the
+  TX chain to the chip.
+
+Net change: +1 mechanical FFI wrapper plus +1 descriptor-ring unsafe
+block. The descriptor writes target DMA-coherent memory, not MMIO, and
+are covered by `ci/check_dma_barriers.sh`.
+
+## 2026-05-31 — RX Opt #4 bump 51 → 52
+
+Added `bridge_irq_pin_auto(pdev, irq)` safe wrapper in
+`src/unsafe_boundary.rs`, calling new cshim
+`r8125_bridge_irq_pin_auto` which picks the first online CPU on
+`pdev`'s NUMA node and calls `irq_set_affinity_and_hint`. Sister
+to `bridge_irq_pin_cpu` (CPU 0 hardcoded → now policy-selected).
+
+Net change: +1 mechanical FFI wrapper. The new module param
+`irq_pin_cpu: u8` (default 255 = auto) selects between
+`bridge_irq_pin_auto` (255), no-op (254), and explicit
+`bridge_irq_pin_cpu(N)` (0..253). See Candidate #4 of
+`docs/RX_OPTIMIZATION_CANDIDATES.md`.

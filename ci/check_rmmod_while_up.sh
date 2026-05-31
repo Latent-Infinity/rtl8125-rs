@@ -16,6 +16,8 @@ set -uo pipefail
 
 IFACE=${IFACE:-enp5s0}
 PEER=${PEER:-10.0.0.1}
+LOCAL_IP=${LOCAL_IP:-10.0.0.2}
+LOCAL_PREFIX=${LOCAL_PREFIX:-24}
 CYCLES=${CYCLES:-5}
 TRAFFIC_SECS=${TRAFFIC_SECS:-8}
 RMMOD_DELAY=${RMMOD_DELAY:-3}
@@ -55,10 +57,10 @@ for cycle in $(seq 1 "$CYCLES"); do
 		fi
 		sleep 0.5
 	done
-	sudo ip addr add 10.0.0.2/24 dev "$IFACE" 2>/dev/null || true
+	sudo ip addr add "$LOCAL_IP/$LOCAL_PREFIX" dev "$IFACE" 2>/dev/null || true
 
 	# Start traffic in background, rmmod mid-flight.
-	(iperf3 -c "$PEER" -B 10.0.0.2 -t "$TRAFFIC_SECS" >/dev/null 2>&1 &)
+	(iperf3 -c "$PEER" -B "$LOCAL_IP" -t "$TRAFFIC_SECS" >/dev/null 2>&1 &)
 	sleep "$RMMOD_DELAY"
 
 	if sudo rmmod r8125_rust; then

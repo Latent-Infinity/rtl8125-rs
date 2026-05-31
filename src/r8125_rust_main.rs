@@ -131,5 +131,17 @@ kernel::module_pci_driver! {
             default: 0,
             description: "Reserve operator intent for ASPM force-off (chip-side already off by default)",
         },
+        // RX Opt #4 — IRQ affinity policy with PCI-local default.
+        // Conventions (u8 because `kernel::module_param` doesn't yet
+        // expose signed types):
+        //   255  → auto: pick first online CPU on the chip's NUMA node
+        //          (default, latency-aligned)
+        //   254  → don't pin; leave to irqbalance
+        //   0..253 → explicit CPU index; must be online
+        // See `docs/RX_OPTIMIZATION_CANDIDATES.md` §"#4".
+        irq_pin_cpu: u8 {
+            default: 255,
+            description: "IRQ affinity policy: 255=auto (PCI-local), 254=skip, 0..253=explicit CPU index",
+        },
     },
 }

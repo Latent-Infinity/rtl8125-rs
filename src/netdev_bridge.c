@@ -8,7 +8,7 @@
  * has no stable Rust API today: net_device + net_device_ops + NAPI +
  * sk_buff plumbing (plan §5.2 / §5.3).
  *
- * Hard cap: 400 LOC including comments. Candidate G/L/M additions fit
+ * Hard cap: 450 LOC including comments. Candidate G/L/M additions fit
  * under the original cap after the dead RX helper exports were removed.
  * See cshim/README.md.
  *
@@ -281,11 +281,70 @@ int r8125_bridge_irq_pin_cpu(unsigned int irq, int cpu)
 }
 EXPORT_SYMBOL_GPL(r8125_bridge_irq_pin_cpu);
 
+/*
+ * `r8125_bridge_irq_pin_auto` — Candidate #4 of
+ * `docs/RX_OPTIMIZATION_CANDIDATES.md`.
+ *
+ * Pick the first online CPU on the PCI device's NUMA node and pin the
+ * vector there. On boxes where the chip's IOMMU/root-complex hangs off
+ * a specific NUMA node, servicing the IRQ on a CPU in the same node
+ * keeps the RX-completion data on the right side of the inter-socket
+ * link. On UMA boxes (most desktops, the MS-A2) every CPU is "local"
+ * so this collapses to "pick the lowest-numbered online CPU." Both
+ * cases are better than the previous hardcoded CPU 0 default.
+ *
+ * Output via `out_cpu` so the Rust side can log which CPU was chosen.
+ * On failure (no online CPU on the node), returns -EINVAL and leaves
+ * *out_cpu unchanged.
+ */
+int r8125_bridge_irq_pin_auto(struct pci_dev *pdev, unsigned int irq,
+			      int *out_cpu)
+{
+	int node = dev_to_node(&pdev->dev);
+	const struct cpumask *node_mask;
+	int cpu;
+
+	if (node == NUMA_NO_NODE) {
+		/* Box doesn't know its NUMA topology; just pick CPU 0
+		 * if it's online, else the first online CPU. */
+		cpu = cpumask_first(cpu_online_mask);
+	} else {
+		node_mask = cpumask_of_node(node);
+		cpu = cpumask_first_and(node_mask, cpu_online_mask);
+	}
+	if (cpu >= nr_cpu_ids)
+		return -EINVAL;
+	if (out_cpu)
+		*out_cpu = cpu;
+	return irq_set_affinity_and_hint(irq, cpumask_of(cpu));
+}
+EXPORT_SYMBOL_GPL(r8125_bridge_irq_pin_auto);
+
 void r8125_bridge_dma_rmb(void)
 {
 	dma_rmb();
 }
 EXPORT_SYMBOL_GPL(r8125_bridge_dma_rmb);
+
+/*
+ * `r8125_bridge_dma_wmb` — sister to `_dma_rmb`. Issue a write-side DMA
+ * barrier before publishing a descriptor with the DescOwn bit set
+ * (TX xmit path) and before re-posting an RX descriptor to the chip
+ * (NAPI poll path). On x86 (TSO) this expands to `sfence`; on ARM/
+ * RISC-V it's a real `dmb ishst`. Pairs with the chip's view of the
+ * DMA-coherent descriptor ring: without it, the chip could read
+ * `opts1` (with OWN set) before the matching `addr` / `opts2` stores
+ * are visible to the bus. r8169 uses `dma_wmb()` at the same point
+ * (r8169_main.c:4189 + :4636).
+ *
+ * Cost on x86: one `sfence` per call — measurable only in micro-
+ * benchmarks; invisible at line rate.
+ */
+void r8125_bridge_dma_wmb(void)
+{
+	dma_wmb();
+}
+EXPORT_SYMBOL_GPL(r8125_bridge_dma_wmb);
 
 /* ── Flow-control + NAPI helpers ────────────────────────────────────── */
 

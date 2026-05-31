@@ -1,12 +1,14 @@
 # RX hot-path optimization candidates (post-#79)
 
-**Status (2026-05-30):** Candidates **A**, **B**, **C**, **F**, **G**
-SHIPPED on KVM. Candidate **H** skipped (LLVM likely elides
-the bounds check; trade-off not worth `unsafe` surface for marginal
-gain). The decision tree at the bottom of this file is still active
-for the Gateway re-measurement (task #80) outcome — it determines
-whether more aggressive optimizations (I, J, D, K, E) become
-warranted.
+**Status (2026-05-30):** Candidates **A**, **B**, **C**, **F**, **G**,
+**L**, **M**, **#1** (TX/RX dma_wmb), **#4** (irq_pin_cpu policy)
+SHIPPED on KVM. Candidate **#2** (BQL + xmit_more) REVERTED
+2026-05-30 — see "RX Opt #2 — REVERTED" section below for the
+dql_min_limit=0 bootstrap-stall root cause. Candidate **H**
+skipped (LLVM likely elides the bounds check). The decision tree
+at the bottom of this file is still active for the Gateway
+re-measurement (task #80) outcome — it determines whether more
+aggressive optimizations (I, J, D, K, E) become warranted.
 
 KVM measurement after A + B both landed:
 
@@ -342,6 +344,66 @@ Gateway h→g MTU 1500 TCP:
     Profile heavily. Consider K (page_pool) if alloc/map shows up.
 ```
 
+## Post-A+B+F+G+L+M re-profile (Tier B, 2026-05-30 ~15:00 UTC)
+
+Re-ran `perf record -a -g -F 999 -- sleep 15` on the KVM during
+the active soak (100 Mbps sustained TCP, A+B+F+G+L+M build, all
+RX-optimization candidates landed). Compared against the pre-
+optimization profile from §"What we did":
+
+| Symbol | Pre | Post | Δ |
+|---|---:|---:|---:|
+| `__pv_queued_spin_lock_slowpath` | 4.90% | <0.5% | **-4.4%** |
+| `unwind_next_frame` | 5.31% | 1.37% | -3.94% |
+| `stack_trace_consume_entry` | 6.20% | 2.87% | -3.33% |
+| `update_stack_state` | 5.55% | 2.73% | -2.82% |
+| `do_csum` | 2.15% | (out of top 25) | -2.15% |
+| `stack_depot_save_flags` | 2.31% | 1.04% | -1.27% |
+| `__lock_acquire` | 11.42% | 10.33% | -1.09% |
+| **Top-14 KASAN+lockdep sum** | **53.1%** | **39.8%** | **-13.3%** |
+
+### Three findings
+
+1. **`__pv_queued_spin_lock_slowpath` collapsed (4.9% → <0.5%).**
+   Candidate G's per-CPU TSTATS removed the
+   `ndev->stats.{rx,tx}_packets` cache-line contention. NAPI poll
+   on one core no longer bounces a line with `ifconfig` /
+   `softnet` readers on others. This is the clearest single signal
+   that G shipped despite being invisible on KVM throughput.
+
+2. **KASAN+lockdep overhead dropped 13 percentage points.** Not
+   because KASAN got faster — because the driver's hot path
+   generates fewer events for stack_trace_consume_entry and
+   unwind_next_frame to walk. Candidate B (5 FFI → 1) means 4×
+   fewer call/return frames per packet. Candidate F's hoisted
+   `ndev` load is one fewer atomic for `__lock_acquire` to
+   record. Translates to a similar real-world gain on Gateway
+   (where KASAN doesn't run at all).
+
+3. **`do_csum` (TCP/UDP software checksum) fell out of the top 25.**
+   Previously 2.15%. Either the chip's RX-checksum offload is now
+   reliably eating those cycles, or `dev_sw_netstats_rx_add` (G)
+   removed enough surrounding overhead that csum dropped relative.
+   Either way, the path is healthier.
+
+### `r8125_rust` symbols are not in the top 25
+
+The driver hot path is now below the KVM instrumentation noise
+floor. **We have nothing more to optimize on KVM** — anything we
+do is speculative without bare-metal data. Decision: STOP RX-opt
+work on KVM, gate next candidates on Gateway measurements per the
+decision tree above.
+
+### Sole open issue: `rx_missed`
+
+ethtool reports `rx_missed = 51107` during the 15-second window.
+The chip RX-overran ~51K times in 15s = ~3.4K misses/sec at
+100 Mbps. Likely the host can't drain RX fast enough under KASAN
+instrumentation. **Expected to drop to near-zero on Gateway**
+(no KASAN). If it doesn't, that's the canonical signal to do
+Candidate J's "chip RX coalescing → 0" tuning to widen the
+chip's RX FIFO drain window.
+
 ## Candidate J — Redirected: latency-first chip-side coalescing (instead of efficiency)
 
 Per operator direction 2026-05-30, J is reframed for this project:
@@ -401,3 +463,46 @@ stability (L) combination as a real latency win independent of
 KASAN dominance — exactly what the heterogeneous-LB use case
 demands. Expected to compound on Gateway bare-metal where
 softirq cross-CPU migration costs are higher.
+
+## RX Opt #2 — BQL + `netdev_xmit_more()` ⛔ REVERTED 2026-05-30
+
+Shipped briefly, then reverted the same day after observing a
+hard TX stall on KVM.
+
+**Symptom:** after `rmmod` + `insmod` of the new build, the first
+ping (`bytes=60`) returned RX traffic but TX completions never
+happened. `tx_received` climbed to 1 then froze; `tx_consumed`
+stayed at 0. Management network in the KVM guest became
+unresponsive within seconds.
+
+**Bisection:** the only path-altering change in #2 vs the prior
+#1+#4 build was the BQL pair (`netdev_sent_queue` / `xmit_more`
+gated doorbell) and `netdev_reset_queue()` at ndo_open/ndo_stop.
+
+**Root cause:** `netdev_reset_queue()` sets
+`dql->limit = dql->min_limit`. `dql_min_limit` defaults to **0**.
+So the very first xmit with `skb->len=60` produces
+`dql_avail = limit - inflight - bytes = 0 - 0 - 60 = -60`,
+which `dql_queued()` interprets as "over budget" and sets
+`__QUEUE_STATE_STACK_XOFF` on the queue. Our doorbell-suppression
+gate then declined to ring (because `xmit_more` saw the queue
+already stopped), so no completions ever arrived to grow the
+limit back up. Classic BQL-bootstrap deadlock.
+
+**Re-do plan (deferred):** before reactivating #2 we must either
+(a) seed `dql_min_limit` to at least `MTU + max_header_room` so
+the first xmit doesn't immediately fence the queue, **or** (b)
+skip `netdev_reset_queue()` at open and let BQL ramp organically
+from the first ack instead. Either approach needs a chip-up
+smoke that proves `tx_consumed` advances on the very first
+xmit before we re-enable the path.
+
+**State after review:** the failed BQL/xmit_more implementation is
+fully out of tree. No disabled gate, dead FFI wrappers, or unused
+`consume_tx` byte-return path remain. Future work should reintroduce
+the smallest possible surface behind a fresh failing gate and a first-
+packet TX smoke test.
+
+This finding is also a small lesson for future BQL adopters: any
+out-of-tree driver that calls `netdev_reset_queue()` at probe or
+open *must* seed `dql_min_limit` first or skip the reset.

@@ -152,10 +152,16 @@ gate before or with the implementation. Current mandatory gates include:
   storage, increments, snapshot, and ethtool.
 - `ci/check_napi_contract.sh`: NAPI budget, IRQ masking, and TX queue
   hysteresis ordering.
+- `ci/check_offload_path.sh`: TX checksum/TSO prep before DMA mapping,
+  shadowed unmap lengths/types, jumbo offload disabling, and SG rollback
+  clearing of pre-staged descriptors.
 - `ci/check_rx_skb_build.sh`: RX skb-build hot path uses the NAPI-local
   allocator only from NAPI RX poll, uses skb helpers without direct
   `sk_buff` tail/len mutation, and orders post-OWN descriptor reads behind
   the DMA read barrier.
+- `ci/check_dma_barriers.sh`: descriptor OWN-bit handoffs use the reviewed
+  DMA barriers: post-OWN RX reads go through `dma_rmb()`, and OWN-set TX/RX
+  publishes write non-OWN fields before `dma_wmb()` before `opts1`.
 - `ci/check_no_panic_paths.sh`: no `unwrap`, `expect`, `panic!`,
   runtime `assert!`, `unreachable!`, `todo!`, or `debug_assert!` in driver
   Rust sources.

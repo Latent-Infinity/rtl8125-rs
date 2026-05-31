@@ -32,6 +32,8 @@ set -uo pipefail
 
 IFACE=${IFACE:-enp5s0}
 PEER=${PEER:-10.0.0.1}
+LOCAL_IP=${LOCAL_IP:-10.0.0.2}
+LOCAL_PREFIX=${LOCAL_PREFIX:-24}
 BDF=${BDF:-0000:05:00.0}
 BUILD_DIR=${BUILD_DIR:-/tmp/r8125_rust_build}
 BUILD_V2_DIR=${BUILD_V2_DIR:-/tmp/r8125_rust_build_v2}
@@ -46,7 +48,8 @@ echo "==== Phase 1: force_aspm=0 (driver default; ASPM off) ====" | tee "$LOG"
 date | tee -a "$LOG"
 
 SOAK_HOURS="$SOAK_HOURS" SAMPLE_INTERVAL="$SAMPLE_INTERVAL" \
-	IFACE="$IFACE" PEER="$PEER" LOG=/tmp/r8125_aspm_soak.log \
+	IFACE="$IFACE" PEER="$PEER" LOCAL_IP="$LOCAL_IP" LOCAL_PREFIX="$LOCAL_PREFIX" \
+	LOG=/tmp/r8125_aspm_soak.log \
 	bash "$BUILD_DIR/ci/check_aspm_idle_soak.sh"
 EXIT1=$?
 
@@ -70,7 +73,8 @@ if [[ ! -f "$BUILD_V2_DIR/src/r8125_rust.ko" ]]; then
 fi
 
 SOAK_HOURS="$SOAK_HOURS" SAMPLE_INTERVAL="$SAMPLE_INTERVAL" \
-	IFACE="$IFACE" PEER="$PEER" BDF="$BDF" BUILD_DIR="$BUILD_V2_DIR" \
+	IFACE="$IFACE" PEER="$PEER" LOCAL_IP="$LOCAL_IP" LOCAL_PREFIX="$LOCAL_PREFIX" \
+	BDF="$BDF" BUILD_DIR="$BUILD_V2_DIR" \
 	LOG=/tmp/r8125_aspm_on_soak.log \
 	bash "$BUILD_V2_DIR/ci/check_aspm_on_idle_soak.sh"
 EXIT2=$?

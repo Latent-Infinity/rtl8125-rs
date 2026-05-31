@@ -50,6 +50,11 @@ grep -q 'skb_frag_dma_map(dev, frag' "$OFFLOAD" \
   && ok "SG fragment DMA map/unmap path preserves mapping type" \
   || bad "SG fragments mapped with skb_frag_dma_map must be unmapped with dma_unmap_page"
 
+grep -q 'clear_tx_descriptor(self.state, prev_slot)' "$NETDEV" \
+  && grep -q 'self.state.tx.clear_shadow_slot(prev_slot)' "$NETDEV" \
+  && ok "TX SG rollback clears pre-staged fragment descriptors and shadows" \
+  || bad "TX SG rollback must clear fragment descriptors as well as shadows after map failure"
+
 grep -q 'NETIF_F_IP_CSUM' "$BRIDGE" \
   && grep -q 'NETIF_F_IPV6_CSUM' "$BRIDGE" \
   && grep -q 'NETIF_F_RXCSUM' "$BRIDGE" \
