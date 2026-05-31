@@ -175,6 +175,9 @@ gate before or with the implementation. Current mandatory gates include:
 - `ci/check_soak_harness.sh`: long-running soak harnesses must parse under
   bash, report iperf failures, and fail rather than passing without observed
   packet progress.
+- `ci/check_diag_instrumentation.sh`: temporary stall diagnostics may expose
+  ethtool stats, but exported C ABI and raw pointer writes stay inside
+  `unsafe_boundary.rs`, and hot-path diagnostic atomics stay cache padded.
 
 Hardware validation should cover probe/remove, `rmmod` while up, sustained
 traffic, jumbo MTU, MSI/MSI-X and INTx fallback, ASPM/suspend/resume, error

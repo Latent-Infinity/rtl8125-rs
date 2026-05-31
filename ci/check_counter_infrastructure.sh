@@ -97,12 +97,22 @@ else
 	red "counters_alloc/free not wired into r8125_bridge_alloc + both free paths"
 fi
 
-# Cross-check: the ethtool string table length matches the counter count
+# Cross-check: the ethtool string table still starts with the six
+# disposition counters in the documented order. Diagnostic ethtool
+# stats may follow, but the runtime invariant parser depends on these
+# names and indices staying stable.
 nstrings=$(awk '/bridge_ethtool_strings\[\]\[ETH_GSTRING_LEN\]/,/^};/' "$ETHTOOL_C" | grep -c '^\s*"')
-if [[ "$nstrings" -ne "${#COUNTERS[@]}" ]]; then
-	red "bridge_ethtool_strings has $nstrings entries; expected ${#COUNTERS[@]} (one per §6.3 counter)"
+if [[ "$nstrings" -lt "${#COUNTERS[@]}" ]]; then
+	red "bridge_ethtool_strings has $nstrings entries; expected at least ${#COUNTERS[@]} §6.3 counters"
 else
-	grn "ethtool string table has all ${#COUNTERS[@]} §6.3 counters"
+	table_prefix=$(awk '/bridge_ethtool_strings\[\]\[ETH_GSTRING_LEN\]/,/^};/' "$ETHTOOL_C" |
+		grep -E '^\s*"' | head -n "${#COUNTERS[@]}" | sed -E 's/^[[:space:]]*"([^"]+)".*/\1/' | tr '\n' ' ')
+	expected_prefix="${COUNTERS[*]} "
+	if [[ "$table_prefix" == "$expected_prefix" ]]; then
+		grn "ethtool string table starts with all ${#COUNTERS[@]} §6.3 counters"
+	else
+		red "first ${#COUNTERS[@]} ethtool stats must remain: ${COUNTERS[*]} (got: $table_prefix)"
+	fi
 fi
 
 # The §6.3 invariant equation must be documented somewhere reviewers will find it.

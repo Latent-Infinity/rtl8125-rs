@@ -254,3 +254,20 @@ Net change: +1 mechanical FFI wrapper. The new module param
 `bridge_irq_pin_auto` (255), no-op (254), and explicit
 `bridge_irq_pin_cpu(N)` (0..253). See Candidate #4 of
 `docs/RX_OPTIMIZATION_CANDIDATES.md`.
+
+## 2026-05-31 — Temporary stall diagnostics bump 52 → 54
+
+Added the temporary KVM-stall ethtool diagnostic surface:
+
+- `bridge_jiffies()` safe wrapper in `src/unsafe_boundary.rs`, calling
+  cshim `r8125_bridge_jiffies()` (`get_jiffies_64`) so Rust can stamp
+  IRQ/NAPI/RX/TX/xmit events.
+- `r8125_rust_diag_snapshot(out)` C ABI entry point in
+  `src/unsafe_boundary.rs`, which copies the safe Rust
+  `netdev::diag_snapshot()` into the cshim's stack-local ethtool mirror.
+
+Net change: +1 mechanical FFI wrapper and +1 raw-pointer copy at the
+audited C ABI boundary. No new unsafe is permitted in `src/netdev.rs`;
+`ci/check_diag_instrumentation.sh` enforces that the temporary surface
+stays in `unsafe_boundary.rs`, that the Rust/C snapshot layouts stay
+paired, and that the hot-path diagnostic atomics are cache padded.

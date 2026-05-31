@@ -130,6 +130,9 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
                 len,
                 desc.opts1,
             );
+            // DIAG-TEMP (2026-05-31): record a nonzero RX completion for
+            // the stall-localisation ethtool surface.
+            crate::netdev::note_rx_completion();
         }
 
         // Re-post the descriptor with the slot's existing DMA address.
@@ -197,6 +200,9 @@ fn process_tx_completions(state: &NetdevState) -> (usize, usize, usize) {
             // for THIS slot already happened above; for SG packets the
             // intermediate slots' unmaps happened in earlier loop iters.
             skb.consume_tx(state.ndev.load(Ordering::Acquire));
+            // DIAG-TEMP (2026-05-31): record one completed TX skb for the
+            // stall-localisation ethtool surface.
+            crate::netdev::note_tx_complete();
         }
         // Clear the descriptor (preserve EOR if last slot).
         let mut opts1 = 0u32;
@@ -232,6 +238,11 @@ pub(crate) fn poll(state: &NetdevState, budget: c_int) -> c_int {
 
     let work_done = process_rx_completions(state, budget_u);
     let (tx_tail, tx_head, reaped) = process_tx_completions(state);
+    // DIAG-TEMP (2026-05-31): record NAPI polls that did no work, so we
+    // can separate "NAPI not running" from "NAPI running but idle."
+    if work_done == 0 && reaped == 0 {
+        crate::netdev::note_napi_empty();
+    }
     if reaped > 0 {
         // Update tx_tail BEFORE waking the queue — kernel xmit code re-
         // reads tx_tail (indirectly through `in_flight`) to decide whether

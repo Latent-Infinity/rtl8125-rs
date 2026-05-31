@@ -210,6 +210,11 @@ void r8125_bridge_dma_rmb(void);
  * at the equivalent points. */
 void r8125_bridge_dma_wmb(void);
 
+/* DIAG-TEMP (2026-05-31): jiffies fetch for the KVM-stall instrumentation
+ * surface. Remove with the rest of the DIAG-TEMP set once root cause is
+ * identified and fixed. */
+u64 r8125_bridge_jiffies(void);
+
 /* ──────────────────────────────────────────────────────────────────────
  *  Flow-control + NAPI-arming helpers — the §6.3 invariants live here.
  * ────────────────────────────────────────────────────────────────────── */
