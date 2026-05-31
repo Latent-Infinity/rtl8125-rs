@@ -26,7 +26,7 @@ underlying classification rationale.
 | `check_build_makefile.sh` | Kbuild wrapper uses kernel's CC, post-link BTF generation, excludes Rust DWARF from pahole |
 | `check_bare_metal_stack_teardown.sh` | `KBox::init` (not `KBox::new`) for large state + `pci::Driver::unbind` drains netdev BEFORE devres release + `NetdevHandle::shutdown` is idempotent |
 
-## Netdev pattern — copy + adjust per next NIC driver (9 gates)
+## Netdev pattern — copy + adjust per next NIC driver (10 gates)
 
 | Gate | What it enforces |
 |---|---|
@@ -39,6 +39,7 @@ underlying classification rationale.
 | `check_packet_mutation.sh` | `ndo_start_xmit` doesn't write shared-clone fields of skb |
 | `check_rmmod_while_up.sh` | `rmmod` under traffic completes without `BUG`/`WARN` — the #58 fix discipline |
 | `check_skb_ownership.sh` | `DriverOwnedSkb` shape: `#[must_use]`, `#[repr(transparent)]`, no `Drop`, FFI-only `from_raw`, consume verbs only |
+| `check_soak_harness.sh` | Long-running soak harnesses parse, report traffic-generator failures, and fail without observed packet progress |
 
 ## RTL8125-specific — replace per chip (11 gates)
 
@@ -69,11 +70,11 @@ netdev-pattern, partly RTL-specific.
 | Class | Count | Effort for next driver |
 |---|---:|---|
 | `[generic]` | 8 | minutes (copy + adjust paths) |
-| `[netdev]` | 9 | ~1 h (copy + adjust symbol names) |
+| `[netdev]` | 10 | ~1 h (copy + adjust symbol names) |
 | `[rtl8125]` | 11 | full rewrite per chip (~half a day each) |
-| **Total** | **28** | |
+| **Total** | **29** | |
 
-The 8 `[generic]` + 9 `[netdev]` gates are the **starter pack** the
+The 8 `[generic]` + 10 `[netdev]` gates are the **starter pack** the
 next Rust NIC driver project should clone first. Together they
 cover the disciplines that prevent the bug classes named in
 [`PATTERNS.md`](../docs/PATTERNS.md) §"Bug-class index".

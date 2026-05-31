@@ -56,6 +56,9 @@ echo
 echo "== Latency-aligned discipline (Candidates G, L, M) =="
 bash "$CI/check_latency_knobs.sh" || rc=1
 echo
+echo "== soak harness false-pass guards =="
+bash "$CI/check_soak_harness.sh" || rc=1
+echo
 echo "== DMA barriers (RX read + TX/RX publish, Candidate #1) =="
 bash "$CI/check_dma_barriers.sh" || rc=1
 echo

@@ -172,6 +172,9 @@ gate before or with the implementation. Current mandatory gates include:
 - `ci/check_aspm_force_off_param.sh`: operator rollback knob is declared,
   default-off, and acknowledged by probe without implying host-side ASPM
   policy support before the binding exists.
+- `ci/check_soak_harness.sh`: long-running soak harnesses must parse under
+  bash, report iperf failures, and fail rather than passing without observed
+  packet progress.
 
 Hardware validation should cover probe/remove, `rmmod` while up, sustained
 traffic, jumbo MTU, MSI/MSI-X and INTx fallback, ASPM/suspend/resume, error
