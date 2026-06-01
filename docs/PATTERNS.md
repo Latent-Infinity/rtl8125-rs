@@ -60,7 +60,7 @@ excerpts, soak durations), not just "done".
 `#![deny(unsafe_code)]`. The boundary file is the *only* place
 `unsafe extern "C"` FFI wrappers live. `ci/.unsafe-allowlist` is
 the per-file enable list; `ci/.unsafe-census` is the count
-(currently 54), gated non-increasing by `check_unsafe_allowlist.sh`.
+(currently 52), gated non-increasing by `check_unsafe_allowlist.sh`.
 
 **Why.** Constraining unsafe to one auditable file means safety
 review is bounded to ~1000 LOC, not the whole crate.

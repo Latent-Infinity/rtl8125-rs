@@ -28,13 +28,11 @@ use core::sync::atomic::{
 // PHY OCP page selector in `PhyState`.
 
 /// Cache-line padded wrapper. Per `docs/RUST_STANDARDS.md` §15.2, atomics
-/// mutated from independent contexts (here: `tx_head` from xmit, `tx_tail`
-/// + `rx_tail` from NAPI poll) must not share a cache line — false sharing
-///
-/// would serialise the contexts under load. 64 B is the L1 line on x86_64
-/// and aarch64 baseline; PowerPC uses 128 but isn't a deployment target.
-/// Kernel-Rust has no `crossbeam::utils::CachePadded`, so this is the
-/// minimal hand-rolled equivalent.
+/// mutated from independent contexts must not share a cache line. False
+/// sharing would serialize the contexts under load. 64 B is the L1 line on
+/// x86_64 and aarch64 baseline; PowerPC uses 128 but isn't a deployment
+/// target. Kernel-Rust has no `crossbeam::utils::CachePadded`, so this is
+/// the minimal hand-rolled equivalent.
 #[repr(C, align(64))]
 pub(crate) struct CachePadded<T> {
     pub(crate) inner: T,
@@ -61,28 +59,14 @@ use kernel::pci;
 use kernel::prelude::*;
 use kernel::sync::aref::ARef;
 
-/// Counters for low-rate debug visibility into hot path. Removed (or made
-/// dev_dbg!) once the path is proven.
-static XMIT_CALLS: AtomicU32 = AtomicU32::new(0);
-static IRQ_FIRES: AtomicU32 = AtomicU32::new(0);
-static NAPI_POLLS: AtomicU32 = AtomicU32::new(0);
-
-// DIAG-TEMP (2026-05-31): KVM-stall hunt instrumentation. Tracks the
-// jiffies of the most recent IRQ / NAPI poll / RX completion / TX
-// completion / xmit. When the path wedges, the ethtool stats below
-// expose "ms since last event" so we can localise WHERE the path
-// died (no IRQ from chip vs IRQ but no work in NAPI vs NAPI work but
-// no RX completions, etc.). One jiffies read plus one atomic write per
-// event; keep this temporary and remove it once root cause is fixed.
-// The cshim/ethtool side is gated by the same comment marker.
-static LAST_IRQ_JIFFIES: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
-static LAST_NAPI_JIFFIES: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
-static LAST_RX_PACKET_JIFFIES: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
-static LAST_TX_COMPLETE_JIFFIES: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
-static LAST_XMIT_JIFFIES: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
-static NAPI_POLLS_EMPTY: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
-static RX_COMPLETIONS_SEEN: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
-static TX_PACKETS_REAPED: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
+/// Low-rate hot-path debug counters. Each is mutated from an independent
+/// context: XMIT_CALLS from ndo_start_xmit, IRQ_FIRES from the IRQ handler,
+/// and NAPI_POLLS from NAPI poll. Keep them cache-padded per
+/// `docs/RUST_STANDARDS.md §15.2`; otherwise unrelated counter updates
+/// share one line and create avoidable coherence traffic.
+static XMIT_CALLS: CachePadded<AtomicU32> = CachePadded::new(AtomicU32::new(0));
+static IRQ_FIRES: CachePadded<AtomicU32> = CachePadded::new(AtomicU32::new(0));
+static NAPI_POLLS: CachePadded<AtomicU32> = CachePadded::new(AtomicU32::new(0));
 
 pub(crate) fn debug_counts() -> (u32, u32, u32) {
     (
@@ -94,66 +78,10 @@ pub(crate) fn debug_counts() -> (u32, u32, u32) {
 
 pub(crate) fn note_irq_fire() {
     IRQ_FIRES.fetch_add(1, Ordering::Relaxed);
-    // DIAG-TEMP
-    LAST_IRQ_JIFFIES.store(ub::bridge_jiffies(), Ordering::Relaxed);
 }
 
 pub(crate) fn note_napi_poll() {
     NAPI_POLLS.fetch_add(1, Ordering::Relaxed);
-    // DIAG-TEMP
-    LAST_NAPI_JIFFIES.store(ub::bridge_jiffies(), Ordering::Relaxed);
-}
-
-// DIAG-TEMP: called by napi::process_rx_completions once per nonzero RX
-// completion before the cshim tries to allocate and hand an skb to GRO.
-pub(crate) fn note_rx_completion() {
-    RX_COMPLETIONS_SEEN.fetch_add(1, Ordering::Relaxed);
-    LAST_RX_PACKET_JIFFIES.store(ub::bridge_jiffies(), Ordering::Relaxed);
-}
-
-// DIAG-TEMP: called by napi::process_tx_completions once per completed skb.
-pub(crate) fn note_tx_complete() {
-    TX_PACKETS_REAPED.fetch_add(1, Ordering::Relaxed);
-    LAST_TX_COMPLETE_JIFFIES.store(ub::bridge_jiffies(), Ordering::Relaxed);
-}
-
-// DIAG-TEMP: called by ndo_start_xmit on entry.
-pub(crate) fn note_xmit() {
-    LAST_XMIT_JIFFIES.store(ub::bridge_jiffies(), Ordering::Relaxed);
-}
-
-// DIAG-TEMP: called by napi::poll when work_done == 0 (no RX or TX work
-// found). Lets us tell "NAPI is running but the rings are empty" from
-// "NAPI not even running."
-pub(crate) fn note_napi_empty() {
-    NAPI_POLLS_EMPTY.fetch_add(1, Ordering::Relaxed);
-}
-
-// DIAG-TEMP: ethtool stats hook. Returned tuple matches the cshim's
-// diag-stat field order.
-#[repr(C)]
-pub(crate) struct DiagSnapshot {
-    pub(crate) last_irq_jiffies: u64,
-    pub(crate) last_napi_jiffies: u64,
-    pub(crate) last_rx_packet_jiffies: u64,
-    pub(crate) last_tx_complete_jiffies: u64,
-    pub(crate) last_xmit_jiffies: u64,
-    pub(crate) napi_polls_empty: u64,
-    pub(crate) rx_completions_seen: u64,
-    pub(crate) tx_packets_reaped: u64,
-}
-
-pub(crate) fn diag_snapshot() -> DiagSnapshot {
-    DiagSnapshot {
-        last_irq_jiffies: LAST_IRQ_JIFFIES.load(Ordering::Relaxed),
-        last_napi_jiffies: LAST_NAPI_JIFFIES.load(Ordering::Relaxed),
-        last_rx_packet_jiffies: LAST_RX_PACKET_JIFFIES.load(Ordering::Relaxed),
-        last_tx_complete_jiffies: LAST_TX_COMPLETE_JIFFIES.load(Ordering::Relaxed),
-        last_xmit_jiffies: LAST_XMIT_JIFFIES.load(Ordering::Relaxed),
-        napi_polls_empty: NAPI_POLLS_EMPTY.load(Ordering::Relaxed),
-        rx_completions_seen: RX_COMPLETIONS_SEEN.load(Ordering::Relaxed),
-        tx_packets_reaped: TX_PACKETS_REAPED.load(Ordering::Relaxed),
-    }
 }
 
 use crate::mmio::{self, Regs};
@@ -1250,8 +1178,6 @@ fn map_skb_fragments(
 
 fn ndo_start_xmit(state: &NetdevState, skb: crate::skb::DriverOwnedSkb) -> c_int {
     XMIT_CALLS.fetch_add(1, Ordering::Relaxed);
-    // DIAG-TEMP (2026-05-31): jiffies marker for ndo_start_xmit entry.
-    note_xmit();
 
     // Offload bits — may mutate skb data; must precede the DMA map.
     let (tso_opts1, first_opts2) = match compute_offload_bits(&skb) {

@@ -346,21 +346,6 @@ void r8125_bridge_dma_wmb(void)
 }
 EXPORT_SYMBOL_GPL(r8125_bridge_dma_wmb);
 
-/*
- * DIAG-TEMP (2026-05-31): KVM-stall instrumentation helper. Returns the
- * current jiffies value. Used by the Rust note_* hooks to record the
- * last-seen time of IRQ / NAPI / RX / TX / xmit events; ethtool stats
- * compute "ms since last event" by subtracting from a fresh read.
- *
- * Remove this and all `DIAG-TEMP` marked sites by reverting the single
- * diag-temp commit once the KVM stall root cause is identified and fixed.
- */
-u64 r8125_bridge_jiffies(void)
-{
-	return get_jiffies_64();
-}
-EXPORT_SYMBOL_GPL(r8125_bridge_jiffies);
-
 /* ── Flow-control + NAPI helpers ────────────────────────────────────── */
 
 void r8125_bridge_tx_stop_queue(struct net_device *ndev)

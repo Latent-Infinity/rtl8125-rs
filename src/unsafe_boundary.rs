@@ -161,10 +161,6 @@ extern "C" {
     ) -> c_int;
     fn r8125_bridge_dma_rmb();
     fn r8125_bridge_dma_wmb();
-    // DIAG-TEMP (2026-05-31): jiffies read for stall-localisation
-    // instrumentation. Remove with the rest of the DIAG-TEMP set once
-    // the KVM stall root cause is fixed.
-    fn r8125_bridge_jiffies() -> u64;
     fn r8125_bridge_tx_stop_queue(ndev: *mut bindings::net_device);
     fn r8125_bridge_tx_wake_queue(ndev: *mut bindings::net_device);
     fn r8125_bridge_tx_disable(ndev: *mut bindings::net_device);
@@ -663,14 +659,6 @@ pub(crate) fn dma_wmb() {
     unsafe { r8125_bridge_dma_wmb() };
 }
 
-// DIAG-TEMP (2026-05-31): jiffies fetch wrapper. Remove with the rest of
-// the DIAG-TEMP set once the KVM stall root cause is fixed.
-pub(crate) fn bridge_jiffies() -> u64 {
-    // SAFETY: jiffies read is always safe (the kernel's `get_jiffies_64`
-    // is the underlying implementation).
-    unsafe { r8125_bridge_jiffies() }
-}
-
 pub(crate) fn bridge_tx_stop_queue(ndev: *mut bindings::net_device) {
     // SAFETY: ndev alive.
     unsafe { r8125_bridge_tx_stop_queue(ndev) };
@@ -988,25 +976,6 @@ pub(crate) fn bridge_phy_kick_state_machine(
 pub(crate) fn bridge_phy_stop(ndev: *mut bindings::net_device) {
     // SAFETY: see fn-level contract.
     unsafe { r8125_bridge_phy_stop(ndev) };
-}
-
-/// DIAG-TEMP C entry point for `netdev_bridge_ethtool.c`.
-///
-/// Copies the safe Rust diagnostic snapshot into the C shim's stack-local
-/// mirror. This lives in `unsafe_boundary` so the raw-pointer write stays
-/// inside the one audited unsafe module.
-#[no_mangle]
-pub(crate) extern "C" fn r8125_rust_diag_snapshot(
-    out: *mut crate::netdev::DiagSnapshot,
-) {
-    if out.is_null() {
-        return;
-    }
-    let snap = crate::netdev::diag_snapshot();
-    // SAFETY: caller is the cshim ethtool callback, which passes the address
-    // of a live stack-local `struct r8125_diag_snapshot` with a layout that
-    // `ci/check_diag_instrumentation.sh` ties to `netdev::DiagSnapshot`.
-    unsafe { core::ptr::write(out, snap) };
 }
 
 #[inline]

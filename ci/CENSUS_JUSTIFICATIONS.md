@@ -271,3 +271,16 @@ audited C ABI boundary. No new unsafe is permitted in `src/netdev.rs`;
 `ci/check_diag_instrumentation.sh` enforces that the temporary surface
 stays in `unsafe_boundary.rs`, that the Rust/C snapshot layouts stay
 paired, and that the hot-path diagnostic atomics are cache padded.
+
+## 2026-06-01 — Temporary stall diagnostics removed 54 → 52
+
+Removed the temporary KVM-stall ethtool diagnostic surface after review:
+
+- `bridge_jiffies()` and the cshim `r8125_bridge_jiffies()` helper.
+- `r8125_rust_diag_snapshot(out)`, the raw-pointer C ABI copy.
+- DIAG-TEMP hot-path atomics, note hooks, and ethtool strings.
+
+Net change: -1 mechanical FFI wrapper and -1 raw-pointer C ABI copy, so the
+unsafe census returns to 52. The permanent §6.3 ethtool counters remain, and
+`ci/check_counter_infrastructure.sh` plus the runtime counter-invariant gate
+cover that retained surface.

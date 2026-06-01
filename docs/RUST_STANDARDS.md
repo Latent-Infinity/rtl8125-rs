@@ -146,8 +146,9 @@ gate before or with the implementation. Current mandatory gates include:
 - `ci/check_unsafe_allowlist.sh`: unsafe containment, raw-MMIO containment,
   and non-increasing unsafe census.
 - `ci/check_clippy.sh`: kernel-build Clippy, not `cargo clippy`.
-- `ci/check_cache_padding.sh`: non-array atomics in cross-context state must
-  be `CachePadded` or explicitly annotated `// NOT-PADDED:`.
+- `ci/check_cache_padding.sh`: non-array atomics in cross-context state and
+  file-scope hot-path statics must be `CachePadded` or explicitly annotated
+  `// NOT-PADDED:`.
 - `ci/check_counter_infrastructure.sh`: six disposition counters wired through
   storage, increments, snapshot, and ethtool.
 - `ci/check_napi_contract.sh`: NAPI budget, IRQ masking, and TX queue
@@ -175,10 +176,6 @@ gate before or with the implementation. Current mandatory gates include:
 - `ci/check_soak_harness.sh`: long-running soak harnesses must parse under
   bash, report iperf failures, and fail rather than passing without observed
   packet progress.
-- `ci/check_diag_instrumentation.sh`: temporary stall diagnostics may expose
-  ethtool stats, but exported C ABI and raw pointer writes stay inside
-  `unsafe_boundary.rs`, and hot-path diagnostic atomics stay cache padded.
-
 Hardware validation should cover probe/remove, `rmmod` while up, sustained
 traffic, jumbo MTU, MSI/MSI-X and INTx fallback, ASPM/suspend/resume, error
 injection, and at least one bare-metal soak. Report concrete dates, kernel

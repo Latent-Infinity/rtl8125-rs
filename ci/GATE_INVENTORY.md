@@ -26,14 +26,13 @@ underlying classification rationale.
 | `check_build_makefile.sh` | Kbuild wrapper uses kernel's CC, post-link BTF generation, excludes Rust DWARF from pahole |
 | `check_bare_metal_stack_teardown.sh` | `KBox::init` (not `KBox::new`) for large state + `pci::Driver::unbind` drains netdev BEFORE devres release + `NetdevHandle::shutdown` is idempotent |
 
-## Netdev pattern — copy + adjust per next NIC driver (11 gates)
+## Netdev pattern — copy + adjust per next NIC driver (10 gates)
 
 | Gate | What it enforces |
 |---|---|
 | `check_counter_infrastructure.sh` | §6.3 disposition-counter set is allocated, exported via ethtool -S, summed across CPUs |
 | `check_counter_invariant.sh` | Runtime: `tx_received == tx_consumed + tx_busy_exception + tx_dropped_error` after 1 GB transfer |
 | `check_cshim_loc_caps.sh` | Per-file `Hard cap: N LOC` marker on every cshim TU + enforcement |
-| `check_diag_instrumentation.sh` | Temporary ethtool diagnostics preserve unsafe-boundary and cache-padding rules |
 | `check_mdio_bridge.sh` | MDIO bus alloc/register/free lifecycle + PHY init failure unwinds via disconnect + reg-range validation |
 | `check_napi_contract.sh` | NAPI poll rules: `budget==0` no complete_done, `work_done<budget` complete_done+rearm, queue hysteresis, TX-tail-before-wake ordering |
 | `check_offload_path.sh` | TSO/CSUM setup BEFORE DMA map + linear unmap uses shadow length + short-UDP errata fallback present + TSO advertisement paired with chip max_segs/max_size |
@@ -71,11 +70,11 @@ netdev-pattern, partly RTL-specific.
 | Class | Count | Effort for next driver |
 |---|---:|---|
 | `[generic]` | 8 | minutes (copy + adjust paths) |
-| `[netdev]` | 11 | ~1 h (copy + adjust symbol names) |
+| `[netdev]` | 10 | ~1 h (copy + adjust symbol names) |
 | `[rtl8125]` | 11 | full rewrite per chip (~half a day each) |
-| **Total** | **30** | |
+| **Total** | **29** | |
 
-The 8 `[generic]` + 11 `[netdev]` gates are the **starter pack** the
+The 8 `[generic]` + 10 `[netdev]` gates are the **starter pack** the
 next Rust NIC driver project should clone first. Together they
 cover the disciplines that prevent the bug classes named in
 [`PATTERNS.md`](../docs/PATTERNS.md) §"Bug-class index".

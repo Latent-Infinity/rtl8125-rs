@@ -11,8 +11,8 @@
 # they're indexed by slot, and slots used together (xmit head vs
 # reaper tail) are typically far apart in the 256-slot ring.
 #
-# This script scans `struct NetdevState` (the only cross-context state
-# in the driver today) and enforces the rule:
+# This script scans cross-context state structs and file-scope hot-path
+# statics and enforces the rule:
 #
 #   Any non-array `Atomic*` field must either:
 #     - be wrapped in `CachePadded<...>`, OR
@@ -20,7 +20,7 @@
 #       documenting why padding is unnecessary
 #
 # Adding more cross-context structs in the future: extend `STRUCTS`
-# below and the regex coverage will follow.
+# below. Adding file-scope hot-path atomics: extend `STATIC_FILES`.
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -36,6 +36,10 @@ STRUCTS=(
 	"src/netdev.rs|RxRingState"
 	"src/netdev.rs|IrqState"
 	"src/netdev.rs|PhyState"
+)
+
+STATIC_FILES=(
+	"src/netdev.rs"
 )
 
 for entry in "${STRUCTS[@]}"; do
@@ -109,6 +113,54 @@ for entry in "${STRUCTS[@]}"; do
 
 	if [[ "$violations" -eq 0 ]]; then
 		grn "$name in $file: all non-array atomics are CachePadded or annotated"
+	fi
+done
+
+for file in "${STATIC_FILES[@]}"; do
+	full="$ROOT/$file"
+
+	if [[ ! -f "$full" ]]; then
+		red "$file not found"
+		continue
+	fi
+
+	violations=0
+	declare -a recent=()
+	lineno=0
+	while IFS= read -r content; do
+		lineno=$((lineno + 1))
+		# Detect file-scope unpadded AtomicXxx statics:
+		#   static FOO: AtomicU32 = ...
+		# but NOT:
+		#   static FOO: CachePadded<AtomicU32> = ...
+		#   static FOO: [AtomicU32; N] = ...
+		if echo "$content" | grep -qE '^\s*(pub\(crate\)\s+)?static\s+[A-Za-z0-9_]+:\s*Atomic[A-Za-z0-9_]+(<[^>]*>)?\s*='; then
+			annotated=0
+			for prev in "${recent[@]}"; do
+				if echo "$prev" | grep -qE '//\s*NOT-PADDED:'; then
+					annotated=1
+					break
+				fi
+				echo "$prev" | grep -qE '^\s*(//|///|#\[)' || break
+			done
+			if [[ "$annotated" -eq 1 ]]; then
+				recent=()
+				continue
+			fi
+			red "$file:$lineno  unpadded file-scope atomic static (wrap in CachePadded or add a '// NOT-PADDED:' annotation):"
+			printf '       %s\n' "$content" >&2
+			violations=$((violations + 1))
+		fi
+		if [[ -n "${content// /}" ]]; then
+			recent=("$content" "${recent[@]}")
+			if [[ ${#recent[@]} -gt 8 ]]; then
+				unset 'recent[8]'
+			fi
+		fi
+	done < "$full"
+
+	if [[ "$violations" -eq 0 ]]; then
+		grn "file-scope atomics in $file: all statics are CachePadded or annotated"
 	fi
 done
 

@@ -59,9 +59,6 @@ echo
 echo "== soak harness false-pass guards =="
 bash "$CI/check_soak_harness.sh" || rc=1
 echo
-echo "== temporary stall diagnostic instrumentation =="
-bash "$CI/check_diag_instrumentation.sh" || rc=1
-echo
 echo "== DMA barriers (RX read + TX/RX publish, Candidate #1) =="
 bash "$CI/check_dma_barriers.sh" || rc=1
 echo

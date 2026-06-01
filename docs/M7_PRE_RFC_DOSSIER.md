@@ -244,7 +244,7 @@ It does **not** ship `net_device`, `napi_struct`, `sk_buff`, or
    is itself interesting research.
 2. Inline the unsafety. Rejected — the unsafe surface would be
    ~3× larger and impossible to audit by file inspection. Our
-   current `unsafe` census is 54 items
+   current `unsafe` census is 52 items
    ([`ci/.unsafe-census`](../ci/.unsafe-census)) and every one is
    reviewed against an allowlist
    ([`ci/.unsafe-allowlist`](../ci/.unsafe-allowlist)).
