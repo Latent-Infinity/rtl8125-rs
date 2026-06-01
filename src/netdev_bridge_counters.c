@@ -29,7 +29,8 @@
 
 /* Allocate the six per-CPU counters in lockstep; on partial failure
  * release any partial successes and return -ENOMEM. `free_percpu(NULL)`
- * is a no-op, so the free helper is safe to call from this rollback. */
+ * is a no-op, so the free helper is safe to call from this rollback.
+ */
 int r8125_bridge_counters_alloc(struct r8125_bridge *b)
 {
 	b->tx_received        = alloc_percpu(u64);
@@ -72,7 +73,8 @@ void r8125_bridge_counters_free(struct r8125_bridge *b)
  * small aggregate skew is acceptable for the ethtool/invariant-check
  * use cases (the §6.3 invariant runtime check quiesces TX via a link
  * down/up cycle before reading, so writers are silent at snapshot
- * time anyway). */
+ * time anyway).
+ */
 static u64 bridge_counter_sum(u64 __percpu *counter)
 {
 	u64 sum = 0;

@@ -49,7 +49,8 @@
 /* 8125 hardware errata: UDP frames whose transport-data portion is
  * shorter than this length get a wrong UDP checksum from the chip.
  * Upstream r8169 has the same workaround at RTL_MIN_PATCH_LEN = 47
- * (r8169_main.c:4395). */
+ * (r8169_main.c:4395).
+ */
 #define R8125_MIN_UDP_PATCH_LEN	47
 
 static bool r8125_short_udp_needs_sw_csum(struct sk_buff *skb)
@@ -92,7 +93,8 @@ u32 r8125_bridge_skb_tx_csum_opts(struct sk_buff *skb)
 		if (r8125_short_udp_needs_sw_csum(skb)) {
 			/* Chip miscomputes UDP CSUM for short transport-data
 			 * frames (vendor errata). Force the kernel to do it
-			 * in software and submit a fully-checksummed frame. */
+			 * in software and submit a fully-checksummed frame.
+			 */
 			if (skb_checksum_help(skb))
 				return R8125_TX_CSUM_OPTS_DROP;
 			return 0;
@@ -114,12 +116,14 @@ void r8125_bridge_skb_rx_csum_set(struct sk_buff *skb, u32 desc_opts1)
 
 	if (fail) {
 		/* Chip flagged a checksum failure — leave skb->ip_summed at
-		 * its default; the stack will either retry SW or drop. */
+		 * its default; the stack will either retry SW or drop.
+		 */
 		skb_checksum_none_assert(skb);
 		return;
 	}
 	/* Per r8169 rtl8169_rx_csum: only TCP (PID0) or UDP (PID1) — not
-	 * both, not neither — indicate a verified L4 checksum. */
+	 * both, not neither — indicate a verified L4 checksum.
+	 */
 	if (pid == R8125_RX_PID0 || pid == R8125_RX_PID1)
 		skb->ip_summed = CHECKSUM_UNNECESSARY;
 	else
@@ -131,7 +135,8 @@ void r8125_bridge_account_tx(struct net_device *ndev, unsigned int bytes)
 {
 	/* Per-CPU tx_packets/tx_bytes via Candidate G's
 	 * NETDEV_PCPU_STAT_TSTATS setup at bridge_alloc. r8169 uses the
-	 * same helper at rtl8169_tx_handler (r8169_main.c:4769). */
+	 * same helper at rtl8169_tx_handler (r8169_main.c:4769).
+	 */
 	dev_sw_netstats_tx_add(ndev, 1, bytes);
 }
 EXPORT_SYMBOL_GPL(r8125_bridge_account_tx);
@@ -141,7 +146,8 @@ EXPORT_SYMBOL_GPL(r8125_bridge_account_tx);
 /* TX descriptor opts1 bits used only by the TSO path. Same prefix
  * scheme as the CSUM opts2 bits above. Realtek vendor + r8169 agree
  * on these values (r8125_n.c GiantSendv4/v6 vs rtl_tx_desc_bit_1
- * TD1_GTSENV4/V6). */
+ * TD1_GTSENV4/V6).
+ */
 #define R8125_TD1_GTSENV6	BIT(25)
 #define R8125_TD1_GTSENV4	BIT(26)
 #define R8125_GTTCPHO_SHIFT	18
@@ -228,7 +234,8 @@ bool r8125_bridge_skb_tso_setup(struct sk_buff *skb,
 		*opts1_bits |= R8125_TD1_GTSENV6;
 	} else {
 		/* Other GSO types (UDP frag, GRE, etc.) — chip can't TSO,
-		 * the kernel will fall back to software segmentation. */
+		 * the kernel will fall back to software segmentation.
+		 */
 		return false;
 	}
 
@@ -245,7 +252,8 @@ void r8125_bridge_skb_consume_tx(struct net_device *ndev, struct sk_buff *skb)
 	/* Account BEFORE napi_consume_skb — once consumed the pointer is
 	 * stale. The byte count comes from skb->len (the full logical-
 	 * packet size including all paged frags), not from any single
-	 * descriptor's LEN field (chip clears those on completion). */
+	 * descriptor's LEN field (chip clears those on completion).
+	 */
 	if (b)
 		this_cpu_inc(*b->tx_consumed);
 	if (ndev)

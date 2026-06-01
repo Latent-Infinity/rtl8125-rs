@@ -1,0 +1,20 @@
+# MAINTAINERS stanza for the mainline `MAINTAINERS` file.
+#
+# When upstreaming this driver, copy the block below into the kernel
+# tree's top-level `MAINTAINERS`, preserving alphabetical ordering of
+# subsystem stanzas. The format mirrors existing entries (see for
+# example the "REALTEK RTL8169 GIGABIT ETHERNET DRIVER" stanza for the
+# C sibling driver this one shares a chip family with).
+#
+# The M: line below uses the current repository author identity. Replace it
+# with the real responsible maintainer's legal name and email before posting
+# if the upstream submitter identity differs.
+
+REALTEK RTL8125 RUST ETHERNET DRIVER
+M:	firestrand <firestrand@gmail.com>
+L:	netdev@vger.kernel.org
+L:	rust-for-linux@vger.kernel.org
+S:	Maintained
+W:	https://github.com/firestrand/rtl8125-rs
+F:	Documentation/networking/device_drivers/realtek/r8125_rust.rst
+F:	drivers/net/ethernet/realtek/r8125_rust/

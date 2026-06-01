@@ -48,7 +48,8 @@ static int bridge_mii_write(struct mii_bus *bus, int phyaddr, int phyreg,
  * probe (rtl822x_hwmon_init → phy_clear_bits_mmd) and get_features
  * (phy_read_mmd of RTL_MDIO_PMA_SPEED for 2.5G capability) work,
  * unblocking 2.5G negotiation. Only MDIO_MMD_VEND2 + regnum > MDIO_STAT2
- * reaches the chip; other combinations return 0 / -ENODEV. */
+ * reaches the chip; other combinations return 0 / -ENODEV.
+ */
 static int bridge_mii_read_c45(struct mii_bus *bus, int phyaddr, int devad,
 			       int phyreg)
 {
@@ -112,7 +113,8 @@ int r8125_bridge_phy_register(struct net_device *ndev,
 	bus->write = bridge_mii_write;
 	/* C45 callbacks — see comment on bridge_mii_read_c45 above. Without
 	 * these the Realtek NBASE-T PHY driver fails to bind and genphy
-	 * fallback caps the link at 1G. */
+	 * fallback caps the link at 1G.
+	 */
 	bus->read_c45 = bridge_mii_read_c45;
 	bus->write_c45 = bridge_mii_write_c45;
 

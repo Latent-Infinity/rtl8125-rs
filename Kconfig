@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# Sample Kconfig stanza for the Realtek RTL8125 Rust driver. The
+# block below is the stanza you would copy into
+# `drivers/net/ethernet/realtek/Kconfig` when integrating this driver
+# into a kernel source tree. Out-of-tree builds use the top-level
+# `Makefile`; this file exists for upstream-readiness review only.
+
+config RTL8125_RUST
+	tristate "Realtek RTL8125 2.5 Gigabit Ethernet support (Rust)"
+	depends on PCI && RUST
+	select MII
+	select PHYLIB
+	select REALTEK_PHY
+	help
+	  Say Y here if you have a Realtek RTL8125 2.5 Gigabit Ethernet
+	  PCIe adapter whose hardware revision is listed in this driver's
+	  supported-chip table, and want to test this driver instead of the
+	  in-tree r8169 driver.
+
+	  This driver is written predominantly in Rust, with a thin
+	  C bridge ("cshim") for kernel networking APIs that have no
+	  safe-Rust abstraction yet. It is a Rust-for-Linux netdev
+	  prototype; the in-tree r8169 driver also covers RTL8125 hardware
+	  and is the default choice for production deployments.
+
+	  To compile this driver as a module, choose M here. The module
+	  will be called r8125_rust.
+
+	  See Documentation/networking/device_drivers/realtek/r8125_rust.rst
+	  for module parameters, supported chips, and limitations.

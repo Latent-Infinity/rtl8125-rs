@@ -46,7 +46,8 @@ struct napi_struct;
  *
  *  Rust implementations must be marked `extern "C"` and `pub`; nothing
  *  else in Rust calls them directly.
- * ────────────────────────────────────────────────────────────────────── */
+ * ──────────────────────────────────────────────────────────────────────
+ */
 struct r8125_bridge_ops {
 	/*
 	 * open(priv) — full device bring-up
@@ -148,7 +149,8 @@ struct r8125_bridge_ops {
  *
  *  Allocation accounting (§6.3 invariant) is initialised in the alloc
  *  call; `r8125_bridge_counters_snapshot` exposes the running totals.
- * ────────────────────────────────────────────────────────────────────── */
+ * ──────────────────────────────────────────────────────────────────────
+ */
 
 /*
  * Allocate a net_device whose private area is `struct r8125_bridge` (an
@@ -176,7 +178,8 @@ int r8125_bridge_register(struct net_device *ndev);
 
 /* Unregister + free in one step (the normal teardown path). Idempotent in
  * the sense that the driver must call it exactly once after a successful
- * register; do not also call free() afterwards. */
+ * register; do not also call free() afterwards.
+ */
 void r8125_bridge_unregister_and_free(struct net_device *ndev);
 
 /*
@@ -200,26 +203,31 @@ int r8125_bridge_irq_pin_auto(struct pci_dev *pdev, unsigned int irq,
 
 /* DMA read barrier after an RX descriptor's OWN bit clears. Mirrors
  * r8169's rtl_rx ordering: descriptor fields and DMA-written bytes are
- * not read until the device's OWN-clear publish is visible. */
+ * not read until the device's OWN-clear publish is visible.
+ */
 void r8125_bridge_dma_rmb(void);
 
 /* DMA write barrier before publishing a descriptor with the DescOwn bit
  * set. Pair with the chip's view: without this, the chip could observe
  * `opts1`'s OWN-set before the matching `addr`/`opts2` stores are
  * visible on weakly-ordered archs (ARM, RISC-V). r8169 uses dma_wmb()
- * at the equivalent points. */
+ * at the equivalent points.
+ */
 void r8125_bridge_dma_wmb(void);
 
 /* ──────────────────────────────────────────────────────────────────────
  *  Flow-control + NAPI-arming helpers — the §6.3 invariants live here.
- * ────────────────────────────────────────────────────────────────────── */
+ * ──────────────────────────────────────────────────────────────────────
+ */
 
 /* Stop the TX queue. Call from xmit BEFORE the ring fills, NOT in the
- * NETDEV_TX_BUSY hot path (see §6.3). Safe from xmit context. */
+ * NETDEV_TX_BUSY hot path (see §6.3). Safe from xmit context.
+ */
 void r8125_bridge_tx_stop_queue(struct net_device *ndev);
 
 /* Wake the TX queue. Call from the completion reaper once descriptors are
- * available again. Safe from NAPI / IRQ-thread context. */
+ * available again. Safe from NAPI / IRQ-thread context.
+ */
 void r8125_bridge_tx_wake_queue(struct net_device *ndev);
 
 /* Schedule a NAPI poll. Safe to call from atomic (IRQ) context. */
@@ -227,7 +235,8 @@ void r8125_bridge_napi_schedule(struct net_device *ndev);
 
 /* Tell NAPI we processed `work_done` frames this round and are done. The
  * driver MUST call this from inside the poll callback before returning
- * `work_done` when `work_done < budget`. */
+ * `work_done` when `work_done < budget`.
+ */
 void r8125_bridge_napi_complete_done(struct net_device *ndev, int work_done);
 
 /* Link-state helpers — Rust calls these after detecting carrier change. */
@@ -243,7 +252,8 @@ void r8125_bridge_tx_disable(struct net_device *ndev);
  *
  *  Each helper documents the counter side-effect; the Rust type-state
  *  in `src/skb.rs` mirrors these into `TxSkb<S>` transitions.
- * ────────────────────────────────────────────────────────────────────── */
+ * ──────────────────────────────────────────────────────────────────────
+ */
 
 /* DMA-unmap. No counter change here; skb consume/free is the counter event. */
 void r8125_bridge_skb_dma_unmap_tx(struct device *dev,
@@ -265,7 +275,8 @@ void r8125_bridge_skb_dma_unmap_frag_tx(struct device *dev,
  *  calls `rx_free_jumbo` for each. The NAPI RX super-call below owns the
  *  streaming-DMA sync discipline while copying bytes out of a completed
  *  slot.
- * ────────────────────────────────────────────────────────────────────── */
+ * ──────────────────────────────────────────────────────────────────────
+ */
 int  r8125_bridge_rx_alloc_jumbo(struct device *dev, void **out_cpu,
 				 dma_addr_t *out_dma);
 void r8125_bridge_rx_free_jumbo(struct device *dev, void *cpu,
@@ -293,7 +304,8 @@ void r8125_bridge_rx_one_packet(struct net_device *ndev,
 void r8125_bridge_skb_free_error(struct sk_buff *skb);
 
 /* Count a NETDEV_TX_BUSY return where the kernel retains skb ownership.
- * Call only on the documented exceptional ring-full race path. */
+ * Call only on the documented exceptional ring-full race path.
+ */
 void r8125_bridge_tx_busy_exception(struct net_device *ndev);
 
 /* ──────────────────────────────────────────────────────────────────────
@@ -339,7 +351,8 @@ void r8125_bridge_skb_rx_csum_set(struct sk_buff *skb, u32 desc_opts1);
 
 /* Bump TX netdev stats from inside the cshim. RX accounting lives in
  * `r8125_bridge_rx_one_packet`, next to `napi_gro_receive`, so the
- * Rust RX hot path makes a single cshim call per packet. */
+ * Rust RX hot path makes a single cshim call per packet.
+ */
 void r8125_bridge_account_tx(struct net_device *ndev, unsigned int bytes);
 
 /* ──────────────────────────────────────────────────────────────────────
@@ -349,18 +362,21 @@ void r8125_bridge_account_tx(struct net_device *ndev, unsigned int bytes);
  *  (linear-head + each paged frag); the chip walks them from FirstFrag
  *  to LastFrag. The Rust hot-path doesn't see sk_buff internals — the
  *  cshim does the introspection and DMA mapping.
- * ────────────────────────────────────────────────────────────────────── */
+ * ──────────────────────────────────────────────────────────────────────
+ */
 
 /* Number of paged fragments. 0 if the skb is linear-only. */
 unsigned int r8125_bridge_skb_nr_frags(struct sk_buff *skb);
 
 /* Map the LINEAR head of `skb` (skb->data .. +skb_headlen) for TX DMA.
- * Returns 0 on success, negative errno on mapping failure. */
+ * Returns 0 on success, negative errno on mapping failure.
+ */
 int r8125_bridge_skb_data_dma_map(struct device *dev, struct sk_buff *skb,
 				  dma_addr_t *out_handle, unsigned int *out_len);
 
 /* Map paged fragment `frag_idx` (0 .. nr_frags-1) for TX DMA. Uses
- * skb_frag_dma_map (page-aware) under the hood. */
+ * skb_frag_dma_map (page-aware) under the hood.
+ */
 int r8125_bridge_skb_frag_dma_map(struct device *dev, struct sk_buff *skb,
 				  unsigned int frag_idx,
 				  dma_addr_t *out_handle, unsigned int *out_len);
@@ -369,20 +385,23 @@ int r8125_bridge_skb_frag_dma_map(struct device *dev, struct sk_buff *skb,
  * GSO type is TCPv4 or TCPv6, fills `*opts1_bits` with
  * `GiantSendv4|6 | (transport_offset << GTTCPHO_SHIFT)` and `*opts2_bits`
  * with `(mss << TD1_MSS_SHIFT)` and returns true. Otherwise zeros both
- * and returns false (caller falls back to plain CSUM bits). */
+ * and returns false (caller falls back to plain CSUM bits).
+ */
 bool r8125_bridge_skb_tso_setup(struct sk_buff *skb,
 				u32 *opts1_bits, u32 *opts2_bits);
 
 /* Consume an skb on TX completion (no DMA unmap — caller did per-
  * descriptor unmap already). Bumps netdev->stats.tx_{packets,bytes}
- * from skb->len and hands the skb back to NAPI for recycling. */
+ * from skb->len and hands the skb back to NAPI for recycling.
+ */
 void r8125_bridge_skb_consume_tx(struct net_device *ndev, struct sk_buff *skb);
 
 /* ──────────────────────────────────────────────────────────────────────
  *  Counter snapshot — §6.3 invariant `tx_received == tx_consumed +
  *  tx_busy_exception + tx_dropped_error`. CI smoke test reads this at
  *  quiesce and asserts.
- * ────────────────────────────────────────────────────────────────────── */
+ * ──────────────────────────────────────────────────────────────────────
+ */
 struct r8125_bridge_counters {
 	u64 tx_received;
 	u64 tx_consumed;
@@ -408,13 +427,15 @@ void r8125_bridge_counters_snapshot(struct net_device *ndev,
  *  32-bit MMIO transaction at offset 0xB8 (GPHY_OCP). MMIO must stay
  *  inside the Rust `unsafe_boundary`; the cshim is forbidden from
  *  touching the BAR directly.
- * ────────────────────────────────────────────────────────────────────── */
+ * ──────────────────────────────────────────────────────────────────────
+ */
 
 /* MDIO read/write: u16 in [0, 0xFFFF] on success, negative errno on
  * failure. Called from process context (RTNL held). The C45 variants
  * add an MMD device address (devad) — only MDIO_MMD_VEND2 with a
  * regnum > MDIO_STAT2 actually reaches the chip; other (devad, regnum)
- * combinations return 0 (read) / -ENODEV (write), matching r8169. */
+ * combinations return 0 (read) / -ENODEV (write), matching r8169.
+ */
 typedef int (*r8125_bridge_mdio_read_fn)(void *priv, int phyreg);
 typedef int (*r8125_bridge_mdio_write_fn)(void *priv, int phyreg, u16 val);
 typedef int (*r8125_bridge_mdio_read_c45_fn)(void *priv, int devad, int phyreg);
@@ -457,7 +478,8 @@ int r8125_bridge_phy_connect_and_reset(struct net_device *ndev);
 int r8125_bridge_phy_kick_state_machine(struct net_device *ndev);
 
 /* Tear down the open-time PHY state: phy_stop + phy_disconnect. Idempotent;
- * safe to call when phy_start was never reached. */
+ * safe to call when phy_start was never reached.
+ */
 void r8125_bridge_phy_stop(struct net_device *ndev);
 
 #endif /* _R8125_NETDEV_BRIDGE_H */

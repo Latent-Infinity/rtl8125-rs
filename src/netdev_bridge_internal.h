@@ -17,7 +17,8 @@
  * line bouncing between TX context (xmit / process) and reaper context
  * (NAPI / softirq). See RUST_STANDARDS.md §15.2 and docs/M4_CLOSEOUT.md.
  * `r8125_bridge_counters_snapshot` sums across CPUs for the userspace
- * `ethtool -S` surface. */
+ * `ethtool -S` surface.
+ */
 struct r8125_bridge {
 	struct net_device *ndev;
 	struct pci_dev *pdev;
@@ -40,12 +41,14 @@ struct r8125_bridge {
 
 /* ethtool ops table; defined in netdev_bridge_ethtool.c. Exposes the
  * §6.3 counters via `ethtool -S` so the runtime invariant check
- * (`ci/check_counter_invariant.sh`) can read them from userspace. */
+ * (`ci/check_counter_invariant.sh`) can read them from userspace.
+ */
 extern const struct ethtool_ops r8125_bridge_ethtool_ops;
 
 /* §6.3 percpu counter lifecycle helpers, defined in
  * netdev_bridge_counters.c. Called from r8125_bridge_alloc /
- * r8125_bridge_{free,unregister_and_free} only; never on a hot path. */
+ * r8125_bridge_{free,unregister_and_free} only; never on a hot path.
+ */
 int  r8125_bridge_counters_alloc(struct r8125_bridge *b);
 void r8125_bridge_counters_free(struct r8125_bridge *b);
 

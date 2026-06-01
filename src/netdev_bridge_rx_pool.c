@@ -161,7 +161,8 @@ void r8125_bridge_rx_one_packet(struct net_device *ndev,
 	rx_len = skb->len;
 	this_cpu_inc(*b->rx_handed_to_stack);
 	/* Per-CPU rx_packets/rx_bytes via Candidate G's
-	 * NETDEV_PCPU_STAT_TSTATS setup at bridge_alloc. */
+	 * NETDEV_PCPU_STAT_TSTATS setup at bridge_alloc.
+	 */
 	dev_sw_netstats_rx_add(ndev, rx_len);
 	napi_gro_receive(&b->napi, skb);
 

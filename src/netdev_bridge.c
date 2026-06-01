@@ -44,7 +44,8 @@ static int bridge_ndo_open(struct net_device *ndev)
 		return rc;
 	}
 	/* Rust open() performs the hardware bring-up and decides when the
-	 * TX queue is ready. Carrier follows the PHY link-state callback. */
+	 * TX queue is ready. Carrier follows the PHY link-state callback.
+	 */
 	return 0;
 }
 
@@ -65,7 +66,8 @@ static netdev_tx_t bridge_ndo_start_xmit(struct sk_buff *skb,
 
 	/* All §6.3 counter side-effects happen inside the Rust path via
 	 * the skb helpers below — bridge_ndo_start_xmit itself is a pure
-	 * delegation. */
+	 * delegation.
+	 */
 	return (netdev_tx_t)b->ops.xmit(b->priv, skb);
 }
 
@@ -84,7 +86,8 @@ static int bridge_ndo_change_mtu(struct net_device *ndev, int new_mtu)
 		 * surfaced this on 2026-05-28). r8169 mainline solves it the
 		 * same way: drop NETIF_F_ALL_TSO + NETIF_F_CSUM at jumbo via
 		 * `ndo_fix_features`. We trigger the renegotiation here so
-		 * `bridge_ndo_fix_features` runs against the new MTU. */
+		 * `bridge_ndo_fix_features` runs against the new MTU.
+		 */
 		netdev_update_features(ndev);
 	}
 	return rc;
@@ -151,7 +154,8 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	 * re-alloc. We cap at the industry-common 9000 rather than the
 	 * chip's hardware max (16380) so peers / switches commonly tuned
 	 * for 9000 won't drop oversized frames. Phase-D bump to 16380
-	 * once operator validates peer support. */
+	 * once operator validates peer support.
+	 */
 	ndev->min_mtu = ETH_MIN_MTU;
 	ndev->max_mtu = 9000;
 
@@ -162,7 +166,8 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	 * `dev_sw_netstats_{rx,tx}_add` which is a single per-CPU
 	 * INC + ADD instead of a shared-cache-line WRITE_ONCE pair.
 	 * Same idiom r8169 uses (`r8169_main.c:5828`). Eliminates the
-	 * `ndev->stats.{rx,tx}_packets` cache-line contention. */
+	 * `ndev->stats.{rx,tx}_packets` cache-line contention.
+	 */
 	ndev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS;
 
 	/* Candidate M (RX_OPTIMIZATION_CANDIDATES.md §M): drop the
@@ -171,7 +176,8 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	 * heterogeneous-load-balancer tail-latency goal. 256 caps the
 	 * worst-case TX queueing delay at ~870 us while still leaving
 	 * room for short bursts. r8169 keeps 1000 as kernel default;
-	 * we deliberately diverge for latency.  */
+	 * we deliberately diverge for latency.
+	 */
 	ndev->tx_queue_len = 256;
 
 	/* HW offload feature advertisement. opts bits + skb-side setup
@@ -184,7 +190,8 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	 * r8169 mainline + Realtek vendor both publish 64; that is wrong
 	 * for this chip. Line rate (2.35 Gbps) is reached at ~8 segments
 	 * so the cap is not a throughput bottleneck. Full bisection log
-	 * + counter-evidence: docs/RTL8125B_TSO_NOTES.md. */
+	 * + counter-evidence: docs/RTL8125B_TSO_NOTES.md.
+	 */
 	ndev->hw_features = NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
 			    NETIF_F_RXCSUM | NETIF_F_SG |
 			    NETIF_F_TSO | NETIF_F_TSO6;
@@ -237,7 +244,8 @@ void r8125_bridge_unregister_and_free(struct net_device *ndev)
 	 * netdev). Only THEN is it safe to unregister the mdiobus, which
 	 * removes the phy_device from the bus and frees it. mdiobus_free
 	 * must happen before free_netdev because the bridge struct holds
-	 * the mii_bus pointer. */
+	 * the mii_bus pointer.
+	 */
 	unregister_netdev(ndev);
 	if (b->mii_bus) {
 		mdiobus_unregister(b->mii_bus);
@@ -276,7 +284,8 @@ int r8125_bridge_irq_pin_cpu(unsigned int irq, int cpu)
 	/* `cpumask_of(cpu)` returns a `const struct cpumask *` from the
 	 * kernel's pre-allocated per-CPU table — no stack-frame growth
 	 * (an inline `struct cpumask` would push us past
-	 * `-Wframe-larger-than=1024` on `NR_CPUS=8192` builds). */
+	 * `-Wframe-larger-than=1024` on `NR_CPUS=8192` builds).
+	 */
 	return irq_set_affinity_and_hint(irq, cpumask_of(cpu));
 }
 EXPORT_SYMBOL_GPL(r8125_bridge_irq_pin_cpu);
@@ -306,7 +315,8 @@ int r8125_bridge_irq_pin_auto(struct pci_dev *pdev, unsigned int irq,
 
 	if (node == NUMA_NO_NODE) {
 		/* Box doesn't know its NUMA topology; just pick CPU 0
-		 * if it's online, else the first online CPU. */
+		 * if it's online, else the first online CPU.
+		 */
 		cpu = cpumask_first(cpu_online_mask);
 	} else {
 		node_mask = cpumask_of_node(node);

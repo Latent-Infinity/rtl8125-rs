@@ -75,11 +75,14 @@ mod ring;
 mod skb;
 mod unsafe_boundary;
 
+// `authors` accepts a list of "Name <email>" strings. Before posting to
+// netdev the human author must replace this out-of-tree project identity
+// with the responsible maintainer identity; see docs/COMMIT_POLICY.md.
 kernel::module_pci_driver! {
     type: pci::R8125Driver,
     name: "r8125_rust",
-    authors: ["rtl8125-rs"],
-    description: "Rust driver for the Realtek RTL8125",
+    authors: ["rtl8125-rs maintainers"],
+    description: "Rust driver for the Realtek RTL8125 2.5G Ethernet controller",
     license: "GPL v2",
     params: {
         // Deliberate failure-injection knob for the plan §7 M2

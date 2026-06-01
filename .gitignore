@@ -28,6 +28,12 @@ target/
 *.log
 /var-log-*
 
+# Packet captures - bound them via tools/safe_capture.sh; never commit ad-hoc dumps.
+# (gitignore does not untrack the one already-tracked baseline under docs/baseline/.)
+*.pcap
+*.pcap[0-9]*
+*.pcapng
+
 # OS / editor cruft
 .DS_Store
 *.swp

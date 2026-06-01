@@ -1,0 +1,13 @@
+net: r8125_rust: <one-line summary, <= 50 chars>
+
+# Why (the user-visible behaviour change) before what (the code change).
+# Wrap body at 75 chars. Reference any docs/* or kernel files by path.
+#
+# Trailers (uncomment + fill before commit; DCO is required for
+# upstream submission, see docs/COMMIT_POLICY.md):
+#
+# Signed-off-by: Your Name <your.email@example.org>
+# Assisted-by: OpenAI:gpt-5 Codex
+#
+# Reviewed-by: <added during review>
+# Tested-by: <added during review>

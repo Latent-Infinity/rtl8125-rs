@@ -62,6 +62,9 @@ echo
 echo "== DMA barriers (RX read + TX/RX publish, Candidate #1) =="
 bash "$CI/check_dma_barriers.sh" || rc=1
 echo
+echo "== checkpatch.pl on cshim (kernel-community style gate) =="
+bash "$CI/check_checkpatch.sh" || rc=1
+echo
 echo "== M6 design gates (skip vacuously until impl lands) =="
 bash "$CI/check_msix_static.sh" || rc=1
 bash "$CI/check_isr_v2_paired.sh" || rc=1
