@@ -97,4 +97,3 @@ void r8125_bridge_counters_snapshot(struct net_device *ndev,
 	out->rx_handed_to_stack = bridge_counter_sum(b->rx_handed_to_stack);
 	out->rx_dropped_error   = bridge_counter_sum(b->rx_dropped_error);
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_counters_snapshot);

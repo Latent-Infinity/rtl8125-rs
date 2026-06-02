@@ -37,11 +37,11 @@ below was assembled from the netdev FAQ, `Documentation/process/`,
 | **Performance numbers vs in-tree alternative** | done | `docs/perf/r8169_comparison.md` + Gateway baseline; KVM 24h active soak + Gateway 24h active soak both clean with cache-padded fix |
 | **KASAN / lockdep / DMA_API_DEBUG clean over 24h soak** | done | `ci/check_active_soak.sh` enforces; M5_CLOSEOUT confirms |
 | **Cover-letter material (why this driver, given r8169)** | done | `docs/M7_PRE_RFC_DOSSIER.md` answers verbatim; section "Why a Rust RTL8125 driver" |
-| **Self-tests in `tools/testing/selftests/net/`** | Deferred | No selftest yet. Our harness in `scripts/` + `ci` plays the same role at the project level; a small selftest is in scope for the second patch in the series |
+| **Self-tests in `tools/testing/selftests/net/`** | Added this pass | `tools/testing/selftests/net/r8125_rust_smoke.sh` covers load, bound netdev discovery, `ip link show`, and unload; the local Makefile wires it into `TEST_PROGS`; `ci/check_selftest_smoke.sh` enforces its TAP/skip/load/unload shape |
 | **Reproducible CI (`make`, build matrix)** | done | `ci/run_checks.sh` runs the local static gate suite plus `ci/check_clippy.sh` against the validated rustc-1.93 |
-| **No new global symbols leaked to other modules** | Follow-up | All cshim helpers are `EXPORT_SYMBOL_GPL`-tagged, but they live in module-private namespace; for upstream we should consider whether to drop the exports (Rust calls cross from same module so EXPORT isn't strictly required) and audit |
+| **No new global symbols leaked to other modules** | Fixed this pass | Removed `EXPORT_SYMBOL_GPL` from module-private `r8125_bridge_*` cshim helpers; `ci/check_no_bridge_exports.sh` prevents regressions |
 | **kernel-doc (`/** ... */`) on public C API** | Follow-up | `netdev_bridge.h` carries detailed cshim contract comments, but they are not parseable kernel-doc blocks; local `scripts/kernel-doc` was unavailable here, so convert/verify before posting if these contracts are exposed as kernel-doc |
-| **Sparse / smatch clean on cshim** | Follow-up | Not run yet this session; `make C=2 M=$PWD` gate should be added before submission |
+| **Sparse / smatch clean on cshim** | Gate added | `ci/check_sparse.sh` and `ci/check_smatch.sh` run through Kbuild `C=2`; this host lacks the analyzer binaries, so run them on an analyzer-equipped kernel-build host before posting |
 | **No deprecated APIs** | done | Uses `napi_gro_receive` (current), `napi_alloc_skb`, `pcpu_stats`, `phylib`; no `netif_rx`-style legacy paths |
 
 ## Categorisation of remaining gaps
@@ -62,21 +62,19 @@ below was assembled from the netdev FAQ, `Documentation/process/`,
 
 ### Soft blockers (should fix before RFC, but maintainer might accept "in flight")
 
-3. **Sparse + smatch clean on cshim.** Adds two CI gates. Mechanical work.
-4. **`EXPORT_SYMBOL_GPL` audit on cshim helpers.** Most can drop the
-   export now that the bridge is module-local; reduces upstream surface
-   area for reviewers to argue about.
-5. **One selftest in `tools/testing/selftests/net/`.** Even a tiny one
-   ("`insmod r8125_rust && ip link show enp* && rmmod`") gives the
-   maintainer something to point CI at.
+3. **Sparse + smatch clean on cshim.** CI gates exist now; remaining work is
+   to run them on an analyzer-equipped kernel-build host and fix any findings.
+4. **Run the new selftest on hardware.** The script and static shape gate
+   exist now; remaining work is to run it on the RTL8125B host with a built
+   module and capture the TAP output.
 
 ### Acceptable to defer past RFC
 
-6. **Reviewed-by trailers.** Maintainer will assign reviewers; we can
+5. **Reviewed-by trailers.** Maintainer will assign reviewers; we can
    collect Reviewed-by during the review cycle.
-7. **A second hardware-revision test (RTL8125A / RTL8126).** Not in our
+6. **A second hardware-revision test (RTL8125A / RTL8126).** Not in our
    procurement plan; document supported chips explicitly in the RST.
-8. **Multi-queue + RSS.** Documented as not-yet (`docs/M6_MULTIQ_NA.md`)
+7. **Multi-queue + RSS.** Documented as not-yet (`docs/M6_MULTIQ_NA.md`)
    and that's fine for first submission.
 
 ## Architectural concerns the maintainer will raise
@@ -107,7 +105,10 @@ must justify:
   pre-submission step the human author has to take ownership of.
 - We do NOT implement `pm_ops` -- design exists; implementation is a
   separate task once Gateway PM-soak passes.
-- We do NOT run sparse/smatch -- adding the CI gate is a separate task.
+- We do NOT claim a local sparse/smatch analyzer result on hosts where the
+  analyzer binaries are absent; the CI gates skip cleanly there.
+- We do NOT claim the new selftest has passed on hardware until the RTL8125B
+  host runs it with the built module and captures TAP output.
 
 ## Concrete additions in this pass
 
@@ -123,6 +124,13 @@ must justify:
 6. `docs/CHECKPATCH_NOTES.md` -- first checkpatch.pl run results +
    triage.
 7. This document -- `docs/UPSTREAM_REVIEW.md`.
+8. `ci/check_sparse.sh` + `ci/check_smatch.sh` -- Kbuild `C=2`
+   analyzer gates that skip cleanly when the analyzer binaries are absent.
+9. `ci/check_no_bridge_exports.sh` -- prevents module-private C shim
+   helpers from re-entering the global kernel symbol namespace.
+10. `tools/testing/selftests/net/r8125_rust_smoke.sh`,
+   `tools/testing/selftests/net/Makefile`, and `ci/check_selftest_smoke.sh`
+   -- upstream-style load/netdev/unload smoke selftest and static shape gate.
 
 ## Cross-references
 

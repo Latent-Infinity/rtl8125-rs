@@ -107,7 +107,6 @@ u32 r8125_bridge_skb_tx_csum_opts(struct sk_buff *skb)
 	opts2 |= (u32)skb_transport_offset(skb) << R8125_TCPHO_SHIFT;
 	return opts2;
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_skb_tx_csum_opts);
 
 void r8125_bridge_skb_rx_csum_set(struct sk_buff *skb, u32 desc_opts1)
 {
@@ -129,7 +128,6 @@ void r8125_bridge_skb_rx_csum_set(struct sk_buff *skb, u32 desc_opts1)
 	else
 		skb_checksum_none_assert(skb);
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_skb_rx_csum_set);
 
 void r8125_bridge_account_tx(struct net_device *ndev, unsigned int bytes)
 {
@@ -139,7 +137,6 @@ void r8125_bridge_account_tx(struct net_device *ndev, unsigned int bytes)
 	 */
 	dev_sw_netstats_tx_add(ndev, 1, bytes);
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_account_tx);
 
 /* ── Scatter-gather + TSO (M4-perf phase 2, task 49) ─────────────────── */
 
@@ -158,7 +155,6 @@ unsigned int r8125_bridge_skb_nr_frags(struct sk_buff *skb)
 {
 	return (unsigned int)skb_shinfo(skb)->nr_frags;
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_skb_nr_frags);
 
 int r8125_bridge_skb_data_dma_map(struct device *dev, struct sk_buff *skb,
 				  dma_addr_t *out_handle, unsigned int *out_len)
@@ -177,14 +173,12 @@ int r8125_bridge_skb_data_dma_map(struct device *dev, struct sk_buff *skb,
 	*out_len = len;
 	return 0;
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_skb_data_dma_map);
 
 void r8125_bridge_skb_dma_unmap_frag_tx(struct device *dev, dma_addr_t handle,
 					size_t len)
 {
 	dma_unmap_page(dev, handle, len, DMA_TO_DEVICE);
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_skb_dma_unmap_frag_tx);
 
 int r8125_bridge_skb_frag_dma_map(struct device *dev, struct sk_buff *skb,
 				  unsigned int frag_idx,
@@ -205,7 +199,6 @@ int r8125_bridge_skb_frag_dma_map(struct device *dev, struct sk_buff *skb,
 	*out_len = len;
 	return 0;
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_skb_frag_dma_map);
 
 bool r8125_bridge_skb_tso_setup(struct sk_buff *skb,
 				u32 *opts1_bits, u32 *opts2_bits)
@@ -243,7 +236,6 @@ bool r8125_bridge_skb_tso_setup(struct sk_buff *skb,
 	*opts2_bits |= (u32)mss << R8125_TD1_MSS_SHIFT;
 	return true;
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_skb_tso_setup);
 
 void r8125_bridge_skb_consume_tx(struct net_device *ndev, struct sk_buff *skb)
 {
@@ -260,4 +252,3 @@ void r8125_bridge_skb_consume_tx(struct net_device *ndev, struct sk_buff *skb)
 		r8125_bridge_account_tx(ndev, skb->len);
 	napi_consume_skb(skb, 1);
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_skb_consume_tx);

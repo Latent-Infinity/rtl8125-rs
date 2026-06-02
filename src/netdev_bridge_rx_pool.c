@@ -90,7 +90,6 @@ int r8125_bridge_rx_alloc_jumbo(struct device *dev, void **out_cpu,
 	*out_dma = dma;
 	return 0;
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_rx_alloc_jumbo);
 
 /*
  * `r8125_bridge_rx_free_jumbo` — release one slot acquired via
@@ -115,7 +114,6 @@ void r8125_bridge_rx_free_jumbo(struct device *dev, void *cpu, dma_addr_t dma)
 	dma_unmap_page(dev, dma, R8125_RX_JUMBO_BUF_SIZE, DMA_FROM_DEVICE);
 	__free_pages(virt_to_page(cpu), R8125_RX_PAGE_ORDER);
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_rx_free_jumbo);
 
 /*
  * `r8125_bridge_rx_one_packet` — RX super-call (Candidate B of
@@ -127,8 +125,8 @@ EXPORT_SYMBOL_GPL(r8125_bridge_rx_free_jumbo);
  * (~166 K pps) this saves ~660 K boundary crossings/second.
  *
  * Same idiomatic shape r8169_main.c `rtl_rx` uses inline; the
- * difference is that we expose it as one exported entry point to
- * the Rust NAPI poll caller. If skb allocation fails, this function
+ * difference is that we expose it as one FFI entry point to the Rust
+ * NAPI poll caller. If skb allocation fails, this function
  * bumps the §6.3 `rx_dropped_error` counter and still returns the
  * DMA slot to device ownership before returning.
  *
@@ -169,6 +167,5 @@ void r8125_bridge_rx_one_packet(struct net_device *ndev,
 	dma_sync_single_for_device(d, dma, R8125_RX_JUMBO_BUF_SIZE,
 				   DMA_FROM_DEVICE);
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_rx_one_packet);
 
 MODULE_LICENSE("GPL v2");

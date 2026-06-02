@@ -13,7 +13,7 @@ underlying classification rationale.
 - `[rtl8125]` — encodes RTL8125B-specific chip knowledge; replace
   per chip
 
-## Generic — copy verbatim to next driver (8 gates)
+## Generic — copy verbatim to next driver (10 gates)
 
 | Gate | What it enforces |
 |---|---|
@@ -21,24 +21,28 @@ underlying classification rationale.
 | `check_no_panic_paths.sh` | No `unwrap()` / `expect()` / `panic!` reachable from kernel context |
 | `check_dco_assistedby.sh` | Commit messages have human `Signed-off-by:` paired with any `Assisted-by:` per kernel AI policy |
 | `check_clippy.sh` | Kernel-build clippy clean (uses rustc-1.93 toolchain pin in the Makefile) |
+| `check_sparse.sh` | Kbuild `C=2 CHECK=sparse` clean when sparse is installed |
+| `check_smatch.sh` | Kbuild `C=2 CHECK=smatch` clean when smatch is installed |
 | `check_cache_padding.sh` | Cross-context shared atomics wrap in `CachePadded<T>` |
 | `check_clean_contract_docs.sh` | Source comments don't reference stale milestones / removed IRQ modes / etc. |
 | `check_build_makefile.sh` | Kbuild wrapper uses kernel's CC, post-link BTF generation, excludes Rust DWARF from pahole |
 | `check_bare_metal_stack_teardown.sh` | `KBox::init` (not `KBox::new`) for large state + `pci::Driver::unbind` drains netdev BEFORE devres release + `NetdevHandle::shutdown` is idempotent |
 
-## Netdev pattern — copy + adjust per next NIC driver (10 gates)
+## Netdev pattern — copy + adjust per next NIC driver (12 gates)
 
 | Gate | What it enforces |
 |---|---|
 | `check_counter_infrastructure.sh` | §6.3 disposition-counter set is allocated, exported via ethtool -S, summed across CPUs |
 | `check_counter_invariant.sh` | Runtime: `tx_received == tx_consumed + tx_busy_exception + tx_dropped_error` after 1 GB transfer |
 | `check_cshim_loc_caps.sh` | Per-file `Hard cap: N LOC` marker on every cshim TU + enforcement |
+| `check_no_bridge_exports.sh` | C shim helpers stay module-private; no accidental global `EXPORT_SYMBOL*` API |
 | `check_mdio_bridge.sh` | MDIO bus alloc/register/free lifecycle + PHY init failure unwinds via disconnect + reg-range validation |
 | `check_napi_contract.sh` | NAPI poll rules: `budget==0` no complete_done, `work_done<budget` complete_done+rearm, queue hysteresis, TX-tail-before-wake ordering |
 | `check_offload_path.sh` | TSO/CSUM setup BEFORE DMA map + linear unmap uses shadow length + short-UDP errata fallback present + TSO advertisement paired with chip max_segs/max_size |
 | `check_packet_mutation.sh` | `ndo_start_xmit` doesn't write shared-clone fields of skb |
 | `check_rmmod_while_up.sh` | `rmmod` under traffic completes without `BUG`/`WARN` — the #58 fix discipline |
 | `check_skb_ownership.sh` | `DriverOwnedSkb` shape: `#[must_use]`, `#[repr(transparent)]`, no `Drop`, FFI-only `from_raw`, consume verbs only |
+| `check_selftest_smoke.sh` | Upstream-style net selftest exists, emits TAP, skips cleanly, and covers load/netdev/unload shape |
 | `check_soak_harness.sh` | Long-running soak harnesses parse, report traffic-generator failures, and fail without observed packet progress |
 
 ## RTL8125-specific — replace per chip (11 gates)
@@ -69,12 +73,12 @@ netdev-pattern, partly RTL-specific.
 
 | Class | Count | Effort for next driver |
 |---|---:|---|
-| `[generic]` | 8 | minutes (copy + adjust paths) |
-| `[netdev]` | 10 | ~1 h (copy + adjust symbol names) |
+| `[generic]` | 10 | minutes (copy + adjust paths) |
+| `[netdev]` | 12 | ~1 h (copy + adjust symbol names) |
 | `[rtl8125]` | 11 | full rewrite per chip (~half a day each) |
-| **Total** | **29** | |
+| **Total** | **33** | |
 
-The 8 `[generic]` + 10 `[netdev]` gates are the **starter pack** the
+The 10 `[generic]` + 12 `[netdev]` gates are the **starter pack** the
 next Rust NIC driver project should clone first. Together they
 cover the disciplines that prevent the bug classes named in
 [`PATTERNS.md`](../docs/PATTERNS.md) §"Bug-class index".

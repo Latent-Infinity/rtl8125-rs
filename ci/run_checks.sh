@@ -65,6 +65,16 @@ echo
 echo "== checkpatch.pl on cshim (kernel-community style gate) =="
 bash "$CI/check_checkpatch.sh" || rc=1
 echo
+echo "== cshim global-symbol hygiene =="
+bash "$CI/check_no_bridge_exports.sh" || rc=1
+echo
+echo "== sparse/smatch on cshim (kernel static-analysis gates) =="
+bash "$CI/check_sparse.sh" || rc=1
+bash "$CI/check_smatch.sh" || rc=1
+echo
+echo "== upstream-style selftest shape =="
+bash "$CI/check_selftest_smoke.sh" || rc=1
+echo
 echo "== M6 design gates (skip vacuously until impl lands) =="
 bash "$CI/check_msix_static.sh" || rc=1
 bash "$CI/check_isr_v2_paired.sh" || rc=1

@@ -72,7 +72,7 @@ path is:
 | Module load/unload (`rmmod`) while up | ✅ yes | Validated by `ci/check_rmmod_while_up.sh`, 5/5 cycles clean under iperf3 load |
 | 24-hour ASPM idle soak | ✅ yes | PCI core handles L1.x; the gate is "does the chip transmit after 24h idle" which is hardware behavior, not driver code |
 | 10× suspend/resume via `systemctl suspend` | ⚠️ partial | Without our hooks the PCI core saves/restores config, but the chip may need quirks on resume (PHY re-init etc.) that we don't do. This is the realistic gap. |
-| Function-level reset (FLR) cycle via sysfs | ✅ yes | `/sys/bus/pci/devices/.../reset` triggers FLR; our probe re-runs and we re-init. Equivalent stress test to suspend/resume from the chip's point of view. |
+| Teardown/reprobe cycle (`device/remove` + `bus/rescan`) | ✅ yes | The RTL8125B advertises **`FLReset-`** (no FLR — bare-metal and under VFIO alike), and a raw `.../reset` (secondary bus reset) WARNs in phylib because kernel-Rust `pci::Driver` has no `reset_prepare`/`reset_done` to quiesce the PHY mid-reset, and the link doesn't auto-recover. The validated substitute drives the driver's own `remove()`→`probe()` cleanly (3/3 cycles, 0 warnings). See `ci/check_flr_cycle.sh`. **Not** equivalent to true FLR/suspend, but exercises the chip re-init + ring/PHY teardown paths. |
 | Runtime PM (`echo auto > .../power/control`) | ⚠️ partial | Without our hooks the device idles into D3hot; works for many chips but the L1 chip-quirk path doesn't run. |
 
 ## Recommended M5 close-out posture
@@ -80,10 +80,15 @@ path is:
 - Document the gap (this file).
 - Run the **24h ASPM idle soak** as the binding M5 gate — it doesn't
   depend on our PM callbacks.
-- Run the **FLR cycle test** as the suspend/resume proxy (chip-side
-  semantics are similar enough).
-- Add a tracking task for "wire PM via kernel-Rust PCI when upstream
-  API lands" as a future M5+1 or M6 work item.
+- Run the **remove+rescan reprobe test** (`ci/check_flr_cycle.sh`) as the
+  suspend/resume proxy. The chip has no FLR, so this drives the driver's
+  own `remove()`/`probe()` path rather than a raw bus reset (which would
+  WARN in phylib and not re-init — see the table above).
+- Add a tracking task for "wire PM **and PCI reset handlers
+  (`reset_prepare`/`reset_done`)** via kernel-Rust PCI when the upstream
+  API lands" as a future M5+1 or M6 work item. Reset handlers would let a
+  raw `.../reset` quiesce the PHY (phy_stop) and re-init cleanly, closing
+  the WARNING seen on direct bus reset.
 
 This is honest about what's achievable today without forking the
 kernel-Rust PCI abstractions.

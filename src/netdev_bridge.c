@@ -9,7 +9,7 @@
  * sk_buff plumbing (plan §5.2 / §5.3).
  *
  * Hard cap: 450 LOC including comments. Candidate G/L/M additions fit
- * under the original cap after the dead RX helper exports were removed.
+ * under the original cap after the dead RX helpers were removed.
  * See cshim/README.md.
  *
  * Every ndo callback below is a thin delegation to the Rust vtable.
@@ -217,7 +217,6 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 			      BRIDGE_NAPI_WEIGHT);
 	return ndev;
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_alloc);
 
 void r8125_bridge_free(struct net_device *ndev)
 {
@@ -227,13 +226,11 @@ void r8125_bridge_free(struct net_device *ndev)
 	r8125_bridge_counters_free(b);
 	free_netdev(ndev);
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_free);
 
 int r8125_bridge_register(struct net_device *ndev)
 {
 	return register_netdev(ndev);
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_register);
 
 void r8125_bridge_unregister_and_free(struct net_device *ndev)
 {
@@ -257,7 +254,6 @@ void r8125_bridge_unregister_and_free(struct net_device *ndev)
 	r8125_bridge_counters_free(b);
 	free_netdev(ndev);
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_unregister_and_free);
 
 /*
  * `r8125_bridge_irq_pin_cpu` — Candidate L
@@ -288,7 +284,6 @@ int r8125_bridge_irq_pin_cpu(unsigned int irq, int cpu)
 	 */
 	return irq_set_affinity_and_hint(irq, cpumask_of(cpu));
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_irq_pin_cpu);
 
 /*
  * `r8125_bridge_irq_pin_auto` — Candidate #4 of
@@ -328,13 +323,11 @@ int r8125_bridge_irq_pin_auto(struct pci_dev *pdev, unsigned int irq,
 		*out_cpu = cpu;
 	return irq_set_affinity_and_hint(irq, cpumask_of(cpu));
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_irq_pin_auto);
 
 void r8125_bridge_dma_rmb(void)
 {
 	dma_rmb();
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_dma_rmb);
 
 /*
  * `r8125_bridge_dma_wmb` — sister to `_dma_rmb`. Issue a write-side DMA
@@ -354,7 +347,6 @@ void r8125_bridge_dma_wmb(void)
 {
 	dma_wmb();
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_dma_wmb);
 
 /* ── Flow-control + NAPI helpers ────────────────────────────────────── */
 
@@ -362,13 +354,11 @@ void r8125_bridge_tx_stop_queue(struct net_device *ndev)
 {
 	netif_tx_stop_queue(netdev_get_tx_queue(ndev, 0));
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_tx_stop_queue);
 
 void r8125_bridge_tx_wake_queue(struct net_device *ndev)
 {
 	netif_tx_wake_queue(netdev_get_tx_queue(ndev, 0));
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_tx_wake_queue);
 
 void r8125_bridge_napi_schedule(struct net_device *ndev)
 {
@@ -376,7 +366,6 @@ void r8125_bridge_napi_schedule(struct net_device *ndev)
 
 	napi_schedule(&b->napi);
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_napi_schedule);
 
 void r8125_bridge_napi_complete_done(struct net_device *ndev, int work_done)
 {
@@ -384,25 +373,21 @@ void r8125_bridge_napi_complete_done(struct net_device *ndev, int work_done)
 
 	napi_complete_done(&b->napi, work_done);
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_napi_complete_done);
 
 void r8125_bridge_carrier_on(struct net_device *ndev)
 {
 	netif_carrier_on(ndev);
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_carrier_on);
 
 void r8125_bridge_carrier_off(struct net_device *ndev)
 {
 	netif_carrier_off(ndev);
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_carrier_off);
 
 void r8125_bridge_tx_disable(struct net_device *ndev)
 {
 	netif_tx_disable(ndev);
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_tx_disable);
 
 /* ── sk_buff helpers + counter side-effects (§6.3) ─────────────────── */
 
@@ -411,7 +396,6 @@ void r8125_bridge_skb_dma_unmap_tx(struct device *dev, dma_addr_t handle,
 {
 	dma_unmap_single(dev, handle, len, DMA_TO_DEVICE);
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_skb_dma_unmap_tx);
 
 void r8125_bridge_skb_free_error(struct sk_buff *skb)
 {
@@ -422,7 +406,6 @@ void r8125_bridge_skb_free_error(struct sk_buff *skb)
 		this_cpu_inc(*b->tx_dropped_error);
 	dev_kfree_skb_any(skb);
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_skb_free_error);
 
 void r8125_bridge_tx_busy_exception(struct net_device *ndev)
 {
@@ -430,7 +413,6 @@ void r8125_bridge_tx_busy_exception(struct net_device *ndev)
 
 	this_cpu_inc(*b->tx_busy_exception);
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_tx_busy_exception);
 
 /* r8125_bridge_counters_snapshot lives in netdev_bridge_counters.c. */
 

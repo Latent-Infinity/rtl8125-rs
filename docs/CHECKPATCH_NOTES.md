@@ -44,8 +44,10 @@ still run `ci/run_checks.sh` without a Linux kernel install).
 A clean checkpatch run is the **minimum** netdev acceptance bar; it is
 not sufficient. Maintainers additionally expect:
 
-  - `sparse` clean (`make C=2 M=$PWD`) -- TODO before RFC.
-  - `smatch` clean -- TODO before RFC.
+  - `sparse` clean (`ci/check_sparse.sh`) -- gated in CI when the
+    analyzer binary is installed.
+  - `smatch` clean (`ci/check_smatch.sh`) -- gated in CI when the
+    analyzer binary is installed.
   - `kernel-doc` warnings absent for any parseable `/** ... */`
     blocks. The current cshim header uses detailed contract comments,
     not kernel-doc blocks; convert and verify with

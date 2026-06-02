@@ -147,7 +147,6 @@ int r8125_bridge_phy_register(struct net_device *ndev,
 	phy_support_asym_pause(b->phydev);
 	return 0;
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_phy_register);
 
 int r8125_bridge_phy_connect_and_reset(struct net_device *ndev)
 {
@@ -185,7 +184,6 @@ disconnect:
 	b->phy_connected = false;
 	return ret;
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_phy_connect_and_reset);
 
 int r8125_bridge_phy_kick_state_machine(struct net_device *ndev)
 {
@@ -196,7 +194,6 @@ int r8125_bridge_phy_kick_state_machine(struct net_device *ndev)
 	phy_start(b->phydev);
 	return 0;
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_phy_kick_state_machine);
 
 void r8125_bridge_phy_stop(struct net_device *ndev)
 {
@@ -208,4 +205,3 @@ void r8125_bridge_phy_stop(struct net_device *ndev)
 	phy_disconnect(b->phydev);
 	b->phy_connected = false;
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_phy_stop);
