@@ -294,11 +294,7 @@ impl<'a> Regs<'a> {
     /// transaction to complete.
     ///
     /// Returns `Err(EIO)` on timeout (the chip never cleared OCPAR_FLAG).
-    pub(crate) fn gphy_ocp_write(
-        &self,
-        ocp_addr: u32,
-        data: u16,
-    ) -> kernel::error::Result<()> {
+    pub(crate) fn gphy_ocp_write(&self, ocp_addr: u32, data: u16) -> kernel::error::Result<()> {
         // OCPAR_FLAG | (ocp_addr << 15) | data
         let cmd = regs::OCPAR_FLAG | ((ocp_addr & 0xFFFF) << 15) | u32::from(data);
         self.bar.write32(cmd, regs::GPHY_OCP);
@@ -341,12 +337,7 @@ impl<'a> Regs<'a> {
     }
 
     /// MDIO-style PHY write — same page logic as `mdio_read`.
-    pub(crate) fn mdio_write(
-        &self,
-        ocp_base: u32,
-        reg: u8,
-        val: u16,
-    ) -> kernel::error::Result<()> {
+    pub(crate) fn mdio_write(&self, ocp_base: u32, reg: u8, val: u16) -> kernel::error::Result<()> {
         let reg_adj = if ocp_base != regs::OCP_STD_PHY_BASE && reg >= 0x10 {
             reg - 0x10
         } else {

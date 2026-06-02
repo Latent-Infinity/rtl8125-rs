@@ -20,6 +20,9 @@ userspace idioms.
 - **MUST** target the Rust toolchain supported by the validated kernel tree,
   not latest stable by default. This repo currently validates through the
   kernel build/Clippy path pinned in `ci/check_clippy.sh`.
+- **MUST** keep Rust sources `rustfmt`-clean through `ci/check_rustfmt.sh`.
+  Cargo is not the build system here; formatting is checked directly against
+  the Rust files compiled by Kbuild.
 - **MUST** keep the crate `#![deny(unsafe_code)]`; all unsafe Rust belongs in
   `src/unsafe_boundary.rs` and must be justified at the wrapper boundary.
 - **MUST** treat MMIO ordering, DMA ownership, cache-coherency sync, IRQ/NAPI
@@ -145,6 +148,8 @@ gate before or with the implementation. Current mandatory gates include:
 
 - `ci/check_unsafe_allowlist.sh`: unsafe containment, raw-MMIO containment,
   and non-increasing unsafe census.
+- `ci/check_rustfmt.sh`: Rust source formatting without assuming a Cargo
+  manifest.
 - `ci/check_clippy.sh`: kernel-build Clippy, not `cargo clippy`.
 - `ci/check_cache_padding.sh`: non-array atomics in cross-context state and
   file-scope hot-path statics must be `CachePadded` or explicitly annotated
@@ -180,6 +185,11 @@ Hardware validation should cover probe/remove, `rmmod` while up, sustained
 traffic, jumbo MTU, MSI/MSI-X and INTx fallback, ASPM/suspend/resume, error
 injection, and at least one bare-metal soak. Report concrete dates, kernel
 config, hardware, traffic profile, counters, and observed failures.
+
+Cargo dependency-audit tools do not apply until this driver grows a
+`Cargo.toml`/`Cargo.lock`. Kernel-module cleanliness is enforced through
+Kbuild Clippy, `rustfmt`, unsafe containment, panic-path bans, driver
+invariant gates, sparse/smatch/checkpatch, and runtime/debug-kernel tests.
 
 ## Observability
 

@@ -23,6 +23,9 @@ echo
 echo "== build wrapper / BTF path =="
 bash "$CI/check_build_makefile.sh" || rc=1
 echo
+echo "== Rust source formatting =="
+bash "$CI/check_rustfmt.sh" || rc=1
+echo
 echo "== RTL8125B hardware init parity =="
 bash "$CI/check_hw_init.sh" || rc=1
 echo

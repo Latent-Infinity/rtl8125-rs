@@ -63,15 +63,13 @@ pub(crate) struct ChipInfo {
 
 /// Known-chip dispatch table — M2 carries only the validated entry. Adding
 /// a row here is the supported way to support a new RTL8125 sub-revision.
-pub(crate) const KNOWN: &[ChipInfo] = &[
-    ChipInfo {
-        mask: 0x7cf,
-        val: 0x641,
-        mac_version: MacVersion::Rtl8125B,
-        name: "RTL8125B",
-        max_mtu: crate::regs::JUMBO_9K_BYTES,
-    },
-];
+pub(crate) const KNOWN: &[ChipInfo] = &[ChipInfo {
+    mask: 0x7cf,
+    val: 0x641,
+    mac_version: MacVersion::Rtl8125B,
+    name: "RTL8125B",
+    max_mtu: crate::regs::JUMBO_9K_BYTES,
+}];
 
 /// Extract the XID from a raw `TxConfig` value (the r8169 formula).
 pub(crate) fn xid_from_tx_config(tx_config: u32) -> u32 {
@@ -168,11 +166,7 @@ fn hw_start_8125b_unlocked(regs: &Regs<'_>) -> Result<()> {
     regs.mac_ocp_modify(0xE860, 0x0000, 0x0080);
 
     // Critical for our 16-byte (legacy r8169) TX descriptors.
-    regs.mac_ocp_modify(
-        regs::MAC_OCP_NEW_TX_DESC,
-        regs::MAC_OCP_NEW_TX_DESC_BIT0,
-        0,
-    );
+    regs.mac_ocp_modify(regs::MAC_OCP_NEW_TX_DESC, regs::MAC_OCP_NEW_TX_DESC_BIT0, 0);
 
     // VER_63 specific tuning.
     regs.mac_ocp_modify(0xE614, 0x0700, 0x0200);

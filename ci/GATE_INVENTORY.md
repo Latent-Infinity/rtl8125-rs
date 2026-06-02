@@ -13,13 +13,14 @@ underlying classification rationale.
 - `[rtl8125]` — encodes RTL8125B-specific chip knowledge; replace
   per chip
 
-## Generic — copy verbatim to next driver (10 gates)
+## Generic — copy verbatim to next driver (11 gates)
 
 | Gate | What it enforces |
 |---|---|
 | `check_unsafe_allowlist.sh` | `#![deny(unsafe_code)]` outside the boundary file + `.unsafe-allowlist` + non-increasing `.unsafe-census` |
 | `check_no_panic_paths.sh` | No `unwrap()` / `expect()` / `panic!` reachable from kernel context |
 | `check_dco_assistedby.sh` | Commit messages have human `Signed-off-by:` paired with any `Assisted-by:` per kernel AI policy |
+| `check_rustfmt.sh` | Rust sources are rustfmt-clean without requiring a Cargo manifest |
 | `check_clippy.sh` | Kernel-build clippy clean (uses rustc-1.93 toolchain pin in the Makefile) |
 | `check_sparse.sh` | Kbuild `C=2 CHECK=sparse` clean when sparse is installed |
 | `check_smatch.sh` | Kbuild `C=2 CHECK=smatch` clean when smatch is installed |
@@ -73,12 +74,12 @@ netdev-pattern, partly RTL-specific.
 
 | Class | Count | Effort for next driver |
 |---|---:|---|
-| `[generic]` | 10 | minutes (copy + adjust paths) |
+| `[generic]` | 11 | minutes (copy + adjust paths) |
 | `[netdev]` | 12 | ~1 h (copy + adjust symbol names) |
 | `[rtl8125]` | 11 | full rewrite per chip (~half a day each) |
-| **Total** | **33** | |
+| **Total** | **34** | |
 
-The 10 `[generic]` + 12 `[netdev]` gates are the **starter pack** the
+The 11 `[generic]` + 12 `[netdev]` gates are the **starter pack** the
 next Rust NIC driver project should clone first. Together they
 cover the disciplines that prevent the bug classes named in
 [`PATTERNS.md`](../docs/PATTERNS.md) §"Bug-class index".

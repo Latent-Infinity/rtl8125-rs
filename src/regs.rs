@@ -65,8 +65,7 @@ pub(crate) const INTR_TER: u32 = 0x0008;
 pub(crate) const INTR_LINK_CHG: u32 = 0x0020;
 /// IRQ sources we listen for at M4 baseline: RX OK + RX err + TX OK + TX err
 /// + link-change. RX descriptor unavailable / overrun are silently dropped.
-pub(crate) const INTR_M4_BASELINE: u32 =
-    INTR_ROK | INTR_RER | INTR_TOK | INTR_TER | INTR_LINK_CHG;
+pub(crate) const INTR_M4_BASELINE: u32 = INTR_ROK | INTR_RER | INTR_TOK | INTR_TER | INTR_LINK_CHG;
 
 // ── ISR_V2 / IMR_V2 — per-message-id interrupt layout (M6 #1 Phase A.2) ──
 //
@@ -99,8 +98,7 @@ pub(crate) const ISRIMR_V2_LINKCHG: u32 = 1 << 21;
 /// RX error / TX error don't have explicit V2 messages on 8125B; the
 /// chip surfaces them as TOK_Q0 / ROK_Q0 with status flags in the
 /// descriptor, which the NAPI reaper inspects per-packet.
-pub(crate) const INTR_V2_M4_BASELINE: u32 =
-    ISRIMR_V2_ROK_Q0 | ISRIMR_V2_TOK_Q0 | ISRIMR_V2_LINKCHG;
+pub(crate) const INTR_V2_M4_BASELINE: u32 = ISRIMR_V2_ROK_Q0 | ISRIMR_V2_TOK_Q0 | ISRIMR_V2_LINKCHG;
 
 // ── INT_CFG — 8125 interrupt config ──────────────────────────────────────
 /// `INT_CFG0` (8-bit at 0x34). At M4 we write 0 (legacy-ISR mode).
@@ -288,7 +286,7 @@ pub(crate) const RCR_ACCEPT_ERR: u32 = 0x20;
 // VER_63 case. Must be OR'd with the accept-policy bits at write time.
 // Without these the RX engine fetches descriptors too slowly under bursty
 // peer-ACK traffic.
-pub(crate) const RXCFG_DMA_BURST: u32 = 7 << 8;        // bits 8-10
+pub(crate) const RXCFG_DMA_BURST: u32 = 7 << 8; // bits 8-10
 pub(crate) const RXCFG_PAUSE_SLOT_ON_8125B: u32 = 1 << 11;
 pub(crate) const RXCFG_FETCH_DFLT_8125: u32 = 8 << 27; // bits 27-29
 pub(crate) const RXCFG_8125B_CHIP_BITS: u32 =
@@ -298,10 +296,8 @@ pub(crate) const RXCFG_8125B_CHIP_BITS: u32 =
 /// + the 8125B chip-config bits above. r8169 writes these together so
 ///
 /// the full 32-bit RxConfig has both accept policy AND FIFO/DMA setup.
-pub(crate) const RCR_M4_BASELINE: u32 = RCR_ACCEPT_BROADCAST
-    | RCR_ACCEPT_MULTICAST
-    | RCR_ACCEPT_MY_PHYS
-    | RXCFG_8125B_CHIP_BITS;
+pub(crate) const RCR_M4_BASELINE: u32 =
+    RCR_ACCEPT_BROADCAST | RCR_ACCEPT_MULTICAST | RCR_ACCEPT_MY_PHYS | RXCFG_8125B_CHIP_BITS;
 
 // ── CPlusCmd (16-bit, MMIO 0xE0) ─────────────────────────────────────────
 pub(crate) const CPLUSCMD: usize = 0xE0;

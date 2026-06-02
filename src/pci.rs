@@ -40,12 +40,7 @@
 //! (plan §7 M2) is enforced (other drivers rebind cleanly).
 
 use kernel::{
-    device::Core,
-    devres::Devres,
-    error::code::ENODEV,
-    pci,
-    prelude::*,
-    sync::aref::ARef,
+    device::Core, devres::Devres, error::code::ENODEV, pci, prelude::*, sync::aref::ARef,
 };
 
 use core::sync::atomic::AtomicPtr;
@@ -167,8 +162,7 @@ impl pci::Driver for R8125Driver {
             // Reset-timeout failure-injection knob. Read once at probe entry
             // so the value is consistent through the BAR-mapping + reset flow
             // inside the init scope below.
-            let inject_timeout =
-                *crate::module_parameters::inject_reset_timeout.value() != 0;
+            let inject_timeout = *crate::module_parameters::inject_reset_timeout.value() != 0;
 
             Ok(try_pin_init!(Self {
                 _bar <- pdev.iomap_region_sized::<{ mmio::R8125_MMIO_LEN }>(

@@ -16,8 +16,8 @@
 //! - **Compile-time bounds**: `const RING_LEN: usize = 256`; ring sizes
 //!   propagate through `Ring<N>` const-generic parameter.
 
-use kernel::dma::{CoherentAllocation, DmaAddress};
 use kernel::device;
+use kernel::dma::{CoherentAllocation, DmaAddress};
 use kernel::error::code::EIO;
 use kernel::prelude::*;
 
@@ -84,8 +84,14 @@ macro_rules! ring_index {
 }
 
 ring_index!(TxHead, "TX ring producer index (driver advances).");
-ring_index!(TxTail, "TX ring consumer index (reaper advances on completion).");
-ring_index!(RxHead, "RX ring producer index (hardware advances on receive).");
+ring_index!(
+    TxTail,
+    "TX ring consumer index (reaper advances on completion)."
+);
+ring_index!(
+    RxHead,
+    "RX ring producer index (hardware advances on receive)."
+);
 ring_index!(RxTail, "RX ring consumer index (NAPI advances after rx).");
 
 // Power-of-two so the wrap mask above is a compile-time constant.

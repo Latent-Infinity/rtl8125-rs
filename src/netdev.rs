@@ -329,10 +329,7 @@ pub(crate) struct IrqState {
 }
 
 impl IrqState {
-    pub(crate) fn new(
-        num: u32,
-        mode: IrqMode,
-    ) -> impl pin_init::Init<Self, kernel::error::Error> {
+    pub(crate) fn new(num: u32, mode: IrqMode) -> impl pin_init::Init<Self, kernel::error::Error> {
         kernel::try_init!(Self {
             num,
             mode: AtomicU8::new(mode as u8),
@@ -502,7 +499,9 @@ pub(crate) const M4_FULL_OPS: BridgeOps = BridgeOps {
 // to point at `M4_SKELETON_OPS` for a no-traffic insmod/rmmod
 // regression with no chip interaction. Not wired by default.
 #[allow(dead_code)]
-extern "C" fn skel_open(_cookie: *mut c_void) -> c_int { 0 }
+extern "C" fn skel_open(_cookie: *mut c_void) -> c_int {
+    0
+}
 #[allow(dead_code)]
 extern "C" fn skel_stop(_cookie: *mut c_void) {}
 #[allow(dead_code)]
@@ -513,9 +512,13 @@ extern "C" fn skel_xmit(_cookie: *mut c_void, skb: *mut bindings::sk_buff) -> c_
     NETDEV_TX_OK
 }
 #[allow(dead_code)]
-extern "C" fn skel_poll(_cookie: *mut c_void, _budget: c_int) -> c_int { 0 }
+extern "C" fn skel_poll(_cookie: *mut c_void, _budget: c_int) -> c_int {
+    0
+}
 #[allow(dead_code)]
-extern "C" fn skel_change_mtu(_cookie: *mut c_void, _new_mtu: c_int) -> c_int { 0 }
+extern "C" fn skel_change_mtu(_cookie: *mut c_void, _new_mtu: c_int) -> c_int {
+    0
+}
 
 #[allow(dead_code)]
 pub(crate) const M4_SKELETON_OPS: BridgeOps = BridgeOps {
@@ -601,7 +604,11 @@ fn pre_post_rx_descriptors(state: &NetdevState) {
         ub::desc_publish_own(
             state.rx.desc,
             i,
-            Descriptor { opts1, opts2: 0, addr: dma },
+            Descriptor {
+                opts1,
+                opts2: 0,
+                addr: dma,
+            },
         );
     }
 }
@@ -618,7 +625,11 @@ fn clear_tx_descriptor(state: &NetdevState, slot: usize) {
     ub::desc_write(
         state.tx.desc,
         slot,
-        Descriptor { opts1, opts2: 0, addr: 0 },
+        Descriptor {
+            opts1,
+            opts2: 0,
+            addr: 0,
+        },
     );
 }
 
@@ -769,7 +780,10 @@ struct RxPoolGuard<'a> {
 impl<'a> RxPoolGuard<'a> {
     fn allocate(state: &'a NetdevState) -> Result<Self> {
         allocate_rx_pool(state)?;
-        Ok(Self { state, released: false })
+        Ok(Self {
+            state,
+            released: false,
+        })
     }
 
     /// Mark the pool as owned by the active netdev — `ndo_stop` (not
@@ -802,7 +816,11 @@ impl<'a> IrqGuard<'a> {
     fn register(state: &'a NetdevState) -> Result<Self> {
         let cookie = cookie_from_state(state);
         register_irq_handler(state, cookie)?;
-        Ok(Self { state, cookie, released: false })
+        Ok(Self {
+            state,
+            cookie,
+            released: false,
+        })
     }
 
     fn release(mut self) {
@@ -895,7 +913,9 @@ fn ndo_stop(state: &NetdevState) {
     let (x, i, n) = debug_counts();
     pr_info!(
         "r8125_rust ndo_stop: xmit_calls={} irq_fires={} napi_polls={}\n",
-        x, i, n
+        x,
+        i,
+        n
     );
 
     // Stop kernel TX submissions + carrier first so xmit can't race the
@@ -977,11 +997,7 @@ fn compute_offload_bits(skb: &crate::skb::DriverOwnedSkb) -> OffloadOutcome {
 /// recheck), and returns `None`. Caller returns `NETDEV_TX_BUSY`. On
 /// success returns `Some(tail)` so the caller can reuse the snapshot
 /// in the post-commit `in_flight_after` calculation.
-fn try_reserve_ring_space(
-    state: &NetdevState,
-    head: usize,
-    n_desc: usize,
-) -> Option<usize> {
+fn try_reserve_ring_space(state: &NetdevState, head: usize, n_desc: usize) -> Option<usize> {
     let tail = state.tx.tail.inner.load(Ordering::Acquire);
     let in_flight = head.wrapping_sub(tail);
     if in_flight + n_desc >= RING_LEN {
@@ -1086,7 +1102,11 @@ impl<'a> Drop for TxMapGuard<'a> {
     fn drop(&mut self) {
         // If `release` ran the slot is `None`; nothing to undo.
         if let Some(skb) = self.skb.take() {
-            ub::skb_dma_unmap_tx(&self.state.pdev, self.linear_handle, self.linear_len as usize);
+            ub::skb_dma_unmap_tx(
+                &self.state.pdev,
+                self.linear_handle,
+                self.linear_len as usize,
+            );
             for j in 0..self.frags_published {
                 let prev_slot = (self.head.wrapping_add(1 + j)) % RING_LEN;
                 let pa = self.state.tx.shadow_dma[prev_slot].load(Ordering::Acquire);
@@ -1157,13 +1177,21 @@ fn map_skb_fragments(
         // skb pointer lives on the LAST descriptor only; intermediate
         // fragments stay null so the reaper only consumes the skb once.
         state.tx.shadow[slot].store(
-            if is_last_frag { skb.as_raw() } else { core::ptr::null_mut() },
+            if is_last_frag {
+                skb.as_raw()
+            } else {
+                core::ptr::null_mut()
+            },
             Ordering::Release,
         );
         ub::desc_write(
             state.tx.desc,
             slot,
-            Descriptor { opts1, opts2: first_opts2, addr: h },
+            Descriptor {
+                opts1,
+                opts2: first_opts2,
+                addr: h,
+            },
         );
         guard.record_frag();
     }
@@ -1238,8 +1266,7 @@ fn ndo_start_xmit(state: &NetdevState, skb: crate::skb::DriverOwnedSkb) -> c_int
     // publishing the head LAST (after all fragment descriptors), the
     // chip observes a fully-populated chain when it picks up the head.
     let first_slot = head % RING_LEN;
-    let mut first_opts1 =
-        regs::DESC_OWN | regs::DESC_TX_FS | (linear_len & regs::DESC_LEN_MASK);
+    let mut first_opts1 = regs::DESC_OWN | regs::DESC_TX_FS | (linear_len & regs::DESC_LEN_MASK);
     if n_desc == 1 {
         first_opts1 |= regs::DESC_TX_LS;
     }

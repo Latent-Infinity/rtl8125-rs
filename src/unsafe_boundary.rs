@@ -201,10 +201,7 @@ extern "C" {
         out_opts1: *mut u32,
         out_opts2: *mut u32,
     ) -> bool;
-    fn r8125_bridge_skb_consume_tx(
-        ndev: *mut bindings::net_device,
-        skb: *mut bindings::sk_buff,
-    );
+    fn r8125_bridge_skb_consume_tx(ndev: *mut bindings::net_device, skb: *mut bindings::sk_buff);
 
     // ── PHY plumbing (M4-traffic) ────────────────────────────────────────
     fn r8125_bridge_phy_register(
@@ -248,12 +245,8 @@ pub(crate) struct BridgeMdioOps {
     pub read: extern "C" fn(priv_: *mut c_void, phyreg: c_int) -> c_int,
     pub write: extern "C" fn(priv_: *mut c_void, phyreg: c_int, val: u16) -> c_int,
     pub read_c45: extern "C" fn(priv_: *mut c_void, devad: c_int, phyreg: c_int) -> c_int,
-    pub write_c45: extern "C" fn(
-        priv_: *mut c_void,
-        devad: c_int,
-        phyreg: c_int,
-        val: u16,
-    ) -> c_int,
+    pub write_c45:
+        extern "C" fn(priv_: *mut c_void, devad: c_int, phyreg: c_int, val: u16) -> c_int,
 }
 
 // SAFETY: `NetdevHandle` wraps a raw `*mut bindings::net_device` from
@@ -296,9 +289,7 @@ pub(crate) fn pci_set_master(_pdev: &kernel::sync::aref::ARef<pci::Device>) {
 
 /// Raw `*mut pci_dev` from an `ARef<pci::Device>` (same layout argument as
 /// `pci_dev_raw` above — `pci::Device` is repr(transparent) over Opaque).
-fn pci_dev_raw_from_aref(
-    pdev: &kernel::sync::aref::ARef<pci::Device>,
-) -> *mut bindings::pci_dev {
+fn pci_dev_raw_from_aref(pdev: &kernel::sync::aref::ARef<pci::Device>) -> *mut bindings::pci_dev {
     let p: &pci::Device = pdev;
     let opaque: &Opaque<bindings::pci_dev> =
         // SAFETY: same repr-transparent argument as `pci_dev_raw`.
@@ -627,10 +618,7 @@ pub(crate) fn bridge_irq_pin_cpu(irq: u32, cpu: c_int) -> c_int {
 /// # SAFETY: as `bridge_irq_pin_cpu` plus: `pdev` must be a live
 /// `pci_dev` (the caller is probe-time, so probe's
 /// `pci::Device<Bound>` guarantees this).
-pub(crate) fn bridge_irq_pin_auto(
-    pdev: *mut bindings::pci_dev,
-    irq: u32,
-) -> (c_int, c_int) {
+pub(crate) fn bridge_irq_pin_auto(pdev: *mut bindings::pci_dev, irq: u32) -> (c_int, c_int) {
     let mut cpu_chosen: c_int = -1;
     // SAFETY: see fn-level contract.
     let rc = unsafe { r8125_bridge_irq_pin_auto(pdev, irq, &mut cpu_chosen) };
@@ -679,9 +667,7 @@ pub(crate) fn bridge_carrier_off(ndev: *mut bindings::net_device) {
     unsafe { r8125_bridge_carrier_off(ndev) };
 }
 
-fn bridge_dma_device(
-    pdev: &kernel::sync::aref::ARef<pci::Device>,
-) -> *mut bindings::device {
+fn bridge_dma_device(pdev: &kernel::sync::aref::ARef<pci::Device>) -> *mut bindings::device {
     // Use the cshim's accessor by going through ANY registered net_device
     // is awkward when we only have pdev; just build &dev from the pci_dev
     // directly. The cshim's `bridge_skb_*` helpers accept a struct device *
@@ -883,10 +869,7 @@ pub(crate) fn skb_frag_dma_map(
 /// # SAFETY: `ndev` is the registered net_device (alive while
 /// NetdevHandle lives); `skb` was just removed from the TX shadow and is
 /// driver-owned exclusively at this point.
-pub(crate) fn skb_consume_tx(
-    ndev: *mut bindings::net_device,
-    skb: *mut bindings::sk_buff,
-) {
+pub(crate) fn skb_consume_tx(ndev: *mut bindings::net_device, skb: *mut bindings::sk_buff) {
     // SAFETY: see fn-level contract.
     unsafe { r8125_bridge_skb_consume_tx(ndev, skb) };
 }
@@ -948,9 +931,7 @@ pub(crate) fn bridge_phy_register(
 ///
 /// # SAFETY: `ndev` must be a registered net_device for which
 /// `bridge_phy_register` previously returned Ok.
-pub(crate) fn bridge_phy_connect_and_reset(
-    ndev: *mut bindings::net_device,
-) -> Result<()> {
+pub(crate) fn bridge_phy_connect_and_reset(ndev: *mut bindings::net_device) -> Result<()> {
     // SAFETY: see fn-level contract.
     let rc = unsafe { r8125_bridge_phy_connect_and_reset(ndev) };
     to_result(rc)
@@ -961,9 +942,7 @@ pub(crate) fn bridge_phy_connect_and_reset(
 ///
 /// # SAFETY: same as `bridge_phy_connect_and_reset`; must have been
 /// called first.
-pub(crate) fn bridge_phy_kick_state_machine(
-    ndev: *mut bindings::net_device,
-) -> Result<()> {
+pub(crate) fn bridge_phy_kick_state_machine(ndev: *mut bindings::net_device) -> Result<()> {
     // SAFETY: see fn-level contract.
     let rc = unsafe { r8125_bridge_phy_kick_state_machine(ndev) };
     to_result(rc)
@@ -997,10 +976,7 @@ fn valid_mii_reg(phyreg: c_int) -> bool {
 /// MDIO read entry point — invoked by `mii_bus->read`. Returns a
 /// non-negative `u16` value on success or a negative kernel errno on
 /// failure. Reg 0x1F returns the current OCP page.
-pub(crate) extern "C" fn r8125_rust_mdio_read(
-    cookie: *mut c_void,
-    phyreg: c_int,
-) -> c_int {
+pub(crate) extern "C" fn r8125_rust_mdio_read(cookie: *mut c_void, phyreg: c_int) -> c_int {
     if cookie.is_null() || !valid_mii_reg(phyreg) {
         return errno_to_c_int(kernel::error::code::EINVAL);
     }

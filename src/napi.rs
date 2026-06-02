@@ -123,13 +123,7 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
             // Cuts 4 FFI crossings per packet vs the previous chain.
             // The cshim handles `rx_dropped_error` accounting on
             // alloc failure; nothing else for the Rust side to do.
-            ub::bridge_rx_one_packet(
-                ndev,
-                slot.dma,
-                slot.cpu.cast_const(),
-                len,
-                desc.opts1,
-            );
+            ub::bridge_rx_one_packet(ndev, slot.dma, slot.cpu.cast_const(), len, desc.opts1);
         }
 
         // Re-post the descriptor with the slot's existing DMA address.
@@ -145,7 +139,11 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
         ub::desc_publish_own(
             state.rx.desc,
             rx_tail,
-            Descriptor { opts1, opts2: 0, addr: slot.dma },
+            Descriptor {
+                opts1,
+                opts2: 0,
+                addr: slot.dma,
+            },
         );
 
         rx_tail = (rx_tail + 1) % RING_LEN;
@@ -206,7 +204,11 @@ fn process_tx_completions(state: &NetdevState) -> (usize, usize, usize) {
         ub::desc_write(
             state.tx.desc,
             slot,
-            Descriptor { opts1, opts2: 0, addr: 0 },
+            Descriptor {
+                opts1,
+                opts2: 0,
+                addr: 0,
+            },
         );
         tx_tail = tx_tail.wrapping_add(1);
         reaped += 1;
