@@ -28,7 +28,14 @@
 #include <linux/slab.h>
 #include <asm/barrier.h>
 
-#define BRIDGE_NAPI_WEIGHT	64
+/*
+ * Raised from 64 (r8169 default) to 128: at MTU-1500 line rate (~166k pps)
+ * the Rust RX poll is more per-packet-expensive than r8169's C path, so a
+ * deeper per-poll drain reduces re-arm churn and ring-overrun drops. Eval
+ * lever #1 (RX batching); measured on the KASAN KVM where the cost is
+ * amplified.
+ */
+#define BRIDGE_NAPI_WEIGHT	128
 
 /* ── ndo callbacks — each is a thin delegation to Rust ───────────────── */
 

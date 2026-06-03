@@ -106,9 +106,11 @@ pub(crate) struct Ring<const N: usize> {
     /// DMA-coherent descriptor array. Slots 0..N are hardware-visible;
     /// slot N is the tail canary. Drops on `Ring` drop → `dma_free_coherent`.
     desc: CoherentAllocation<Descriptor>,
-    /// Per-descriptor software canary shadow. Catches driver-side scribbles
-    /// in M4+ (in M3 it is vacuously preserved — no driver writes happen).
-    shadow: [u64; N],
+    /// Per-descriptor software canary shadow. Heap-allocated (`KBox`) and
+    /// filled in place so a large `N` never materialises an `[u64; N]` on the
+    /// kernel stack during probe (see `Ring::new`). Catches driver-side
+    /// scribbles in M4+ (in M3 it is vacuously preserved — no driver writes).
+    shadow: KBox<[u64; N]>,
 }
 
 impl<const N: usize> Ring<N> {
@@ -135,10 +137,13 @@ impl<const N: usize> Ring<N> {
             }
         );
 
-        Ok(Self {
-            desc,
-            shadow: [CANARY_PATTERN; N],
-        })
+        // Build the shadow on the heap, filled in place: `init_array_from_fn`
+        // never constructs the `[u64; N]` on the stack, so probe stays within
+        // the 16 KiB x86_64 kernel-stack budget even at large `N` (e.g. 1024).
+        // A by-value `[CANARY_PATTERN; N]` here overflowed the stack at N>=512
+        // under KASAN (corrupted-stack-end panic during insmod) — fixed.
+        let shadow = KBox::init(pin_init::init_array_from_fn(|_| CANARY_PATTERN), GFP_KERNEL)?;
+        Ok(Self { desc, shadow })
     }
 
     /// DMA address of slot 0 of the ring — what gets programmed into the

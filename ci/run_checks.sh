@@ -26,6 +26,9 @@ echo
 echo "== Rust source formatting =="
 bash "$CI/check_rustfmt.sh" || rc=1
 echo
+echo "== Host-side Rust contract fuzz/test gate =="
+bash "$CI/check_driver_contract_fuzz.sh" || rc=1
+echo
 echo "== RTL8125B hardware init parity =="
 bash "$CI/check_hw_init.sh" || rc=1
 echo
