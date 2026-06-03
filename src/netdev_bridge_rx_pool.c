@@ -146,13 +146,14 @@ void r8125_bridge_rx_one_packet(struct net_device *ndev,
 	skb = napi_alloc_skb(&b->napi, len + NET_IP_ALIGN);
 	if (unlikely(!skb)) {
 		this_cpu_inc(*b->rx_dropped_error);
-		dma_sync_single_for_device(d, dma, R8125_RX_JUMBO_BUF_SIZE,
+		dma_sync_single_for_device(d, dma, len,
 					   DMA_FROM_DEVICE);
 		return;
 	}
 	skb_reserve(skb, NET_IP_ALIGN);
 	prefetch(buf);
-	__skb_put_data(skb, buf, len);
+	skb_copy_to_linear_data(skb, buf, len);
+	__skb_put(skb, len);
 	skb->protocol = eth_type_trans(skb, ndev);
 	r8125_bridge_skb_rx_csum_set(skb, desc_opts1);
 
@@ -164,7 +165,7 @@ void r8125_bridge_rx_one_packet(struct net_device *ndev,
 	dev_sw_netstats_rx_add(ndev, rx_len);
 	napi_gro_receive(&b->napi, skb);
 
-	dma_sync_single_for_device(d, dma, R8125_RX_JUMBO_BUF_SIZE,
+	dma_sync_single_for_device(d, dma, len,
 				   DMA_FROM_DEVICE);
 }
 

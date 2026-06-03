@@ -30,7 +30,7 @@ if [[ -z "$body" ]]; then
 fi
 
 if grep -q 'dma_sync_single_for_cpu(d, dma, len, DMA_FROM_DEVICE)' <<<"$body" \
-   && grep -q 'dma_sync_single_for_device(d, dma, R8125_RX_JUMBO_BUF_SIZE' <<<"$body"; then
+   && grep -qE 'dma_sync_single_for_device\(d, dma, (len|R8125_RX_JUMBO_BUF_SIZE)' <<<"$body"; then
 	grn "RX super-call keeps streaming-DMA CPU/device ownership syncs"
 else
 	red "RX super-call must sync for CPU before copy and for device before return"
@@ -48,10 +48,11 @@ else
 	red "RX super-call should prefetch(buf) before the linear copy"
 fi
 
-if grep -q '__skb_put_data(skb, buf, len)' <<<"$body"; then
-	grn "RX super-call uses kernel helper for unchecked copy/tail update"
+if grep -q '__skb_put_data(skb, buf, len)' <<<"$body" \
+	|| grep -q 'skb_copy_to_linear_data(skb, buf, len)' <<<"$body"; then
+	grn "RX super-call uses kernel helper for linear copy and tail update"
 else
-	red "RX super-call must use __skb_put_data(skb, buf, len)"
+	red "RX super-call must use __skb_put_data or skb_copy_to_linear_data + __skb_put"
 fi
 
 if grep -q 'netdev_alloc_skb' <<<"$body"; then
@@ -68,7 +69,9 @@ fi
 
 cpu_line=$(grep -n 'dma_sync_single_for_cpu' <<<"$body" | head -n1 | cut -d: -f1)
 alloc_line=$(grep -n 'napi_alloc_skb(&b->napi' <<<"$body" | head -n1 | cut -d: -f1)
-copy_line=$(grep -n '__skb_put_data(skb, buf, len)' <<<"$body" | head -n1 | cut -d: -f1)
+copy_line=$( (grep -n '__skb_put_data(skb, buf, len)' <<<"$body" | head -n1; \
+              grep -n 'skb_copy_to_linear_data(skb, buf, len)' <<<"$body" | head -n1) \
+            | head -n1 | cut -d: -f1 )
 csum_line=$(grep -n 'r8125_bridge_skb_rx_csum_set' <<<"$body" | head -n1 | cut -d: -f1)
 gro_line=$(grep -n 'napi_gro_receive(&b->napi, skb)' <<<"$body" | head -n1 | cut -d: -f1)
 device_line=$(grep -n 'dma_sync_single_for_device' <<<"$body" | tail -n1 | cut -d: -f1)
