@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# Static gate for M6 sub-feature #3 (jumbo frames + RX pool refactor).
-# See docs/M6_JUMBO_DESIGN.md.
+# Static gate for the zero-copy RX page_pool lifecycle (M6 #2 v3).
+# See docs/M6_JUMBO_DESIGN.md and src/netdev_bridge_rx_pool.c.
 #
-# Once we replace the M4 single CoherentAllocation<RxBuffer> with
-# per-slot streaming DMA pages, every alloc_pages call needs a
-# matching __free_pages and every dma_map_page needs a matching
-# dma_unmap_page. This script catches mismatches statically.
-#
-# Vacuous before the jumbo refactor lands.
+# The RX buffers are owned by a `page_pool`. Leak-safety now means:
+#   - every page_pool_create has a matching page_pool_destroy,
+#   - allocated pages either go to the stack (recycle) or back to the pool
+#     (page_pool_put_full_page) — no bare alloc without a return path,
+#   - ndo_stop frees all slots AND destroys the pool,
+#   - ndo_open failure paths release the pool (RAII guard or manual).
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,95 +19,83 @@ red()  { printf '\033[1;31mFAIL\033[0m %s\n' "$*"; rc=1; }
 grn()  { printf '\033[1;32mPASS\033[0m %s\n' "$*"; }
 yel()  { printf '\033[1;33mSKIP\033[0m %s\n' "$*"; }
 
-# Engagement: jumbo RX-pool refactor is in tree once any cshim file
-# references alloc_pages_node, OR if RxSlot/rx_slots appears in
-# NetdevState (the per-slot struct from the design doc).
-JUMBO_LANDED=0
-if grep -qE 'alloc_pages_node|alloc_pages\b' "$ROOT/src/"*.c 2>/dev/null; then
-	JUMBO_LANDED=1
+# Engagement: zero-copy RX pool is in tree once any cshim file references
+# page_pool_create, OR the per-slot shadow appears in NetdevState.
+LANDED=0
+if grep -qE 'page_pool_create' "$ROOT/src/"*.c 2>/dev/null; then
+	LANDED=1
 fi
-if grep -qE 'rx_slots\s*:\s*\[' "$ROOT/src/netdev.rs" 2>/dev/null; then
-	JUMBO_LANDED=1
+if grep -qE 'slot_dma\s*:\s*\[' "$ROOT/src/netdev.rs" 2>/dev/null; then
+	LANDED=1
 fi
-if [[ "$JUMBO_LANDED" -eq 0 ]]; then
-	yel "jumbo RX-pool refactor not yet landed — skipping"
+if [[ "$LANDED" -eq 0 ]]; then
+	yel "zero-copy RX pool not yet landed — skipping"
 	exit 0
 fi
 
-# 1. alloc_pages_node paired with __free_pages.
-alloc_count=$(grep -c 'alloc_pages_node\b\|\balloc_pages(' "$ROOT/src/"*.c 2>/dev/null | \
-	awk -F: '{s+=$NF} END {print s}')
-free_count=$(grep -c '__free_pages\b' "$ROOT/src/"*.c 2>/dev/null | \
-	awk -F: '{s+=$NF} END {print s}')
-if [[ "$alloc_count" -gt 0 ]] && [[ "$free_count" -gt 0 ]]; then
-	grn "alloc_pages call count $alloc_count, __free_pages count $free_count (both nonzero)"
-elif [[ "$alloc_count" -gt 0 ]]; then
-	red "alloc_pages used but __free_pages never called — RX pool leaks on close"
+# 1. page_pool_create paired with page_pool_destroy.
+create_count=$(grep -c 'page_pool_create' "$ROOT/src/"*.c 2>/dev/null | awk -F: '{s+=$NF} END {print s}')
+destroy_count=$(grep -c 'page_pool_destroy' "$ROOT/src/"*.c 2>/dev/null | awk -F: '{s+=$NF} END {print s}')
+if [[ "$create_count" -gt 0 ]] && [[ "$destroy_count" -gt 0 ]]; then
+	grn "page_pool_create count $create_count, page_pool_destroy count $destroy_count (both nonzero)"
+elif [[ "$create_count" -gt 0 ]]; then
+	red "page_pool_create used but page_pool_destroy never called — pool leaks on close"
 fi
 
-# 2. dma_map_page paired with dma_unmap_page (RX side specifically —
-#    TX already has this via skb_frag_dma_map / dma_unmap_page).
-map_count=$(grep -c 'dma_map_page\b' "$ROOT/src/"*.c 2>/dev/null | awk -F: '{s+=$NF} END {print s}')
-unmap_count=$(grep -c 'dma_unmap_page\b' "$ROOT/src/"*.c 2>/dev/null | awk -F: '{s+=$NF} END {print s}')
-if [[ "$map_count" -gt 0 ]] && [[ "$unmap_count" -gt 0 ]]; then
-	grn "dma_map_page count $map_count, dma_unmap_page count $unmap_count (both nonzero)"
-elif [[ "$map_count" -gt 0 ]]; then
-	red "dma_map_page used but dma_unmap_page never called — DMA mapping leaks"
+# 2. Allocated pages have a return path: skb_mark_for_recycle (to the stack)
+#    AND page_pool_put_full_page (teardown + drop). Both must exist.
+alloc_count=$(grep -c 'page_pool_dev_alloc_pages' "$ROOT/src/"*.c 2>/dev/null | awk -F: '{s+=$NF} END {print s}')
+if [[ "$alloc_count" -gt 0 ]]; then
+	if grep -qE 'skb_mark_for_recycle' "$ROOT/src/"*.c 2>/dev/null \
+	   && grep -qE 'page_pool_put_full_page' "$ROOT/src/"*.c 2>/dev/null; then
+		grn "RX pages return via skb_mark_for_recycle (stack) + page_pool_put_full_page (teardown/drop)"
+	else
+		red "page_pool_dev_alloc_pages used but missing a return path (skb_mark_for_recycle / page_pool_put_full_page)"
+	fi
 fi
 
-# 3. Per-slot DMA shadow tracking (similar to tx_shadow_dma for TX).
-#    The reaper / cleanup needs to recover (handle, len) at unmap time
-#    so we need a shadow array per RX slot.
-if grep -qE 'rx_shadow_dma|rx_slot.*dma' "$ROOT/src/netdev.rs" 2>/dev/null; then
-	grn "RX DMA shadow tracking is present"
+# 3. The driver must NOT mix the bare-page allocator with page_pool — that
+#    would double-own buffers. (The v2 alloc_pages/dma_map_page path is gone.)
+if grep -qE '\balloc_pages\(|\bdma_map_page\(' "$ROOT/src/"*.c 2>/dev/null; then
+	red "bare alloc_pages/dma_map_page present alongside page_pool — buffer ownership ambiguity"
 else
-	red "RX pool uses streaming DMA but no rx_shadow_dma/rx_slot.dma tracking — leak risk"
+	grn "RX path uses page_pool exclusively (no bare alloc_pages/dma_map_page)"
 fi
 
-# 4. ndo_stop walks all slots to free + unmap (the cleanup pairing).
-# `rx_free_jumbo` is the safe-Rust wrapper whose cshim does
-# dma_unmap_page + __free_pages atomically — accept it alongside the
-# explicit inline pairing patterns.
-# Note: awk's `\b` word boundary is unreliable (gawk diverges from POSIX);
-# use an explicit `(` lookahead matching `fn ndo_stop(` instead.
-if awk '/fn[[:space:]]+ndo_stop\(/,/^}/' "$ROOT/src/netdev.rs" 2>/dev/null | \
-		grep -qE '(rx_slot|rx_shadow_dma).*dma_unmap|__free_pages\(.*rx|rx_free_jumbo\(|free_rx_slots\(state\)'; then
-	grn "ndo_stop cleans up RX pool (unmap + free per slot)"
+# 4. Per-slot DMA shadow tracking (NAPI needs to re-post the refilled addr).
+if grep -qE 'slot_dma\s*:\s*\[' "$ROOT/src/netdev.rs" 2>/dev/null; then
+	grn "RX per-slot DMA shadow tracking is present"
 else
-	red "ndo_stop does NOT walk RX slots to free pages + unmap DMA — leak on rmmod"
+	red "RX pool uses streaming DMA but no slot_dma shadow — re-post/leak risk"
 fi
 
-# 5. Post-allocation failure paths must release the RX pool. Task #61
-# replaced the open-coded `free_rx_slots(state)` calls in every failure
-# branch with an `RxPoolGuard` — its `Drop` calls `free_rx_slots` so any
-# `?` or `return Err(e)` between `RxPoolGuard::allocate` and the
-# success-path `rx_pool.release()` unwinds automatically. Accept either
-# the manual-cleanup form (legacy) or the RAII guard form.
-manual_ok=1
-awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | \
-		grep -qE '(request_irq|register_irq_handler)\(.*\)[[:space:]]*\{' || manual_ok=0
-awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | \
-		awk '/(request_irq|register_irq_handler)\(/,/return Err\(e\);/' | grep -q 'free_rx_slots(state)' || manual_ok=0
-awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | \
-		awk '/bridge_phy_connect_and_reset/,/return Err\(e\);/' | grep -q 'free_rx_slots(state)' || manual_ok=0
-awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | \
-		awk '/hw_start_8125b/,/return Err\(e\);/' | grep -q 'free_rx_slots(state)' || manual_ok=0
-awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | \
-		awk '/bridge_phy_kick_state_machine/,/return Err\(e\);/' | grep -q 'free_rx_slots(state)' || manual_ok=0
+# 5. ndo_stop frees all slots AND destroys the pool.
+stop_body=$(awk '/fn[[:space:]]+ndo_stop\(/,/^}/' "$ROOT/src/netdev.rs" 2>/dev/null)
+if grep -q 'free_rx_slots(state)' <<<"$stop_body"; then
+	grn "ndo_stop frees the RX pool slots (free_rx_slots also destroys the pool)"
+else
+	red "ndo_stop does NOT call free_rx_slots — leak on rmmod"
+fi
+# free_rx_slots itself must destroy the pool after the slot loop.
+frs_body=$(awk '/fn[[:space:]]+free_rx_slots\(/,/^}/' "$ROOT/src/netdev.rs" 2>/dev/null)
+if grep -q 'rx_pool_destroy(' <<<"$frs_body"; then
+	grn "free_rx_slots destroys the page_pool after returning every slot"
+else
+	red "free_rx_slots must rx_pool_destroy() after freeing all slots"
+fi
 
+# 6. ndo_open post-allocation failure paths release the pool. The RxPoolGuard
+#    RAII form: its Drop calls free_rx_slots (which destroys the pool), so any
+#    `?`/`return Err` after RxPoolGuard::allocate unwinds automatically.
 raii_ok=1
 grep -qE 'struct RxPoolGuard' "$ROOT/src/netdev.rs" || raii_ok=0
-# Accept `impl Drop for RxPoolGuard` and `impl<...> Drop for RxPoolGuard<...>`.
 grep -qE 'impl(<[^>]+>)?[[:space:]]+Drop[[:space:]]+for[[:space:]]+RxPoolGuard' "$ROOT/src/netdev.rs" || raii_ok=0
 grep -q 'free_rx_slots(self.state)' "$ROOT/src/netdev.rs" || raii_ok=0
-awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | \
-		grep -q 'RxPoolGuard::allocate' || raii_ok=0
-
-if grep -qE 'fn[[:space:]]+free_rx_slots\(' "$ROOT/src/netdev.rs" \
-   && { [[ $manual_ok -eq 1 ]] || [[ $raii_ok -eq 1 ]]; }; then
-	grn "ndo_open post-allocation failure paths release RX jumbo slots"
+awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | grep -q 'RxPoolGuard::allocate' || raii_ok=0
+if grep -qE 'fn[[:space:]]+free_rx_slots\(' "$ROOT/src/netdev.rs" && [[ $raii_ok -eq 1 ]]; then
+	grn "ndo_open failure paths release the RX pool (RxPoolGuard RAII)"
 else
-	red "ndo_open has a post-RX-allocation failure path that does not free RX jumbo slots"
+	red "ndo_open has a post-RX-allocation failure path that does not release the pool"
 fi
 
 exit $rc

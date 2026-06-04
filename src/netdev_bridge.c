@@ -8,8 +8,10 @@
  * has no stable Rust API today: net_device + net_device_ops + NAPI +
  * sk_buff plumbing (plan §5.2 / §5.3).
  *
- * Hard cap: 450 LOC including comments. Candidate G/L/M additions fit
- * under the original cap after the dead RX helpers were removed.
+ * Hard cap: 480 LOC including comments. Candidate G/L/M additions fit
+ * under the original 450 cap after the dead RX helpers were removed;
+ * raised to 480 for the two ndo_change_mtu accessors the per-MTU
+ * zero-copy RX path needs (netif_running + WRITE_ONCE(dev->mtu)).
  * See cshim/README.md.
  *
  * Every ndo callback below is a thin delegation to the Rust vtable.
@@ -155,13 +157,11 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	ndev->needs_free_netdev = false; /* we free explicitly */
 	eth_hw_addr_set(ndev, mac);
 
-	/* M6 #2: jumbo support up to 9000 bytes. The per-slot RX pool
-	 * (netdev_bridge_rx_pool.c) sizes every slot at JUMBO_16K_BYTES,
-	 * so any MTU in [ETH_MIN_MTU, 9000] fits without a per-MTU
-	 * re-alloc. We cap at the industry-common 9000 rather than the
-	 * chip's hardware max (16380) so peers / switches commonly tuned
-	 * for 9000 won't drop oversized frames. Phase-D bump to 16380
-	 * once operator validates peer support.
+	/* M6 #2: jumbo support up to 9000 bytes. RX slot geometry now
+	 * comes from per-MTU sizing in netdev_bridge_rx_pool.c, and `ndo_open`
+	 * creates a new page_pool sized for the current MTU.
+	 * We keep the 9000 MTU cap (industry-common) unless operators opt
+	 * in to the chip's 16380 limit after validation.
 	 */
 	ndev->min_mtu = ETH_MIN_MTU;
 	ndev->max_mtu = 9000;
@@ -419,6 +419,58 @@ void r8125_bridge_tx_busy_exception(struct net_device *ndev)
 	struct r8125_bridge *b = netdev_priv(ndev);
 
 	this_cpu_inc(*b->tx_busy_exception);
+}
+
+/*
+ * ndo_change_mtu support. With per-MTU zero-copy RX buffers, a change while
+ * the interface is up must re-create the RX pool at the new size — a full
+ * stop/open cycle. `r8125_bridge_netif_running` lets the Rust side decide
+ * whether that cycle is needed.
+ */
+bool r8125_bridge_netif_running(struct net_device *ndev)
+{
+	return netif_running(ndev);
+}
+
+/*
+ * Re-open the device at a new MTU, bracketing the Rust stop/open with the
+ * same napi_disable/enable + netif_tx_disable discipline as
+ * bridge_ndo_open / bridge_ndo_stop. Doing the napi lifecycle here (not in
+ * Rust) keeps it in one place and avoids destroying the RX page_pool while
+ * its NAPI is still active (the page_pool_disable_direct_recycling race
+ * assertion). The new MTU is published before ops.open so the pool sizes to
+ * it. Returns 0 or a negative errno from ops.open.
+ */
+int r8125_bridge_reopen_for_mtu(struct net_device *ndev, int new_mtu)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+	int rc;
+	int old_mtu;
+
+	if (unlikely(!ndev))
+		return -EINVAL;
+
+	old_mtu = ndev->mtu;
+	if (old_mtu == new_mtu)
+		return 0;
+
+	netif_tx_disable(ndev);
+	napi_disable(&b->napi);
+	b->ops.stop(b->priv);
+
+	WRITE_ONCE(ndev->mtu, new_mtu);
+	napi_enable(&b->napi);
+	rc = b->ops.open(b->priv);
+	if (!rc)
+		return 0;
+
+	/* Roll back to previous MTU before returning failure so callers
+	 * observe a stable state even if `ndo_change_mtu` rejects the
+	 * requested value.
+	 */
+	WRITE_ONCE(ndev->mtu, old_mtu);
+	napi_disable(&b->napi);
+	return rc;
 }
 
 /* r8125_bridge_counters_snapshot lives in netdev_bridge_counters.c. */

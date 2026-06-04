@@ -265,34 +265,37 @@ void r8125_bridge_skb_dma_unmap_frag_tx(struct device *dev,
  *  Jumbo RX-pool: per-slot streaming-DMA allocator (M6 sub-feature #2).
  *
  *  The earlier 2 KiB coherent-ring design used one allocation sized for
- *  256 slots. Jumbo (RX buffers up to 16 KiB) doesn't fit that pattern —
- *  4 MiB contiguous DMA-coherent is unreliable on fragmented systems.
- *  These helpers move the pool to one streaming-DMA page chunk per
- *  slot (`alloc_pages(order=2)` + `dma_map_page`), matching r8169
- *  mainline's per-slot strategy. Implementation: netdev_bridge_rx_pool.c.
+ *  256 slots. This design uses `page_pool` because fragmented systems
+ *  cannot reliably allocate 4 MiB contiguous DMA-coherent memory.
+ *  These helpers own the zero-copy RX buffer lifecycle (M6 #2 v3): a
+ *  per-MTU page_pool at ndo_open, with napi_build_skb delivery +
+ *  page recycling. Implementation: netdev_bridge_rx_pool.c.
  *
- *  Lifecycle: `ndo_open` calls `rx_alloc_jumbo` per ring slot; `ndo_stop`
- *  calls `rx_free_jumbo` for each. The NAPI RX super-call below owns the
- *  streaming-DMA sync discipline while copying bytes out of a completed
- *  slot.
+ *  Lifecycle: `ndo_open` calls `rx_pool_create` (returns the per-buffer
+ *  device-writable length) then `rx_alloc` per ring slot; `ndo_stop`
+ *  calls `rx_free` per slot then `rx_pool_destroy`. The NAPI RX super-call
+ *  below owns the streaming-DMA sync + the alloc-before-consume refill.
  * ──────────────────────────────────────────────────────────────────────
  */
-int  r8125_bridge_rx_alloc_jumbo(struct device *dev, void **out_cpu,
-				 dma_addr_t *out_dma);
-void r8125_bridge_rx_free_jumbo(struct device *dev, void *cpu,
-				dma_addr_t dma);
+int  r8125_bridge_rx_pool_create(struct net_device *ndev, unsigned int ring_len,
+				 u32 *out_buf_len);
+void r8125_bridge_rx_pool_destroy(struct net_device *ndev);
+int  r8125_bridge_rx_alloc(struct net_device *ndev, void **out_cpu,
+			   dma_addr_t *out_dma);
+void r8125_bridge_rx_free(struct net_device *ndev, void *cpu);
 
 /*
- * `r8125_bridge_rx_one_packet` — RX super-call (Candidate B,
- * docs/RX_OPTIMIZATION_CANDIDATES.md). Collapses sync_for_cpu +
- * skb_build_rx + skb_rx_csum_set + skb_deliver_rx + sync_for_device
- * (5 FFI crossings) into 1 cshim call per RX packet. Bumps
- * `rx_dropped_error` internally if skb allocation fails. Callable only
- * from NAPI poll context.
+ * `r8125_bridge_rx_one_packet` — zero-copy RX super-call (Candidate B +
+ * per-MTU #3, docs/RX_OPTIMIZATION_CANDIDATES.md). Hands the received page
+ * to the stack via napi_build_skb + skb_mark_for_recycle (no copy), and
+ * refills the slot alloc-before-consume from the pool. Outputs the slot's
+ * refilled (cpu, dma); on a refill-failure drop they equal the inputs.
+ * Bumps `rx_dropped_error` internally on failure. NAPI-poll context only.
  */
 void r8125_bridge_rx_one_packet(struct net_device *ndev,
 				dma_addr_t dma, const void *buf,
-				size_t len, u32 desc_opts1);
+				size_t len, u32 desc_opts1,
+				void **new_cpu, dma_addr_t *new_dma);
 
 /*
  * Free an skb on the TX-error path (validation reject, DMA-map failure,
@@ -307,6 +310,15 @@ void r8125_bridge_skb_free_error(struct sk_buff *skb);
  * Call only on the documented exceptional ring-full race path.
  */
 void r8125_bridge_tx_busy_exception(struct net_device *ndev);
+
+/* ndo_change_mtu support for per-MTU zero-copy RX: detect the running
+ * state, and (when up) re-open at the new MTU with the napi_disable/enable
+ * bracket so the RX page_pool is never destroyed mid-NAPI. On failure,
+ * the shim restores the old MTU before returning an error so callers see
+ * stable state. See `netdev::rust_change_mtu`.
+ */
+bool r8125_bridge_netif_running(struct net_device *ndev);
+int  r8125_bridge_reopen_for_mtu(struct net_device *ndev, int new_mtu);
 
 /* ──────────────────────────────────────────────────────────────────────
  *  HW checksum offload (M4-perf, task 48).

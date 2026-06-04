@@ -32,26 +32,17 @@ use core::ffi::c_int;
 use core::ptr;
 use core::sync::atomic::Ordering;
 
-use crate::netdev::{IrqMode, NetdevState, RX_BUF_LEN};
+use crate::netdev::{IrqMode, NetdevState, RxSlot};
 use crate::regs;
 use crate::ring::{Descriptor, RING_LEN};
 #[allow(clippy::unsafe_removed_from_name)]
 use crate::unsafe_boundary as ub;
 
-/// Per-descriptor RX length advertised to the chip. The hardware
-/// descriptor's LEN field is 14 bits (`DESC_LEN_MASK = 0x3FFF`), so the
-/// maximum chip-encodable per-slot buffer length is 16383 bytes — one
-/// less than the 16 KiB page chunk the cshim hands us. We clamp here
-/// once (constant fold) so the hot RX loop doesn't redo the saturating
-/// `min` per descriptor.
-const RX_DESC_BUF_LEN: u32 = {
-    let len = RX_BUF_LEN as u32;
-    if len > regs::DESC_LEN_MASK {
-        regs::DESC_LEN_MASK
-    } else {
-        len
-    }
-};
+// Per-descriptor RX length advertised to the chip is now per-MTU (M6 #2
+// v3): the pool's device-writable `buf_len` (already ≤ `DESC_LEN_MASK`,
+// the 14-bit descriptor field). It's read once per poll from
+// `state.rx.buf_len` and reused for both the frame-length clamp and the
+// descriptor LEN field — see `process_rx_completions`.
 
 /// Re-arm the chip's interrupt sources to the baseline mask. Branches on
 /// the probe-chosen [`IrqMode`]:
@@ -99,6 +90,12 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
     // `ndev` atomic load out of the per-packet loop. `ndev` is
     // invariant across the whole NAPI poll call — load it once.
     let ndev = state.ndev.load(Ordering::Acquire);
+    // Per-MTU buffer length for this open (M6 #2 v3): drives both the
+    // frame-length clamp and the descriptor LEN field. Invariant across
+    // the poll, so load once. Already ≤ DESC_LEN_MASK (the cshim caps it).
+    let buf_len = state.rx.buf_len.load(Ordering::Acquire);
+    let buf_desc_len = buf_len & regs::DESC_LEN_MASK;
+    let buf_len = buf_len as usize;
     while work_done < budget_u {
         let desc = ub::desc_read(state.rx.desc, rx_tail);
         // Hardware sets OWN; if still set, this slot isn't filled yet — stop.
@@ -113,25 +110,39 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
         // typically strips CRC — same convention as r8169). Cap at the
         // buffer size for safety.
         let len = (desc.opts1 & regs::DESC_LEN_MASK) as usize;
-        let len = core::cmp::min(len, RX_BUF_LEN);
+        let len = core::cmp::min(len, buf_len);
 
-        let slot = state.rx_slot(rx_tail);
+        // Default re-post address is the slot's current DMA buffer (the
+        // `len == 0` case below never consumes it, so it stays
+        // device-owned and needs no refill).
+        let slot_dma = state.rx.slot_dma[rx_tail].load(Ordering::Acquire);
+        let mut post_dma = slot_dma;
         if len > 0 {
-            // RX super-call (RX_OPTIMIZATION_CANDIDATES.md §B):
-            // collapses sync_for_cpu + skb_build + csum_set +
-            // deliver_rx + sync_for_device into one cshim call.
-            // Cuts 4 FFI crossings per packet vs the previous chain.
-            // The cshim handles `rx_dropped_error` accounting on
-            // alloc failure; nothing else for the Rust side to do.
-            ub::bridge_rx_one_packet(ndev, slot.dma, slot.cpu.cast_const(), len, desc.opts1);
+            // RX super-call (RX_OPTIMIZATION_CANDIDATES.md §B + per-MTU #3):
+            // zero-copy napi_build_skb + page-pool recycle, with
+            // alloc-before-consume refill. The received page is handed to
+            // the stack (no copy) and the slot is refilled with a fresh
+            // page; the call returns the slot's new (cpu, dma). On a refill
+            // failure it drops the frame and returns the old (cpu, dma)
+            // unchanged. The cshim handles all §6.3 counter accounting.
+            let slot_cpu = state.rx.slot_cpu[rx_tail].load(Ordering::Acquire);
+            let (new_cpu, new_dma) =
+                ub::bridge_rx_one_packet(ndev, slot_dma, slot_cpu.cast_const(), len, desc.opts1);
+            // Publish the refilled buffer into the slot shadow so the next
+            // wrap-around reads the live page, not the one now owned by the
+            // stack. (No-op store on the drop path — values are unchanged.)
+            state.set_rx_slot(
+                rx_tail,
+                RxSlot {
+                    cpu: new_cpu,
+                    dma: new_dma,
+                },
+            );
+            post_dma = new_dma;
         }
 
-        // Re-post the descriptor with the slot's existing DMA address.
-        // For `len > 0`, `bridge_rx_one_packet` always returns the DMA
-        // slot to device ownership, even on allocation failure. For
-        // `len == 0`, Rust never reads from the DMA buffer, so ownership
-        // remained with the device and no sync-for-device is required.
-        let mut opts1 = regs::DESC_OWN | RX_DESC_BUF_LEN;
+        // Re-post the descriptor with the (possibly refilled) DMA address.
+        let mut opts1 = regs::DESC_OWN | buf_desc_len;
         if rx_tail == RING_LEN - 1 {
             opts1 |= regs::DESC_EOR;
         }
@@ -142,7 +153,7 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
             Descriptor {
                 opts1,
                 opts2: 0,
-                addr: slot.dma,
+                addr: post_dma,
             },
         );
 

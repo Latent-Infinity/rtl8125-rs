@@ -19,6 +19,8 @@
  * `r8125_bridge_counters_snapshot` sums across CPUs for the userspace
  * `ethtool -S` surface.
  */
+struct page_pool;	/* zero-copy RX buffer owner (netdev_bridge_rx_pool.c) */
+
 struct r8125_bridge {
 	struct net_device *ndev;
 	struct pci_dev *pdev;
@@ -37,6 +39,18 @@ struct r8125_bridge {
 	u64 __percpu *tx_dropped_error;
 	u64 __percpu *rx_handed_to_stack;
 	u64 __percpu *rx_dropped_error;
+
+	/* Zero-copy RX (netdev_bridge_rx_pool.c). The pool owns every RX
+	 * buffer; the geometry below is computed once per ndo_open from
+	 * dev->mtu and cached so the hot path reads it without recomputing.
+	 * page_pool is NULL while the device is down.
+	 */
+	struct page_pool *page_pool;
+	unsigned int rx_headroom;	/* reserved in front of each frame */
+	unsigned int rx_offset;		/* device DMA offset into the page  */
+	unsigned int rx_max_len;	/* device-writable bytes per buffer */
+	unsigned int rx_order;		/* page allocation order            */
+	size_t rx_buf_total;		/* PAGE_SIZE << rx_order            */
 };
 
 /* ethtool ops table; defined in netdev_bridge_ethtool.c. Exposes the

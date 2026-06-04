@@ -33,7 +33,7 @@
 #![allow(unsafe_code)]
 #![allow(non_camel_case_types)]
 
-use core::ffi::{c_int, c_void};
+use core::ffi::{c_int, c_uint, c_void};
 use core::ptr::NonNull;
 use core::sync::atomic::Ordering;
 
@@ -212,28 +212,42 @@ extern "C" {
     fn r8125_bridge_phy_kick_state_machine(ndev: *mut bindings::net_device) -> c_int;
     fn r8125_bridge_phy_stop(ndev: *mut bindings::net_device);
 
-    // ── Jumbo RX-pool (M6 #2) — per-slot streaming-DMA pages ───────────
-    fn r8125_bridge_rx_alloc_jumbo(
-        dev: *mut bindings::device,
+    // ── Zero-copy RX (M6 #2 v3) — page_pool + per-MTU buffers ──────────
+    // The pool is created per ndo_open sized for dev->mtu; `out_buf_len`
+    // is the device-writable bytes per buffer (drives descriptor LEN +
+    // RxMaxSize). Destroy happens after every slot is freed.
+    fn r8125_bridge_rx_pool_create(
+        ndev: *mut bindings::net_device,
+        ring_len: c_uint,
+        out_buf_len: *mut u32,
+    ) -> c_int;
+    fn r8125_bridge_rx_pool_destroy(ndev: *mut bindings::net_device);
+    fn r8125_bridge_rx_alloc(
+        ndev: *mut bindings::net_device,
         out_cpu: *mut *mut c_void,
         out_dma: *mut bindings::dma_addr_t,
     ) -> c_int;
-    fn r8125_bridge_rx_free_jumbo(
-        dev: *mut bindings::device,
-        cpu: *mut c_void,
-        dma: bindings::dma_addr_t,
-    );
+    fn r8125_bridge_rx_free(ndev: *mut bindings::net_device, cpu: *mut c_void);
 
-    // RX super-call (Candidate B, RX_OPTIMIZATION_CANDIDATES.md §B).
-    // Collapses 5 per-packet FFI crossings into 1. On allocation
-    // failure, the cshim bumps rx_dropped_error and re-syncs for device.
+    // RX super-call (Candidate B + #3): zero-copy napi_build_skb +
+    // page-pool recycle, with alloc-before-consume refill. Outputs the
+    // slot's refilled (cpu, dma) so the caller updates its shadow and
+    // re-posts the descriptor. On drop the outputs equal the inputs.
     fn r8125_bridge_rx_one_packet(
         ndev: *mut bindings::net_device,
         dma: bindings::dma_addr_t,
         buf: *const core::ffi::c_void,
         len: usize,
         desc_opts1: u32,
+        new_cpu: *mut *mut c_void,
+        new_dma: *mut bindings::dma_addr_t,
     );
+
+    // ndo_change_mtu accessors (per-MTU RX needs a stop/open on a live
+    // MTU change; see `netdev::rust_change_mtu`). The reopen bracket lives
+    // in C so the napi_disable/enable discipline matches ndo_open/stop.
+    fn r8125_bridge_netif_running(ndev: *mut bindings::net_device) -> bool;
+    fn r8125_bridge_reopen_for_mtu(ndev: *mut bindings::net_device, new_mtu: c_int) -> c_int;
 }
 
 /// Rust mirror of `struct r8125_bridge_mdio_ops` — four function pointers
@@ -381,32 +395,57 @@ pub(crate) fn pci_irq_vector<Ctx: device::DeviceContext>(
     }
 }
 
-// ── Jumbo RX-pool safe wrappers (M6 #2) ──────────────────────────────────
+// ── Zero-copy RX-pool safe wrappers (M6 #2 v3) ───────────────────────────
 //
-// Each `RxSlot` holds one streaming-DMA-mapped 16 KiB page chunk from
-// `r8125_bridge_rx_alloc_jumbo`. The pool's lifecycle is ndo_open
-// (allocate per slot) → ndo_stop (free per slot); see
-// `src/netdev_bridge_rx_pool.c` for the discipline.
+// A `page_pool` owns every RX buffer. Each `RxSlot` holds one page's CPU
+// base + device-visible DMA address pulled from the pool. The pool's
+// lifecycle is ndo_open (create + allocate per slot) → ndo_stop (free per
+// slot + destroy); see `src/netdev_bridge_rx_pool.c` for the discipline.
 
-/// Allocate one jumbo-sized RX slot. Returns `(cpu, dma)` on success.
+/// Create the RX page_pool sized for the netdev's current MTU. Returns
+/// the device-writable bytes per buffer (drives the descriptor LEN field
+/// and the chip's RxMaxSize register).
 ///
 /// # SAFETY contract
 ///
-/// `pdev` is alive (ARef holds the refcount). The cshim's
-/// `r8125_bridge_rx_alloc_jumbo` allocates one 16 KiB page chunk + DMA
-/// maps it `FROM_DEVICE`; on failure no resource is leaked. The caller
-/// MUST eventually balance every successful alloc with `rx_free_jumbo`.
-pub(crate) fn rx_alloc_jumbo(
-    pdev: &kernel::sync::aref::ARef<pci::Device>,
+/// `ndev` is the registered net_device; called once per ndo_open with no
+/// pool currently live (the cshim WARNs on a double-create). Must be
+/// balanced by `rx_pool_destroy` after all slots are freed.
+pub(crate) fn rx_pool_create(ndev: *mut bindings::net_device, ring_len: usize) -> Result<u32> {
+    let mut buf_len: u32 = 0;
+    // SAFETY: see fn-level contract; out-pointer is a stack local.
+    let rc = unsafe {
+        r8125_bridge_rx_pool_create(ndev, ring_len as c_uint, core::ptr::from_mut(&mut buf_len))
+    };
+    to_result(rc)?;
+    Ok(buf_len)
+}
+
+/// Destroy the RX page_pool. Idempotent against a NULL pool (ndo_open
+/// rollback before create). Every slot MUST already be freed via
+/// `rx_free` — page_pool_destroy requires all pages returned first.
+pub(crate) fn rx_pool_destroy(ndev: *mut bindings::net_device) {
+    // SAFETY: `ndev` is the registered net_device; the cshim no-ops on a
+    // NULL pool.
+    unsafe { r8125_bridge_rx_pool_destroy(ndev) };
+}
+
+/// Pull one buffer from the pool for a slot. Returns `(cpu, dma)`.
+///
+/// # SAFETY contract
+///
+/// The pool was created by `rx_pool_create` and is live. Each successful
+/// alloc must eventually be balanced by `rx_free` (teardown) or handed to
+/// the stack via the recycle path in `bridge_rx_one_packet`.
+pub(crate) fn rx_alloc(
+    ndev: *mut bindings::net_device,
 ) -> Result<(*mut c_void, bindings::dma_addr_t)> {
-    let dev = bridge_dma_device(pdev);
     let mut cpu: *mut c_void = core::ptr::null_mut();
     let mut dma: bindings::dma_addr_t = 0;
-    // SAFETY: see fn-level contract; out-pointers are stack locals,
-    // valid for the duration of the call.
+    // SAFETY: see fn-level contract; out-pointers are stack locals.
     let rc = unsafe {
-        r8125_bridge_rx_alloc_jumbo(
-            dev,
+        r8125_bridge_rx_alloc(
+            ndev,
             core::ptr::from_mut(&mut cpu),
             core::ptr::from_mut(&mut dma),
         )
@@ -415,29 +454,24 @@ pub(crate) fn rx_alloc_jumbo(
     Ok((cpu, dma))
 }
 
-/// Release one slot acquired via `rx_alloc_jumbo`. Idempotent against
-/// a null `cpu` pointer (the cshim short-circuits) so the rollback
-/// path in `ndo_open` can call this on partially-acquired state.
-pub(crate) fn rx_free_jumbo(
-    pdev: &kernel::sync::aref::ARef<pci::Device>,
-    cpu: *mut c_void,
-    dma: bindings::dma_addr_t,
-) {
-    let dev = bridge_dma_device(pdev);
-    // SAFETY: `cpu`/`dma` are either both null (no-op) or the values
-    // returned from a prior `rx_alloc_jumbo` on the same `pdev`.
-    unsafe { r8125_bridge_rx_free_jumbo(dev, cpu, dma) };
+/// Return one slot's page to the pool. Idempotent against a null `cpu`
+/// (the empty-slot sentinel) so the ndo_open rollback path can call it on
+/// partially-allocated state.
+pub(crate) fn rx_free(ndev: *mut bindings::net_device, cpu: *mut c_void) {
+    // SAFETY: `cpu` is either null (no-op) or a page base from a prior
+    // `rx_alloc` on the same pool.
+    unsafe { r8125_bridge_rx_free(ndev, cpu) };
 }
 
-/// RX super-call: sync_for_cpu + skb build + csum set + napi_gro_receive +
-/// sync_for_device, all inside one cshim function. Saves 4 FFI crossings
-/// per RX packet vs the previous Rust-side chain. See
-/// `docs/RX_OPTIMIZATION_CANDIDATES.md` §B.
+/// RX super-call: zero-copy `napi_build_skb` + page-pool recycle +
+/// alloc-before-consume refill, all inside one cshim function. Returns the
+/// slot's refilled `(cpu, dma)`; on a refill-failure drop they equal the
+/// inputs. See `docs/RX_OPTIMIZATION_CANDIDATES.md` §B and the per-MTU
+/// rationale in `src/netdev_bridge_rx_pool.c`.
 ///
 /// # SAFETY: `ndev` is the registered net_device (lifetime via
-/// `NetdevHandle`); `dma` came from a prior `rx_alloc_jumbo`; `buf`
-/// is the slot's CPU-side virtual address from the same allocation;
-/// `len` ≤ chip-reported frame length, ≤ `JUMBO_16K_BYTES`.
+/// `NetdevHandle`); `dma`/`buf` came from a prior `rx_alloc` on the live
+/// pool; `len` ≤ chip-reported frame length, ≤ the pool's `max_len`.
 /// Callable only from NAPI poll context.
 pub(crate) fn bridge_rx_one_packet(
     ndev: *mut bindings::net_device,
@@ -445,9 +479,44 @@ pub(crate) fn bridge_rx_one_packet(
     buf: *const core::ffi::c_void,
     len: usize,
     desc_opts1: u32,
-) {
+) -> (*mut c_void, bindings::dma_addr_t) {
+    let mut new_cpu = buf.cast_mut();
+    let mut new_dma: bindings::dma_addr_t = dma;
+    // SAFETY: see fn-level contract; out-pointers are stack locals.
+    unsafe {
+        r8125_bridge_rx_one_packet(
+            ndev,
+            dma,
+            buf,
+            len,
+            desc_opts1,
+            core::ptr::from_mut(&mut new_cpu),
+            core::ptr::from_mut(&mut new_dma),
+        )
+    };
+    (new_cpu, new_dma)
+}
+
+/// `netif_running(ndev)` — is the interface administratively up? Used by
+/// `ndo_change_mtu` to decide whether a live RX-pool resize is needed.
+///
+/// # SAFETY: `ndev` is the registered net_device.
+pub(crate) fn netif_running(ndev: *mut bindings::net_device) -> bool {
     // SAFETY: see fn-level contract.
-    unsafe { r8125_bridge_rx_one_packet(ndev, dma, buf, len, desc_opts1) };
+    unsafe { r8125_bridge_netif_running(ndev) }
+}
+
+/// Re-open the device at `new_mtu` (live MTU change), bracketing the Rust
+/// stop/open with the C-side napi_disable/enable discipline so the RX
+/// page_pool is never destroyed while its NAPI is active. Returns the
+/// kernel errno (0 on success, negative on a failed re-open).
+///
+/// # SAFETY: `ndev` is the registered net_device, the interface is up
+/// (caller checked `netif_running`), and `new_mtu` was range-checked by the
+/// net core. Runs with RTNL held (ndo_change_mtu context).
+pub(crate) fn reopen_for_mtu(ndev: *mut bindings::net_device, new_mtu: c_int) -> c_int {
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_reopen_for_mtu(ndev, new_mtu) }
 }
 
 // ── NetdevState pointer-juggling helpers (keep unsafe in this file) ──────

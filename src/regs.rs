@@ -329,9 +329,12 @@ pub(crate) const RX_MAX_SIZE_JUMBO: u16 = 0x3FFF;
 #[allow(dead_code)]
 pub(crate) const JUMBO_9K_BYTES: usize = 9000;
 /// Chip-side jumbo maximum (the hardware accepts up to `R8169_RX_BUF_SIZE
-/// = 16383` per `r8169_main.c`). Each RX slot's streaming-DMA page chunk
-/// must be at least this size; we round up to the nearest order-2 page
-/// allocation (16 KiB = 4 × 4 KiB pages on x86, `__GFP_ORDER(2)`).
+/// = 16383` per `r8169_main.c`). Documents the upper bound the per-MTU
+/// page_pool geometry rounds up to for a 9000-MTU open (order-2, 16 KiB).
+/// Kept as the documented chip ceiling and referenced by the static gate
+/// `ci/check_jumbo_mtu_chip.sh`; the RX buffer size itself is now computed
+/// per-MTU in `netdev_bridge_rx_pool.c`, so nothing in Rust consumes it.
+#[allow(dead_code)]
 pub(crate) const JUMBO_16K_BYTES: usize = 16384;
 
 // ── Descriptor opts1 bits (TX + RX share this layout) ───────────────────

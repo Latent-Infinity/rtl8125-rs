@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# RX skb-build hot-path contract.
+# RX zero-copy hot-path contract (M6 #2 v3).
 #
 # `r8125_bridge_rx_one_packet` runs once per received packet from NAPI poll.
-# It must perform streaming-DMA syncs, use the NAPI-local skb allocator, and
-# use kernel skb helpers rather than open-coding sk_buff internals.
+# Since the page_pool rewrite it must hand the received page to the stack
+# WITHOUT copying (napi_build_skb + skb_mark_for_recycle), refill the slot
+# alloc-before-consume from the pool, and keep the streaming-DMA CPU sync
+# before it touches the frame. It must NOT regress to the old copy path
+# (napi_alloc_skb + skb_copy_to_linear_data).
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -29,66 +32,70 @@ if [[ -z "$body" ]]; then
 	exit "$rc"
 fi
 
+# 1. Zero-copy delivery: napi_build_skb + recycle, NOT a linear copy.
+if grep -q 'napi_build_skb(' <<<"$body"; then
+	grn "RX super-call hands the page to the stack via napi_build_skb (zero copy)"
+else
+	red "RX super-call must use napi_build_skb for zero-copy delivery"
+fi
+if grep -q 'skb_mark_for_recycle(skb)' <<<"$body"; then
+	grn "RX super-call marks the skb for page_pool recycle"
+else
+	red "RX super-call must skb_mark_for_recycle(skb) so the page returns to the pool"
+fi
+if grep -qE 'skb_copy_to_linear_data|__skb_put_data|napi_alloc_skb' <<<"$body"; then
+	red "RX super-call regressed to the copy path (napi_alloc_skb / skb_copy_to_linear_data)"
+else
+	grn "RX super-call avoids the per-packet copy"
+fi
+
+# 2. Alloc-before-consume refill: a fresh page is pulled from the pool, and
+#    a refill failure drops the frame (never starves the ring).
+if grep -q 'page_pool_dev_alloc_pages(b->page_pool)' <<<"$body"; then
+	grn "RX super-call refills the slot from the page_pool"
+else
+	red "RX super-call must refill the slot via page_pool_dev_alloc_pages"
+fi
+
+# 3. Streaming-DMA CPU sync before the CPU reads the frame.
 if grep -q 'dma_sync_single_for_cpu(d, dma, len, DMA_FROM_DEVICE)' <<<"$body" \
-   && grep -qE 'dma_sync_single_for_device\(d, dma, (len|R8125_RX_JUMBO_BUF_SIZE)' <<<"$body"; then
-	grn "RX super-call keeps streaming-DMA CPU/device ownership syncs"
+   || grep -q 'page_pool_dma_sync_for_cpu(' <<<"$body"; then
+	grn "RX super-call syncs for CPU before reading the frame"
 else
-	red "RX super-call must sync for CPU before copy and for device before return"
+	red "RX super-call must dma_sync_single_for_cpu before touching the frame"
 fi
 
-if grep -q 'napi_alloc_skb(&b->napi' <<<"$body"; then
-	grn "RX super-call uses NAPI-local allocator"
-else
-	red "RX super-call must use napi_alloc_skb(&b->napi, ...)"
-fi
-
-if grep -q 'prefetch(buf)' <<<"$body"; then
-	grn "RX super-call prefetches the freshly-DMAed buffer"
-else
-	red "RX super-call should prefetch(buf) before the linear copy"
-fi
-
-if grep -q '__skb_put_data(skb, buf, len)' <<<"$body" \
-	|| grep -q 'skb_copy_to_linear_data(skb, buf, len)' <<<"$body"; then
-	grn "RX super-call uses kernel helper for linear copy and tail update"
-else
-	red "RX super-call must use __skb_put_data or skb_copy_to_linear_data + __skb_put"
-fi
-
-if grep -q 'netdev_alloc_skb' <<<"$body"; then
-	red "RX super-call regressed to netdev_alloc_skb"
-else
-	grn "RX super-call avoids netdev_alloc_skb slow path"
-fi
-
+# 4. No direct sk_buff internals mutation.
 if grep -qE 'skb->(tail|len)[[:space:]]*[+]?=' <<<"$body"; then
 	red "RX super-call mutates skb tail/len directly"
 else
 	grn "RX super-call avoids direct skb tail/len mutation"
 fi
 
-cpu_line=$(grep -n 'dma_sync_single_for_cpu' <<<"$body" | head -n1 | cut -d: -f1)
-alloc_line=$(grep -n 'napi_alloc_skb(&b->napi' <<<"$body" | head -n1 | cut -d: -f1)
-copy_line=$( (grep -n '__skb_put_data(skb, buf, len)' <<<"$body" | head -n1; \
-              grep -n 'skb_copy_to_linear_data(skb, buf, len)' <<<"$body" | head -n1) \
-            | head -n1 | cut -d: -f1 )
+# 5. Hot-path order: refill-alloc -> sync_for_cpu -> build_skb ->
+#    mark_for_recycle -> csum -> GRO.
+alloc_line=$(grep -n 'page_pool_dev_alloc_pages(b->page_pool)' <<<"$body" | head -n1 | cut -d: -f1)
+cpu_line=$(grep -nE 'dma_sync_single_for_cpu|page_pool_dma_sync_for_cpu' <<<"$body" | head -n1 | cut -d: -f1)
+build_line=$(grep -n 'napi_build_skb(' <<<"$body" | head -n1 | cut -d: -f1)
+recycle_line=$(grep -n 'skb_mark_for_recycle(skb)' <<<"$body" | head -n1 | cut -d: -f1)
 csum_line=$(grep -n 'r8125_bridge_skb_rx_csum_set' <<<"$body" | head -n1 | cut -d: -f1)
 gro_line=$(grep -n 'napi_gro_receive(&b->napi, skb)' <<<"$body" | head -n1 | cut -d: -f1)
-device_line=$(grep -n 'dma_sync_single_for_device' <<<"$body" | tail -n1 | cut -d: -f1)
-if [[ -n "$cpu_line" && -n "$alloc_line" && -n "$copy_line" && -n "$csum_line" && -n "$gro_line" && -n "$device_line" ]] \
-   && (( cpu_line < alloc_line && alloc_line < copy_line && copy_line < csum_line && csum_line < gro_line && gro_line < device_line )); then
-	grn "RX super-call preserves sync/build/csum/GRO/device-sync order"
+if [[ -n "$alloc_line" && -n "$cpu_line" && -n "$build_line" && -n "$recycle_line" && -n "$csum_line" && -n "$gro_line" ]] \
+   && (( alloc_line < cpu_line && cpu_line < build_line && build_line < recycle_line && recycle_line < csum_line && csum_line < gro_line )); then
+	grn "RX super-call preserves refill/sync/build/recycle/csum/GRO order"
 else
-	red "RX super-call order must be sync_for_cpu -> alloc/copy -> csum -> GRO -> sync_for_device"
+	red "RX super-call order must be alloc-refill -> sync_for_cpu -> build_skb -> mark_for_recycle -> csum -> GRO"
 fi
 
+# 6. Allocation failure is accounted before returning.
 if grep -q 'rx_dropped_error' <<<"$body" \
    && grep -q 'return;' <<<"$body"; then
-	grn "RX super-call accounts allocation failure before returning"
+	grn "RX super-call accounts refill failure before returning"
 else
-	red "RX super-call must account skb allocation failure before returning"
+	red "RX super-call must account refill/skb failure before returning"
 fi
 
+# ── NAPI poll side ────────────────────────────────────────────────────────
 process_rx_body=$(
 	awk '
 		/^fn process_rx_completions\(/ { in_fn=1 }
@@ -111,6 +118,20 @@ if grep -q 'ub::bridge_rx_one_packet(' <<<"$process_rx_body"; then
 	grn "NAPI RX poll calls bridge_rx_one_packet super-call"
 else
 	red "NAPI RX poll must call ub::bridge_rx_one_packet - see RX_OPTIMIZATION_CANDIDATES.md §B"
+fi
+
+# The poll must install the refilled buffer the super-call returns, or the
+# next wrap reads a page now owned by the stack (use-after-handoff).
+if echo "$process_rx_body" | awk '
+	/set_rx_slot\(.*RxSlot/ { found = 1; exit }
+	/set_rx_slot\(/ { in_call = 1 }
+	in_call && /RxSlot/ { found = 1; exit }
+	in_call && /^\s*\)/ { in_call = 0 }
+	END { exit (found ? 0 : 1) }
+'; then
+	grn "NAPI RX poll installs the refilled buffer into the slot shadow"
+else
+	red "NAPI RX poll must set_rx_slot() with the refilled (cpu, dma) from the super-call"
 fi
 
 exit "$rc"

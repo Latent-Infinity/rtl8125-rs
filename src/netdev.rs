@@ -119,18 +119,10 @@ fn stop_tx_queue_with_recheck(state: &NetdevState, head: usize) {
     }
 }
 
-/// RX buffer size — one chip-side jumbo-capable RX slot. Sized at the
-/// chip's `R8169_RX_BUF_SIZE` equivalent (`JUMBO_16K_BYTES = 16384`)
-/// regardless of advertised MTU, so the chip's `RxMaxSize` threshold
-/// can sit at `RX_MAX_SIZE_JUMBO` and every slot has room for the
-/// largest frame the chip will ever DMA. Lower-MTU traffic just leaves
-/// the tail of the buffer untouched.
-///
-/// Each slot is one `order-2` page chunk (16 KiB on x86) from
-/// `r8125_bridge_rx_alloc_jumbo` (`src/netdev_bridge_rx_pool.c`),
-/// streaming-DMA-mapped. Compile-time sanity matches the cshim's
-/// `R8125_RX_JUMBO_BUF_SIZE`.
-pub(crate) const RX_BUF_LEN: usize = crate::regs::JUMBO_16K_BYTES;
+// RX buffer geometry is no longer a fixed compile-time size. With per-MTU
+// zero-copy buffers (M6 #2 v3) the page_pool sizes each buffer from
+// dev->mtu at ndo_open and returns the device-writable length, cached in
+// `RxRingState::buf_len`. See `src/netdev_bridge_rx_pool.c`.
 
 /// Per-slot streaming-DMA RX buffer view. One pair per ring descriptor:
 /// the chip's RX completion deposits bytes via DMA into `dma`; the NAPI
@@ -140,7 +132,7 @@ pub(crate) const RX_BUF_LEN: usize = crate::regs::JUMBO_16K_BYTES;
 /// pool through `&NetdevState` without unsafe interior mutability.
 ///
 /// `cpu` is the kernel-virtual `page_address(...)` from
-/// `r8125_bridge_rx_alloc_jumbo` — guaranteed-lowmem on x86_64 because
+/// `r8125_bridge_rx_alloc` — guaranteed-lowmem on x86_64 because
 /// the kernel-Rust DMA layer never hands us highmem pages. `dma` is the
 /// matching `dma_map_page(...)` handle. The empty sentinel (`cpu = null,
 /// dma = 0`) is the ring's initial state and the post-stop "freed"
@@ -271,12 +263,12 @@ pub(crate) struct RxRingState {
     pub(crate) desc: *mut Descriptor,
     pub(crate) dma: u64,
 
-    /// Per-slot streaming-DMA RX buffers (M6 #2 jumbo refactor). Each
-    /// slot holds one `order-2` page chunk (16 KiB on x86) mapped
-    /// `FROM_DEVICE` for the lifetime of the open: `ndo_open` populates
-    /// every slot via `ub::rx_alloc_jumbo`, `ndo_stop` frees the lot
-    /// via `ub::rx_free_jumbo`. The `cpu`/`dma` pair is stored as two
-    /// per-slot atomics — both fields are written together (by
+    /// Per-slot streaming-DMA RX buffers (M6 #2 v3). Geometry comes from
+    /// `RxRingState::buf_len` at `ndo_open`, so each MTU class gets the
+    /// smallest page geometry that safely holds a full frame for that MTU.
+    /// `ndo_open` populates every slot via `ub::rx_alloc`, and `ndo_stop`
+    /// frees the lot via `ub::rx_free`. The `cpu`/`dma` pair is stored as
+    /// two per-slot atomics — both fields are written together (by
     /// `NetdevState::set_rx_slot`) and read together (by
     /// `NetdevState::rx_slot`); see [`RxSlot`]. `(null, 0)` is the
     /// empty sentinel.
@@ -287,6 +279,13 @@ pub(crate) struct RxRingState {
     /// cross-context false sharing is possible.
     pub(crate) slot_cpu: [AtomicPtr<core::ffi::c_void>; RING_LEN],
     pub(crate) slot_dma: [AtomicU64; RING_LEN],
+
+    /// Device-writable bytes per RX buffer for the current open, set by
+    /// `r8125_bridge_rx_pool_create` from the MTU-derived geometry (M6 #2
+    /// v3 per-MTU sizing). Drives the descriptor LEN field (chip's view of
+    /// "how many bytes it may DMA") and the frame-length clamp in the NAPI
+    /// RX loop. Zero while the device is down. Already ≤ `DESC_LEN_MASK`.
+    pub(crate) buf_len: CachePadded<AtomicU32>,
 
     /// RX consumer index (advanced by the NAPI RX path). Cache-padded so
     /// the RX hot loop's index doesn't ping-pong with TX indices.
@@ -307,6 +306,7 @@ impl RxRingState {
             slot_dma <- pin_init::init_array_from_fn(
                 |_| AtomicU64::new(0)
             ),
+            buf_len: CachePadded::new(AtomicU32::new(0)),
             tail: CachePadded::new(AtomicUsize::new(0)),
         }? kernel::error::Error)
     }
@@ -326,6 +326,13 @@ pub(crate) struct IrqState {
     // NOT-PADDED: set-once at probe, then read-only from every other
     // context — no concurrent writer means no false-sharing pressure.
     pub(crate) mode: AtomicU8,
+    /// Whether the IRQ handler is currently registered (`request_irq` done,
+    /// `free_irq` not yet). Single source of truth so the IRQ is freed
+    /// exactly once across the `ndo_open` rollback guard, `ndo_stop`, and any
+    /// teardown double-close — without it, an unbind-while-up could `free_irq`
+    /// an IRQ that is no longer (or was never) registered, tripping the
+    /// kernel's "trying to free already-free IRQ" WARN at `manage.c`.
+    pub(crate) requested: CachePadded<AtomicBool>,
 }
 
 impl IrqState {
@@ -333,6 +340,7 @@ impl IrqState {
         kernel::try_init!(Self {
             num,
             mode: AtomicU8::new(mode as u8),
+            requested: CachePadded::new(AtomicBool::new(false)),
         }? kernel::error::Error)
     }
 }
@@ -479,12 +487,29 @@ extern "C" fn rust_poll(cookie: *mut c_void, budget: c_int) -> c_int {
     crate::napi::poll(state, budget)
 }
 
-extern "C" fn rust_change_mtu(_cookie: *mut c_void, _new_mtu: c_int) -> c_int {
+extern "C" fn rust_change_mtu(cookie: *mut c_void, new_mtu: c_int) -> c_int {
     // Range-check is done by the kernel against ndev->{min,max}_mtu (cshim
-    // populates those at alloc). The M6 #2 jumbo refactor sizes every
-    // RX slot at `JUMBO_16K_BYTES` so any MTU in `[min_mtu, max_mtu]`
-    // fits without a per-MTU re-alloc.
-    0
+    // populates those at alloc). With per-MTU zero-copy RX buffers (M6 #2
+    // v3) the live RX pool is sized for the CURRENT MTU, so a change while
+    // up must re-create it:
+    //   - down: accept; the net core writes dev->mtu after we return 0 and
+    //     the next ndo_open sizes the pool to it.
+    //   - up:   stop → publish the new MTU (the core only writes dev->mtu
+    //     on success, so we set it ourselves) → re-open at the new size.
+    //     If reopen fails, C shim rolls back mtu to the previous value
+    //     before returning the error.
+    // change_mtu runs with RTNL held (same as open/stop), so the teardown
+    // and rebuild are serialized against other ndo callbacks. The reopen
+    // bracket (netif_tx_disable + napi_disable → ops.stop → set mtu →
+    // napi_enable → ops.open) lives in the cshim so the napi lifecycle
+    // matches ndo_open/stop and the RX page_pool is never destroyed while
+    // its NAPI is still active.
+    let state = state_from(cookie);
+    let ndev = state.ndev.load(Ordering::Acquire);
+    if !ub::netif_running(ndev) {
+        return 0;
+    }
+    ub::reopen_for_mtu(ndev, new_mtu)
 }
 
 pub(crate) const M4_FULL_OPS: BridgeOps = BridgeOps {
@@ -534,15 +559,21 @@ pub(crate) const M4_SKELETON_OPS: BridgeOps = BridgeOps {
 /// block above for why this flip is now safe.
 pub(crate) const ACTIVE_OPS: BridgeOps = M4_FULL_OPS;
 
-/// Release all RX jumbo slots and leave the pool in the empty-sentinel
+/// Release all RX slots and leave the pool in the empty-sentinel
 /// state. Used by `ndo_stop` and by every `ndo_open` rollback path after
 /// the M6 #2 RX-pool allocation point.
 fn free_rx_slots(state: &NetdevState) {
+    let ndev = state.ndev.load(Ordering::Acquire);
     for i in 0..RING_LEN {
         let slot = state.rx_slot(i);
         state.set_rx_slot(i, RxSlot::EMPTY);
-        ub::rx_free_jumbo(&state.pdev, slot.cpu, slot.dma);
+        ub::rx_free(ndev, slot.cpu);
     }
+    // page_pool_destroy requires every page returned first — only safe
+    // after the slot loop above. Idempotent against a NULL pool, so the
+    // ndo_open rollback path (failed mid-alloc, or before create) is fine.
+    state.rx.buf_len.inner.store(0, Ordering::Release);
+    ub::rx_pool_destroy(ndev);
 }
 
 // ── ndo_open phase helpers (task #60, 2026-05-29) ─────────────────────────
@@ -567,14 +598,21 @@ fn program_dma_rings(state: &NetdevState, regs: &Regs<'_>) {
     regs.set_cpluscmd(regs::CPLUSCMD_RX_CHKSUM);
 }
 
-/// Allocate one jumbo-sized streaming-DMA page chunk per RX slot (M6 #2).
+/// Allocate one streaming-DMA page chunk per RX slot (M6 #2).
 /// On any per-slot failure unwinds every successful allocation before
 /// returning so the next `ndo_open` retry sees a fresh state. Pre-posting
 /// the descriptor only happens AFTER alloc succeeds so the chip never
 /// sees a half-initialised slot.
 fn allocate_rx_pool(state: &NetdevState) -> Result<()> {
+    let ndev = state.ndev.load(Ordering::Acquire);
+    // Create the page_pool sized for the current MTU first; it returns the
+    // per-buffer device-writable length that drives the descriptor LEN and
+    // the chip RxMaxSize register. On any failure below, `free_rx_slots`
+    // frees whatever was allocated and destroys the pool (both idempotent).
+    let buf_len = ub::rx_pool_create(ndev, RING_LEN)?;
+    state.rx.buf_len.inner.store(buf_len, Ordering::Release);
     for i in 0..RING_LEN {
-        match ub::rx_alloc_jumbo(&state.pdev) {
+        match ub::rx_alloc(ndev) {
             Ok((cpu, dma)) => state.set_rx_slot(i, RxSlot { cpu, dma }),
             Err(e) => {
                 free_rx_slots(state);
@@ -587,15 +625,16 @@ fn allocate_rx_pool(state: &NetdevState) -> Result<()> {
 
 /// Pre-post every RX descriptor with its slot's DMA address + OWN bit.
 /// The last (hardware-visible) slot also gets the EOR marker so the
-/// chip wraps RxHead back to index 0. The descriptor LEN field is
-/// 14 bits (`DESC_LEN_MASK = 0x3FFF`), so the chip-encodable max is
-/// 16383 — we clamp here. The cshim's page chunk is 16384 bytes; the
-/// extra byte is invisible to hardware and exists only so the alloc
-/// lines up with `order = 2` page boundaries.
+/// chip wraps RxHead back to index 0. The descriptor LEN field tells the
+/// chip how many bytes it may DMA into the buffer — with per-MTU sizing
+/// (M6 #2 v3) that's the pool's device-writable `buf_len`, NOT the 16 KiB
+/// jumbo max, so a 4 KiB MTU-1500 buffer can never be overrun by a giant
+/// frame. `buf_len` is already ≤ `DESC_LEN_MASK` (the cshim caps it).
 fn pre_post_rx_descriptors(state: &NetdevState) {
+    let buf_len = state.rx.buf_len.inner.load(Ordering::Acquire) & regs::DESC_LEN_MASK;
     for i in 0..RING_LEN {
         let dma = state.rx_slot(i).dma;
-        let mut opts1 = regs::DESC_OWN | (RX_BUF_LEN as u32).min(regs::DESC_LEN_MASK);
+        let mut opts1 = regs::DESC_OWN | buf_len;
         if i == RING_LEN - 1 {
             opts1 |= regs::DESC_EOR;
         }
@@ -655,7 +694,23 @@ fn register_irq_handler(state: &NetdevState, cookie: *mut c_void) -> Result<()> 
         IrqMode::Intx => ub::IRQF_SHARED,
         IrqMode::Msi => 0,
     };
-    ub::request_irq(state.irq.num, raw_irq_handler, cookie, irq_flags)
+    ub::request_irq(state.irq.num, raw_irq_handler, cookie, irq_flags)?;
+    // Mark the IRQ registered so `free_irq_if_registered` releases it exactly
+    // once on the eventual teardown path (open rollback guard or ndo_stop).
+    state.irq.requested.inner.store(true, Ordering::Release);
+    Ok(())
+}
+
+/// Free the IRQ handler iff it is currently registered, atomically clearing
+/// the flag so repeated / interleaved teardown paths free it exactly once.
+/// `ndo_stop` and the `ndo_open` rollback guard both route through here;
+/// without it, `ndo_stop` could `free_irq` an IRQ with no registered action
+/// on an unbind-while-up / double-close and trip the kernel's
+/// "trying to free already-free IRQ" WARN.
+fn free_irq_if_registered(state: &NetdevState) {
+    if state.irq.requested.inner.swap(false, Ordering::AcqRel) {
+        ub::free_irq(state.irq.num, cookie_from_state(state));
+    }
 }
 
 /// r8169 RTL8125B (MAC_VER_63) baseline: disable interrupt coalescing
@@ -767,7 +822,7 @@ fn log_ndo_open_complete(state: &NetdevState, regs: &Regs<'_>) {
 // stop unconditionally" (call before returning).
 
 /// RAII guard for the per-slot RX page pool. `allocate(state)` runs the
-/// per-slot `rx_alloc_jumbo` loop and on any per-slot failure unwinds
+/// per-slot `rx_alloc` loop and on any per-slot failure unwinds
 /// every prior allocation before returning `Err`. The guard's `Drop`
 /// frees the pool unless `release()` was called — which signals success
 /// in `ndo_open` and hands ownership of the pool to the bound netdev
@@ -802,13 +857,13 @@ impl<'a> Drop for RxPoolGuard<'a> {
 }
 
 /// RAII guard for the registered IRQ handler. `register(state)` wraps
-/// `register_irq_handler` (mode-aware flags) + caches the cookie
-/// pointer used by `request_threaded_irq` so `Drop` can pass the same
-/// value to `free_irq`. Releasing transfers ownership to the bound
-/// netdev so `ndo_stop` is the eventual `free_irq` caller.
+/// `register_irq_handler` (mode-aware flags); on `ndo_open` failure its
+/// `Drop` rolls back via `free_irq_if_registered`. `release()` transfers
+/// ownership to the bound netdev so `ndo_stop` is the eventual freer. The
+/// `requested` flag in `IrqState` guarantees the underlying `free_irq`
+/// runs exactly once regardless of which path (guard or `ndo_stop`) hits.
 struct IrqGuard<'a> {
     state: &'a NetdevState,
-    cookie: *mut c_void,
     released: bool,
 }
 
@@ -818,7 +873,6 @@ impl<'a> IrqGuard<'a> {
         register_irq_handler(state, cookie)?;
         Ok(Self {
             state,
-            cookie,
             released: false,
         })
     }
@@ -831,7 +885,7 @@ impl<'a> IrqGuard<'a> {
 impl<'a> Drop for IrqGuard<'a> {
     fn drop(&mut self) {
         if !self.released {
-            ub::free_irq(self.state.irq.num, self.cookie);
+            free_irq_if_registered(self.state);
         }
     }
 }
@@ -872,6 +926,13 @@ fn ndo_open(state: &NetdevState) -> Result<()> {
         ub::bridge_phy_stop(ndev);
         return Err(e);
     }
+
+    // Override the jumbo-default RxMaxSize from hw_start with the per-MTU
+    // value (M6 #2 v3): the chip must not accept a frame larger than the
+    // pool's buffers hold. Set after hw_start, before the RX engine is
+    // enabled below. `buf_len` is the pool's device-writable length, ≤
+    // RX_MAX_SIZE_JUMBO (0x3FFF), so it fits the 16-bit register.
+    regs.set_rx_max_size(state.rx.buf_len.inner.load(Ordering::Acquire) as u16);
 
     enable_chip_engines(&regs);
     activate_v2_isr_for_msi(state, &regs);
@@ -932,8 +993,10 @@ fn ndo_stop(state: &NetdevState) {
     regs.ack_isr(0xFFFF_FFFF);
     regs.ack_isr_v2(0xFFFF_FFFF);
 
-    // Release the IRQ (kernel synchronises).
-    ub::free_irq(state.irq.num, cookie_from_state(state));
+    // Release the IRQ (kernel synchronises) — exactly once via the flag,
+    // so a close on an already-quiesced / never-fully-opened device can't
+    // double-free.
+    free_irq_if_registered(state);
 
     reap_inflight_tx_shadow(state);
 
@@ -945,7 +1008,7 @@ fn ndo_stop(state: &NetdevState) {
 
     // M6 #2 — release every RX slot's page chunk + DMA mapping. The
     // chip already had its descriptors zeroed above, so it can't DMA
-    // into a freed slot. `rx_free_jumbo` short-circuits on the empty
+    // into a freed slot. `rx_free` short-circuits on the empty
     // sentinel, which is what we leave behind for the next `ndo_open`.
     free_rx_slots(state);
 }
