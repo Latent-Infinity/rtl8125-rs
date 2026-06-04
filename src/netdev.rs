@@ -707,8 +707,13 @@ fn register_irq_handler(state: &NetdevState, cookie: *mut c_void) -> Result<()> 
 /// without it, `ndo_stop` could `free_irq` an IRQ with no registered action
 /// on an unbind-while-up / double-close and trip the kernel's
 /// "trying to free already-free IRQ" WARN.
+#[inline]
+fn release_irq_registration(state: &NetdevState) -> bool {
+    state.irq.requested.inner.swap(false, Ordering::AcqRel)
+}
+
 fn free_irq_if_registered(state: &NetdevState) {
-    if state.irq.requested.inner.swap(false, Ordering::AcqRel) {
+    if release_irq_registration(state) {
         ub::free_irq(state.irq.num, cookie_from_state(state));
     }
 }
@@ -990,13 +995,18 @@ fn ndo_stop(state: &NetdevState) {
     // `quiesce_chip` doc). Then W1C-ack any pending bits on BOTH ISR
     // windows so a follow-up `ndo_open` sees a clean slate.
     quiesce_chip(&regs);
+    regs.clear_imr_v2_mask(0xFFFF_FFFF);
     regs.ack_isr(0xFFFF_FFFF);
     regs.ack_isr_v2(0xFFFF_FFFF);
 
     // Release the IRQ (kernel synchronises) — exactly once via the flag,
     // so a close on an already-quiesced / never-fully-opened device can't
     // double-free.
-    free_irq_if_registered(state);
+    // Keep this explicit to prove `clear_imr_v2_mask` happens before free_irq
+    // for static-design tooling.
+    if release_irq_registration(state) {
+        ub::free_irq(state.irq.num, cookie_from_state(state));
+    }
 
     reap_inflight_tx_shadow(state);
 
