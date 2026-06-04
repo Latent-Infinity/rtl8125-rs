@@ -726,10 +726,14 @@ fn free_irq_if_registered(state: &NetdevState) {
 /// edge into the IO-APIC isn't lost.
 #[inline]
 fn setup_interrupt_config(regs: &Regs<'_>) {
-    regs.set_int_cfg0(0);
+    // Clear the V2-enable bit without clobbering any other INT_CFG0 fields.
+    // V2 enable itself is written later, once IRQ mode is known.
+    let cfg0 = regs.int_cfg0();
+    regs.set_int_cfg0(cfg0 & !regs::INT_CFG0_ENABLE_8125);
     regs.zero_coalesce_table_8125b();
     regs.set_int_cfg1(0);
     regs.ack_isr(0xFFFF_FFFF);
+    regs.ack_isr_v2(0xFFFF_FFFF);
 }
 
 /// M6 #1 Phase A.2 — chip-side activation of the per-message-id
@@ -742,7 +746,13 @@ fn setup_interrupt_config(regs: &Regs<'_>) {
 #[inline]
 fn activate_v2_isr_for_msi(state: &NetdevState, regs: &Regs<'_>) {
     if state.irq_mode() != IrqMode::Intx {
-        regs.set_int_cfg0(regs::INT_CFG0_ENABLE_8125);
+        let rb = regs.set_int_cfg0_v2_enable(true);
+        if rb & regs::INT_CFG0_ENABLE_8125 == 0 {
+            pr_warn!(
+                "r8125_rust: V2 ISR enable did not latch: INT_CFG0 rb=0x{:02x}\n",
+                rb
+            );
+        }
     }
 }
 
@@ -794,12 +804,21 @@ fn reap_inflight_tx_shadow(state: &NetdevState) {
 /// only — the actual bring-up correctness is decided by the linked
 /// state of the chip command register + the unmasked IMR / IMR_V2.
 fn log_ndo_open_complete(state: &NetdevState, regs: &Regs<'_>) {
+    let irq_mode = state.irq_mode();
+    let (isr, imr, isr_v2, imr_v2) = match irq_mode {
+        IrqMode::Intx => (regs.isr(), regs.imr_readback(), 0, 0),
+        IrqMode::Msi => (0, 0, regs.isr_v2(), regs.imr_v2_readback()),
+    };
     pr_info!(
-        "r8125_rust ndo_open complete: IRQ={} ChipCmd=0x{:02x} ISR=0x{:08x} IMR_rb=0x{:08x} PHYStatus=0x{:02x} tx_dma=0x{:016x} rx_dma=0x{:016x}\n",
+        "r8125_rust ndo_open complete: mode={:?} IRQ={} ChipCmd=0x{:02x} ISR=0x{:08x} IMR_rb=0x{:08x} ISR_v2=0x{:08x} IMR_V2_rb=0x{:08x} INT_CFG0=0x{:02x} PHYStatus=0x{:02x} tx_dma=0x{:016x} rx_dma=0x{:016x}\n",
+        irq_mode,
         state.irq.num,
         regs.chip_cmd(),
-        regs.isr(),
-        regs.imr_readback(),
+        isr,
+        imr,
+        isr_v2,
+        imr_v2,
+        regs.int_cfg0(),
         regs.phy_status(),
         state.tx.dma,
         state.rx.dma,
@@ -941,6 +960,15 @@ fn ndo_open(state: &NetdevState) -> Result<()> {
 
     enable_chip_engines(&regs);
     activate_v2_isr_for_msi(state, &regs);
+    if state.irq_mode() != IrqMode::Intx {
+        let coal_rb =
+            regs.set_coalesce_8125b(regs::RX_COALESCE_TIMER_8125B, regs::TX_COALESCE_TIMER_8125B);
+        pr_info!(
+            "r8125_rust: INT_MITI_V2 RX timer set to 0x{:04x}, immediate readback=0x{:04x}\n",
+            regs::RX_COALESCE_TIMER_8125B,
+            coal_rb
+        );
+    }
 
     // Unmask the chosen IRQ surface LAST — mirrors r8169 `rtl_irq_enable`.
     // `rearm_irq_baseline` picks legacy `IMR` or V2 `IMR_V2_SET` based

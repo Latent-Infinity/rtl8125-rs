@@ -59,7 +59,7 @@ else
 fi
 
 if awk '/if state\.irq_mode\(\) != IrqMode::Intx/,/^    }/' "$NETDEV" | \
-		grep -qE 'set_int_cfg0\(regs::INT_CFG0_ENABLE_8125\)'; then
+		grep -Eq 'set_int_cfg0\(regs::INT_CFG0_ENABLE_8125\)|set_int_cfg0_v2_enable\(true\)'; then
 	grn "INT_CFG0_ENABLE_8125 is gated off for INTx fallback"
 else
 	red "INT_CFG0_ENABLE_8125 is not guarded by IrqMode::Intx fallback"

@@ -122,11 +122,23 @@ pub(crate) const INT_CFG0_ENABLE_8125: u8 = 0x01;
 /// `INT_CFG1` (16-bit at 0x7A) — write 0x0000 to disable interrupt
 /// coalescing on MAC_VER_63 (RTL8125B) per r8169.
 pub(crate) const INT_CFG1: usize = 0x7A;
+/// 8125 INT_MITI_V2 per-vector interrupt-moderation table. Each MSI(-X)
+/// vector gets an 8-byte slot: a 16-bit RX timer at +0 and a 16-bit TX
+/// timer at +2. We drive only queue 0 (vector 0).
+pub(crate) const INT_MITI_V2_0_RX: usize = 0xA00;
+pub(crate) const INT_MITI_V2_0_TX: usize = 0xA02;
 /// Per-VER coalescing-table region: r8169 zeros 0xa00..0xa80 step 4 for
 /// VER_63 / VER_70, 0xa00..0xb00 step 4 for VER_61 / 64 / 66 / 80.
 /// We target VER_63 only.
 pub(crate) const COALESCE_TABLE_8125B_START: usize = 0xA00;
 pub(crate) const COALESCE_TABLE_8125B_END: usize = 0xA80;
+/// RX moderation timer for vector 0. Empirically tuned on the bare-metal
+/// gateway (docs/perf/cvr_20260604): 0x10 cuts the IRQ storm 7.5x with
+/// 0% loss in 64B RX tests.
+pub(crate) const RX_COALESCE_TIMER_8125B: u16 = 0x0010;
+/// TX moderation timer for vector 0 — 0 keeps TX completions prompt and
+/// avoids re-adding the BQL latency path we removed.
+pub(crate) const TX_COALESCE_TIMER_8125B: u16 = 0x0000;
 
 // ── Configuration-register lock (Cfg9346 at 0x50, 8-bit) ────────────────
 //

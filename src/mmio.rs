@@ -162,9 +162,7 @@ impl<'a> Regs<'a> {
         self.bar.write16(regs::TPPOLL_NPQ, regs::TPPOLL);
     }
 
-    /// Read `INT_CFG0_8125` (0x34, 8-bit). Phase A.2 will use this for
-    /// the read-modify-write that sets `INT_CFG0_ENABLE_8125`.
-    #[allow(dead_code)]
+    /// Read `INT_CFG0_8125` (0x34, 8-bit).
     pub(crate) fn int_cfg0(&self) -> u8 {
         self.bar.read8(regs::INT_CFG0)
     }
@@ -173,6 +171,24 @@ impl<'a> Regs<'a> {
     /// modes baseline.
     pub(crate) fn set_int_cfg0(&self, value: u8) {
         self.bar.write8(value, regs::INT_CFG0);
+    }
+
+    /// Set or clear only the `INT_CFG0_ENABLE_8125` bit (the V2 ISR/IMR
+    /// surface toggle), preserving every other `INT_CFG0` bit.
+    pub(crate) fn set_int_cfg0_v2_enable(&self, enable: bool) -> u8 {
+        let cur = self.int_cfg0();
+        let next = if enable {
+            cur | regs::INT_CFG0_ENABLE_8125
+        } else {
+            cur & !regs::INT_CFG0_ENABLE_8125
+        };
+        self.bar.write8(next, regs::INT_CFG0);
+        self.int_cfg0()
+    }
+
+    /// Read back `IMR_V2_SET` (0x0D0C) for open-time verification.
+    pub(crate) fn imr_v2_readback(&self) -> u32 {
+        self.bar.read32(regs::IMR_V2_SET)
     }
 
     /// Write `INT_CFG1_8125` (0x7A, 16-bit). 0x0000 disables coalescing.
@@ -355,5 +371,15 @@ impl<'a> Regs<'a> {
             self.bar.write32(0u32, off);
             off += 4;
         }
+    }
+
+    /// Program 8125 INT_MITI_V2 vector 0 moderation:
+    /// RX/TX timer values are written after first zeroing the full table.
+    /// Returns immediate RX timer readback for diagnostics.
+    pub(crate) fn set_coalesce_8125b(&self, rx_timer: u16, tx_timer: u16) -> u16 {
+        self.zero_coalesce_table_8125b();
+        self.bar.write16(rx_timer, regs::INT_MITI_V2_0_RX);
+        self.bar.write16(tx_timer, regs::INT_MITI_V2_0_TX);
+        self.bar.read16(regs::INT_MITI_V2_0_RX)
     }
 }
