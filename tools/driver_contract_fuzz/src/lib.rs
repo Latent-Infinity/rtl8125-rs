@@ -221,4 +221,68 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn tx_stop_and_wake_thresholds_use_strict_bounds() {
+        assert!(!queue_should_stop(TX_STOP_THRS));
+        assert!(queue_should_stop(TX_STOP_THRS - 1));
+        assert!(queue_should_stop(0));
+
+        assert!(!queue_should_wake(TX_START_THRS));
+        assert!(queue_should_wake(TX_START_THRS + 1));
+        assert!(queue_should_wake(RING_LEN));
+    }
+
+    #[test]
+    fn stop_wake_conditions_are_mutually_consistent_over_fuzz_walk() {
+        let mut rng = Lcg64::new(0xBADC0DE);
+        let mut head = 0usize;
+        let mut tail = 0usize;
+        let mut stopped = false;
+
+        for _ in 0..100_000 {
+            let in_flight = tx_in_flight(head, tail)
+                .expect("state machine starts valid and should remain valid");
+
+            // Emulate one or more TX completions at random, with an upper
+            // bound that always keeps the ring non-negative.
+            if in_flight > 0 && (rng.gen_range(1) == 0) {
+                let complete = (rng.gen_range(in_flight) % in_flight) + 1;
+                let free_before =
+                    tx_free_slots(head, tail).expect("free slots should stay valid before reap");
+                tail = tail.wrapping_add(complete);
+                let free_after = tx_free_slots(head, tail)
+                    .expect("free slots should stay valid after reap");
+                if queue_should_wake(free_after) {
+                    assert!(free_after > free_before);
+                    stopped = false;
+                }
+            }
+
+            // Emulate a packet post when possible.
+            if let Some(free_before) = tx_free_slots(head, tail) {
+                let n_desc = (rng.gen_range(8) + 1) as usize;
+                if can_reserve_slot_batch(head, tail, n_desc) {
+                    head = head.wrapping_add(n_desc);
+                    let free_after =
+                        tx_free_slots(head, tail).expect("free slots should stay valid after xmit");
+                    if queue_should_stop(free_after) {
+                        stopped = true;
+                        assert!(free_after < TX_STOP_THRS);
+                    }
+                    assert!(free_after <= free_before);
+                    assert!(free_after > 0);
+                }
+            }
+
+            // If stopped, the only permitted wake transition is crossing
+            // start-threshold back to a larger free window.
+            if stopped {
+                let free = tx_free_slots(head, tail).expect("free slots should stay valid");
+                if queue_should_wake(free) {
+                    stopped = false;
+                }
+            }
+        }
+    }
 }

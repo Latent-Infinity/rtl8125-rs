@@ -112,7 +112,13 @@ EOF
 sleep 3
 
 # Check dmesg for any anomaly.
-WARN_COUNT=$($SSH "sudo dmesg | grep -cE 'BUG|KASAN|UBSAN|Oops|RIP:|UAF|DMA-API.*WARN|kmemleak|slab-use-after-free' || true" 2>&1 | tail -1)
+if ! WARN_OUTPUT=$($SSH "sudo dmesg | grep -E 'BUG|KASAN|UBSAN|Oops|RIP:|UAF|DMA-API.*WARN|kmemleak|slab-use-after-free' || true" 2>&1); then
+	red "FAIL: unable to collect remote dmesg over SSH for $GUEST"
+	echo "$WARN_OUTPUT" | tee -a "$LOG"
+	exit 1
+fi
+
+WARN_COUNT=$(printf '%s\n' "$WARN_OUTPUT" | grep -cE 'BUG|KASAN|UBSAN|Oops|RIP:|UAF|DMA-API.*WARN|kmemleak|slab-use-after-free')
 echo "Post-fuzz dmesg warning count: $WARN_COUNT" | tee -a "$LOG"
 
 if [[ "$WARN_COUNT" -eq 0 ]]; then
@@ -120,6 +126,6 @@ if [[ "$WARN_COUNT" -eq 0 ]]; then
 	exit 0
 else
 	red "FAIL: $WARN_COUNT kernel-debug warnings after fuzz — review:"
-	$SSH "sudo dmesg | grep -E 'BUG|KASAN|UBSAN|Oops|RIP:|UAF|DMA-API.*WARN|kmemleak|slab-use-after-free' | head -10" | tee -a "$LOG"
+	echo "$WARN_OUTPUT" | head -n 20 | tee -a "$LOG"
 	exit 1
 fi

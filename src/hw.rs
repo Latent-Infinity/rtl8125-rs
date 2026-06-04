@@ -230,8 +230,9 @@ fn hw_start_8125b_unlocked(regs: &Regs<'_>) -> Result<()> {
 
     // M6 sub-feature #1 Phase A.2 — chip-side V2 activation has moved
     // to `ndo_open` (immediately after `set_chip_cmd(RX|TX)`), where it
-    // can read `state.irq_mode()` and only set `INT_CFG0_ENABLE_8125`
-    // when probe actually allocated an MSI/MSI-X vector. Empirically
+    // can read `state.irq_mode()` and `state.use_v2_irq_surface()` and
+    // only set `INT_CFG0_ENABLE_8125` when V2 is known-good.
+    // Empirically
     // (Controller-KVM 2026-05-28) flipping that bit while still on
     // legacy INTx silently breaks IRQ delivery — the chip stops
     // asserting the INTx pin once V2 mode is active and expects

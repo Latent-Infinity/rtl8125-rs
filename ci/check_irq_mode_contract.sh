@@ -66,8 +66,9 @@ else
 fi
 
 handler=$(awk '/fn raw_irq_handler/,/^}/' "$NETDEV")
-if echo "$handler" | grep -qE 'IrqMode::Intx[[:space:]]*=>[[:space:]]*regs\.isr\(\)' &&
-   echo "$handler" | grep -qE 'IrqMode::Msi[[:space:]]*=>[[:space:]]*regs\.isr_v2\(\)' &&
+if echo "$handler" | grep -qE 'let use_v2 = state\.irq_mode\(\) == IrqMode::Msi && state\.use_v2_irq_surface\(\)' &&
+   echo "$handler" | grep -qE 'let status = if use_v2' &&
+   echo "$handler" | grep -qE 'if use_v2 \{' &&
    echo "$handler" | grep -qE 'regs\.ack_isr\(status\)' &&
    echo "$handler" | grep -qE 'regs\.set_imr\(0\)' &&
    echo "$handler" | grep -qE 'regs\.ack_isr_v2\(status\)' &&
@@ -78,8 +79,10 @@ else
 fi
 
 rearm=$(awk '/fn rearm_irq_baseline/,/^}/' "$NAPI")
-if echo "$rearm" | grep -qE 'IrqMode::Intx[[:space:]]*=>.*set_imr\(regs::INTR_M4_BASELINE\)' &&
-   echo "$rearm" | grep -qE 'IrqMode::Msi[[:space:]]*=>.*set_imr_v2_mask\(regs::INTR_V2_M4_BASELINE\)'; then
+if echo "$rearm" | grep -qE 'match \(state\.irq_mode\(\), state\.use_v2_irq_surface\(\)\)' &&
+   echo "$rearm" | grep -qE 'IrqMode::Msi, true' &&
+   echo "$rearm" | grep -qE 'set_imr_v2_mask\(regs::INTR_V2_M4_BASELINE\)' &&
+   echo "$rearm" | grep -qE 'set_imr\(regs::INTR_M4_BASELINE\)'; then
 	grn "NAPI re-arm uses the IrqMode-selected interrupt mask"
 else
 	red "NAPI re-arm does not branch on IrqMode"

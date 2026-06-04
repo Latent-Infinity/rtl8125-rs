@@ -48,7 +48,9 @@ use crate::unsafe_boundary as ub;
 /// the probe-chosen [`IrqMode`]:
 ///
 ///   * `Intx` → write `INTR_M4_BASELINE` to legacy `IMR` (0x38).
-///   * `Msi`  → write `INTR_V2_M4_BASELINE` to `IMR_V2_SET` (0x0D0C);
+///   * `Msi` with V2 capability → write `INTR_V2_M4_BASELINE` to
+///     `IMR_V2_SET` (0x0D0C);
+///     without V2 capability, `Msi` falls back to legacy `IMR`.
 ///     bits in this register are unmask-set semantics, so the same write
 ///     re-arms after each NAPI cycle without first clearing.
 ///
@@ -57,9 +59,9 @@ use crate::unsafe_boundary as ub;
 /// choice — keeping the IMR/IMR_V2 selection in one place keeps the
 /// invariant from drifting as the V2 surface gets used elsewhere.
 pub(crate) fn rearm_irq_baseline(state: &NetdevState) {
-    match state.irq_mode() {
-        IrqMode::Intx => state.regs().set_imr(regs::INTR_M4_BASELINE),
-        IrqMode::Msi => state.regs().set_imr_v2_mask(regs::INTR_V2_M4_BASELINE),
+    match (state.irq_mode(), state.use_v2_irq_surface()) {
+        (IrqMode::Msi, true) => state.regs().set_imr_v2_mask(regs::INTR_V2_M4_BASELINE),
+        (IrqMode::Intx, _) | (IrqMode::Msi, false) => state.regs().set_imr(regs::INTR_M4_BASELINE),
     }
 }
 

@@ -163,6 +163,10 @@ impl RxSlot {
 /// PCIe message-based vs pin-asserted side is invisible to the V2 register
 /// surface — so we don't distinguish them. The `intx_only` module param
 /// short-circuits allocation to legacy INTx for regression testing.
+///
+/// V2 is still gated by the probe-time interrupt-surface capability:
+/// some MSI-only paths on virtualized hosts can require legacy ISR
+/// handling even though this mode enum still reports `Msi`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum IrqMode {
@@ -326,6 +330,10 @@ pub(crate) struct IrqState {
     // NOT-PADDED: set-once at probe, then read-only from every other
     // context — no concurrent writer means no false-sharing pressure.
     pub(crate) mode: AtomicU8,
+    /// Probe-time gate for using V2 ISR/IMR in open and IRQ paths:
+    /// `true` only when we know the message-ID surface is available.
+    // NOT-PADDED: written once at probe, read by all contexts.
+    pub(crate) use_v2: AtomicBool,
     /// Whether the IRQ handler is currently registered (`request_irq` done,
     /// `free_irq` not yet). Single source of truth so the IRQ is freed
     /// exactly once across the `ndo_open` rollback guard, `ndo_stop`, and any
@@ -336,10 +344,15 @@ pub(crate) struct IrqState {
 }
 
 impl IrqState {
-    pub(crate) fn new(num: u32, mode: IrqMode) -> impl pin_init::Init<Self, kernel::error::Error> {
+    pub(crate) fn new(
+        num: u32,
+        mode: IrqMode,
+        use_v2: bool,
+    ) -> impl pin_init::Init<Self, kernel::error::Error> {
         kernel::try_init!(Self {
             num,
             mode: AtomicU8::new(mode as u8),
+            use_v2: AtomicBool::new(use_v2),
             requested: CachePadded::new(AtomicBool::new(false)),
         }? kernel::error::Error)
     }
@@ -415,6 +428,11 @@ impl NetdevState {
     #[inline]
     pub(crate) fn irq_mode(&self) -> IrqMode {
         IrqMode::from_u8(self.irq.mode.load(Ordering::Relaxed))
+    }
+
+    #[inline]
+    pub(crate) fn use_v2_irq_surface(&self) -> bool {
+        self.irq.use_v2.load(Ordering::Relaxed)
     }
 
     /// Snapshot RX slot `i`'s (cpu, dma) pair. Both atomics are read
@@ -745,7 +763,7 @@ fn setup_interrupt_config(regs: &Regs<'_>) {
 /// targets the V2 surface.
 #[inline]
 fn activate_v2_isr_for_msi(state: &NetdevState, regs: &Regs<'_>) {
-    if state.irq_mode() != IrqMode::Intx {
+    if state.irq_mode() != IrqMode::Intx && state.use_v2_irq_surface() {
         let rb = regs.set_int_cfg0_v2_enable(true);
         if rb & regs::INT_CFG0_ENABLE_8125 == 0 {
             pr_warn!(
@@ -805,13 +823,16 @@ fn reap_inflight_tx_shadow(state: &NetdevState) {
 /// state of the chip command register + the unmasked IMR / IMR_V2.
 fn log_ndo_open_complete(state: &NetdevState, regs: &Regs<'_>) {
     let irq_mode = state.irq_mode();
-    let (isr, imr, isr_v2, imr_v2) = match irq_mode {
-        IrqMode::Intx => (regs.isr(), regs.imr_readback(), 0, 0),
-        IrqMode::Msi => (0, 0, regs.isr_v2(), regs.imr_v2_readback()),
+    let use_v2 = irq_mode == IrqMode::Msi && state.use_v2_irq_surface();
+    let (isr, imr, isr_v2, imr_v2) = match (irq_mode, use_v2) {
+        (IrqMode::Intx, _) => (regs.isr(), regs.imr_readback(), 0, 0),
+        (IrqMode::Msi, false) => (regs.isr(), regs.imr_readback(), 0, 0),
+        (IrqMode::Msi, true) => (0, 0, regs.isr_v2(), regs.imr_v2_readback()),
     };
     pr_info!(
-        "r8125_rust ndo_open complete: mode={:?} IRQ={} ChipCmd=0x{:02x} ISR=0x{:08x} IMR_rb=0x{:08x} ISR_v2=0x{:08x} IMR_V2_rb=0x{:08x} INT_CFG0=0x{:02x} PHYStatus=0x{:02x} tx_dma=0x{:016x} rx_dma=0x{:016x}\n",
+        "r8125_rust ndo_open complete: mode={:?} use_v2={} IRQ={} ChipCmd=0x{:02x} ISR=0x{:08x} IMR_rb=0x{:08x} ISR_v2=0x{:08x} IMR_V2_rb=0x{:08x} INT_CFG0=0x{:02x} PHYStatus=0x{:02x} tx_dma=0x{:016x} rx_dma=0x{:016x}\n",
         irq_mode,
+        use_v2,
         state.irq.num,
         regs.chip_cmd(),
         isr,
@@ -960,7 +981,7 @@ fn ndo_open(state: &NetdevState) -> Result<()> {
 
     enable_chip_engines(&regs);
     activate_v2_isr_for_msi(state, &regs);
-    if state.irq_mode() != IrqMode::Intx {
+    if state.use_v2_irq_surface() {
         let coal_rb =
             regs.set_coalesce_8125b(regs::RX_COALESCE_TIMER_8125B, regs::TX_COALESCE_TIMER_8125B);
         pr_info!(
@@ -1429,16 +1450,16 @@ fn ndo_start_xmit(state: &NetdevState, skb: crate::skb::DriverOwnedSkb) -> c_int
 extern "C" fn raw_irq_handler(_irq: c_int, dev_id: *mut c_void) -> bindings::irqreturn_t {
     let state = state_from(dev_id);
     let regs = state.regs();
+    let use_v2 = state.irq_mode() == IrqMode::Msi && state.use_v2_irq_surface();
     // M6 #1 Phase A.2 — branch on the probe-chosen delivery mode:
-    //   Intx → legacy ISR (0x3C) + IMR (0x38), W1C ack
-    //   Msi  → ISR_V2 (0x0D04) + IMR_V2 (0x0D00/0x0D0C), W1C ack
+    //   Intx or Msi without V2-capability → legacy ISR (0x3C) + IMR
+    //   (0x38), W1C ack
+    //   Msi with V2-capability → ISR_V2 (0x0D04) + IMR_V2
+    //   (0x0D00/0x0D0C), W1C ack
     // The two windows are mutually exclusive at the chip: once
     // `INT_CFG0_ENABLE_8125` is set, the legacy ISR stops latching
     // sources (and vice versa), so each branch reads exactly one.
-    let status = match state.irq_mode() {
-        IrqMode::Intx => regs.isr(),
-        IrqMode::Msi => regs.isr_v2(),
-    };
+    let status = if use_v2 { regs.isr_v2() } else { regs.isr() };
     if status == 0 || status == 0xFFFF_FFFF {
         // 0 = not ours (or stale read after free_irq); !0 = device gone.
         // For Intx we may legitimately see 0 on a shared line; for
@@ -1449,15 +1470,12 @@ extern "C" fn raw_irq_handler(_irq: c_int, dev_id: *mut c_void) -> bindings::irq
     // Ack everything we saw, mask further IRQs, hand off to NAPI.
     // NAPI's re-arm calls `rearm_irq_baseline` which selects the same
     // window after `napi_complete_done`, closing the loop.
-    match state.irq_mode() {
-        IrqMode::Intx => {
-            regs.ack_isr(status);
-            regs.set_imr(0);
-        }
-        IrqMode::Msi => {
-            regs.ack_isr_v2(status);
-            regs.clear_imr_v2_mask(0xFFFF_FFFF);
-        }
+    if use_v2 {
+        regs.ack_isr_v2(status);
+        regs.clear_imr_v2_mask(0xFFFF_FFFF);
+    } else {
+        regs.ack_isr(status);
+        regs.set_imr(0);
     }
     let ndev = state.ndev.load(Ordering::Acquire);
     ub::bridge_napi_schedule(ndev);

@@ -245,31 +245,36 @@ impl pci::Driver for R8125Driver {
                     // delivery — see hw.rs Phase A.1 comment).
                     let intx_only =
                         *crate::module_parameters::intx_only.value() != 0;
-                    let irq_mode = if intx_only {
+                    let (irq_mode, use_v2) = if intx_only {
                         unsafe_boundary::alloc_one_irq_vector(
                             pdev,
                             pci::IrqTypes::default()
                                 .with(pci::IrqType::Intx),
                         )?;
-                        IrqMode::Intx
+                        (IrqMode::Intx, false)
                     } else {
-                        // First try MSI-X / MSI exclusively so we can tell
-                        // the kernel "no INTx fallback" — that way, on
-                        // failure we know to take the legacy path.
-                        let msi_set = pci::IrqTypes::default()
-                            .with(pci::IrqType::MsiX)
-                            .with(pci::IrqType::Msi);
-                        match unsafe_boundary::alloc_one_irq_vector(
-                            pdev, msi_set,
-                        ) {
-                            Ok(()) => IrqMode::Msi,
-                            Err(_) => {
-                                unsafe_boundary::alloc_one_irq_vector(
-                                    pdev,
-                                    pci::IrqTypes::default()
-                                        .with(pci::IrqType::Intx),
-                                )?;
-                                IrqMode::Intx
+                        // Prefer MSI-X first so the V2 ISR surface can stay
+                        // enabled where supported. If only MSI is available,
+                        // keep Msi mode but disable V2 and fall back to
+                        // legacy ISR layout.
+                        let msix_only =
+                            pci::IrqTypes::default().with(pci::IrqType::MsiX);
+                        if unsafe_boundary::alloc_one_irq_vector(pdev, msix_only).is_ok() {
+                            (IrqMode::Msi, true)
+                        } else {
+                            match unsafe_boundary::alloc_one_irq_vector(
+                                pdev,
+                                pci::IrqTypes::default().with(pci::IrqType::Msi),
+                            ) {
+                                Ok(()) => (IrqMode::Msi, false),
+                                Err(_) => {
+                                    unsafe_boundary::alloc_one_irq_vector(
+                                        pdev,
+                                        pci::IrqTypes::default()
+                                            .with(pci::IrqType::Intx),
+                                    )?;
+                                    (IrqMode::Intx, false)
+                                }
                             }
                         }
                     };
@@ -277,9 +282,10 @@ impl pci::Driver for R8125Driver {
                         unsafe_boundary::pci_irq_vector(pdev, 0)?;
                     dev_info!(
                         pdev,
-                        "RTL8125 IRQ allocated: vector#0 = IRQ {} (mode={:?}{})\n",
+                        "RTL8125 IRQ allocated: vector#0 = IRQ {} (mode={:?}, use_v2={}){}\n",
                         irq_num,
                         irq_mode,
+                        use_v2,
                         if intx_only { ", forced by intx_only" } else { "" }
                     );
 
@@ -380,6 +386,7 @@ impl pci::Driver for R8125Driver {
                             irq <- crate::netdev::IrqState::new(
                                 irq_num,
                                 irq_mode,
+                                use_v2,
                             ),
                             phy <- crate::netdev::PhyState::new(),
                         }? kernel::error::Error),
