@@ -334,3 +334,18 @@ checksum and TSO helpers are now file-local C implementation details, and the
 dead `r8125_bridge_skb_nr_frags` symbol was removed. This reduces per-packet
 FFI crossings on the single-buffer TX path while preserving the rule that all
 skb mutations happen before DMA mapping.
+
+## 2026-06-06 — Phase A1 descriptor migration bump 59 → 69
+
+Phase A1 introduced format-aware RX/TX descriptor publication and type-safe
+V3/V4 parsing support:
+
+- Added `AsBytes`/`FromBytes` implementations for `RxDescriptor` /
+  `RxDescLegacy` / `RxDescV3` / `RxDescV4` in `src/unsafe_boundary.rs`.
+- Added `desc_read_rx` / `desc_write_rx` helpers for typed RX descriptor arrays.
+- Reworked `desc_publish_own` to be format-aware for ordered OWN handoff for
+  both 16-byte and 32-byte RX descriptor layouts and keep TX publication on the
+  same ordering contract.
+
+Net effect: +10 unsafe `impl` / helpers in `unsafe_boundary.rs`. This is the
+intended cost of Phase A1 and is bounded to the audited boundary.

@@ -1,7 +1,7 @@
 # RSS / RXHASH Implementation Plan
 
-**Status: planning only, 2026-06-06.** This plan is deliberately split into
-two tracks:
+**Status: execution plan in progress, 2026-06-06.** This plan is deliberately
+split into two tracks:
 
 - **RXHASH-only**: parse a hardware hash from an RSS-capable RX descriptor and
   call `skb_set_hash(...)` on the existing single RX queue. This can benefit
@@ -12,6 +12,29 @@ two tracks:
 Do not advertise `NETIF_F_RXHASH` or enable hardware RSS until the relevant
 track's gates below are satisfied.
 
+Current checkpoint:
+
+- `docs/perf/DRIVER_GAP_LEDGER.md` is the implementation ledger.
+- Track A is the low-risk first step and has no dependency on multi-queue bridge
+  changes.
+- Track B remains explicit follow-up only.
+
+Phase 0 status:
+
+- **Status: complete (implementation)**
+  - `scripts/phase0_rsshash_probe.sh` is added and wired for both C and Rust runs.
+  - Artifact contract for Phase 0 is finalized (features/traffic/queues/hash/IRQ CSVs + raw captures).
+  - Empirical verdict remains pending until a bench run is executed on RTL8125B and fed into this ledger.
+
+Decision register:
+
+- **D1**: Proceed Track A only after V3 hashability is proven at one queue without
+  multi-queue V2 interrupts.
+- **D2**: If V3 hashes require full V2-style RSS/queue enablement, promote
+  Track B as the implementation path and defer Track A advertising.
+- **D3**: Keep RSS off and report one queue until `B` phases materially improve a
+  measured Gateway user-visible gap.
+
 ## Reference Constraints
 
 The current Rust driver uses the legacy 16-byte RX descriptor shape
@@ -20,6 +43,14 @@ in RxDescV3/V4 fields (`RSSResult`, `HeaderInfo`, `RSSInfo`), not in that
 legacy descriptor. The vendor hash reporting path is
 `rtl8125_rx_hash_v3/v4` -> `skb_set_hash(...)`
 (`references/realtek-r8125-official/src/r8125_rss.c:498-532`).
+
+For the validated chip:
+
+- `MAC_VER_63` / `XID 0x641` is the target (`r8169_main.c:123`), and it maps to
+  V3 descriptor capability (`CFG_METHOD_4/5`; `r8125_n.c:7606-7610` shows XID
+  0x641 resolves to both METHOD_4 and METHOD_5, both TYPE_3 capable).
+- V4 enable paths are not applicable; the validated chip does not require or use
+  `EnableRxDescV4_*`.
 
 Mainline `r8169` does not implement an RTL8125 RSS/RXHASH code path; it keeps
 one RX queue. Full hardware RSS is therefore beyond the upstream reference
@@ -81,12 +112,15 @@ Descriptor go/no-go:
   at RTL8125BP (`CFG_METHOD_8+`, `r8125_n.c:15245-15249`), so V4 enable bits
   and the 0xd8 `EnableRxDescV4_0` path are not applicable to this chip.
 - `InitRxDescType` defaults to legacy and becomes V3 when `EnableRss ||
-  EnablePtp` (`r8125_n.c:15256-15263`). The `EnablePtp` arm proves that the
-  vendor exercises V3 descriptors on this exact chip without requiring
-  multi-queue RSS or the V2/22-vector interrupt surface.
+  EnablePtp` (`r8125_n.c:15256-15263`). This confirms V3-format selection is
+  possible on this chip, but does **not** prove RSS hash fields are populated:
+  `EnablePtp` is a timestamp write-back mode, not the RSS-normal path.
 - RTL8125B's relevant descriptor enable is `EnableRxDescV3`
   (`r8125.h:1649`), applied through `rtl8125_rx_config`
   (`r8125_n.c:15274-15275`).
+- V3 descriptors are 32 bytes (`RX_DESC_LEN_TYPE_3`), so RTL8125B RX ring allocation,
+  tail canary layout, and index stepping are all 2× the legacy descriptor
+  shape.
 
 Make-or-break empirical gate:
 
@@ -95,9 +129,9 @@ Make-or-break empirical gate:
   (`RSS_CTRL_8125` hash bits + RSS key, `Q_NUM_CTRL_8125` still one queue).
 - If `RSSResult` remains zero or invalid unless full `EnableRss` / multi-queue
   RSS is active, Track A collapses into Track B.
-- Answer this by a focused bench experiment before broad refactoring: enable
-  V3, minimally program the hash engine, receive TCP/UDP flows, and dump both
-  the descriptor `RSSResult/HeaderInfo` and the resulting `skb->hash`.
+- Answer this by a focused bench experiment before broad refactoring: enable RSS-normal
+  V3 descriptors only, minimally program the hash engine, receive TCP/UDP flows,
+  and inspect descriptor `RSSResult/HeaderInfo` values and `ethtool -S` counters.
 
 Gap ledger artifacts:
 
@@ -123,6 +157,44 @@ Acceptance:
   evidence.
 - The harness proves RSS is disabled today and can later prove RXHASH/RSS state.
 
+Execution status:
+
+- **A1**: complete — RX format migration and completion normalization are in place; runtime format still defaults to legacy pending phase-0 verdict.
+- **A2**: pending — no hash fields reach C shim yet.
+- **A3**: blocked — gate depends on A1/A2 plus bench result from phase 0.
+- **B1–B5**: blocked — all deferred until Track A is validated.
+
+### Phase 0 Evidence Protocol
+
+To close the phase-0 gate, we need one controlled experiment before any
+structural refactor:
+
+1. Confirm the validated RTL8125B is in one-queue mode with the legacy ISR/IMR
+   surface.
+2. Program RSS-normal V3 descriptors only (exclude PTP timestamp write-back path).
+3. Set minimal hash-engine state (`RSS_CTRL_8125` hash bits + key, `Q_NUM_CTRL_8125`
+   pinned to one queue).
+4. Exercise TCP and UDP traffic and capture:
+   - descriptor `RSSResult` / `HeaderInfo` (phase-0 primary signal),
+   - `ethtool -S` `rx_hash_*` deltas,
+   - and `skb->hash` only after A2 in A3 validation.
+5. Accept `Track A` only if:
+   - hash values are non-zero for hashable traffic,
+   - `HeaderInfo` maps deterministically to `PKT_HASH_TYPE_L3/L4`,
+   - missing hash counter does not rise for controlled hashable traffic.
+
+If the above is inconclusive, Track A is blocked and the plan must move to Track
+B full-RSS prerequisites.
+
+Recommended execution:
+
+```bash
+LABEL=rust     DUT_IFACE=enp3s0 PEER_IFACE=enp4s0 scripts/phase0_rsshash_probe.sh
+LABEL=c_r8169  DUT_IFACE=enp3s0 PEER_IFACE=enp4s0 scripts/phase0_rsshash_probe.sh
+```
+
+Artifacts expected in `docs/perf/rsshash_phase0_<timestamp>_<label>/`.
+
 ## Track A - RXHASH-Only
 
 RXHASH-only does **not** require multiple RX queues. `NETIF_F_RXHASH` means the
@@ -140,9 +212,9 @@ Implementation shape:
 - Add `RxDescLegacy`, `RxDescV3`, and `RxDescV4`.
 - Add `RxDescFormat::{Legacy, V3, V4}` selected once at open/probe for the
   running chip, never per packet.
-- Track A uses V3 on the validated RTL8125B. V4 may be modeled for future
-  RTL8125BP/D-family chips, but it is not part of the RTL8125B enablement
-  path.
+- Track A runtime format selection is explicit but remains `Legacy` on Rust until
+  phase-0 confirms single-queue V3 hash population; the V3/V4 parse paths are
+  now implemented and compile-time validated.
 - Add a normalized completion:
 
 ```rust
@@ -166,7 +238,12 @@ Descriptor migration ripple to handle:
 - `AsBytes`/`FromBytes` unsafe impls in `unsafe_boundary.rs`
 - OWN/DDONE bit positions and `dma_rmb()` contract for V3
 - descriptor publish order for repost
-- descriptor length field extraction
+- descriptor length and field extraction from V3 offsets:
+  - `opts1` at offset 28, `opts2` at 24, `addr` at 16,
+  - RSSResult and HeaderInfo at 8–15,
+  - OWN in `opts1` bit 31.
+- VLAN/csum parity re-validation: `opts2` still carries VLAN tag bit/metadata and
+  `opts1` still carries checksum/length ownership semantics; only offsets move.
 
 Acceptance:
 
@@ -209,6 +286,8 @@ Acceptance:
 - Non-hashable traffic does not receive fabricated hashes.
 - `NETIF_F_RXHASH` is advertised only after this passes on Gateway.
 - No per-packet dynamic dispatch or hot-path logging is added.
+- `Option<RxHash>` is lowered at exactly one boundary (`Rust -> C`); C stays on
+  plain scalars and does not grow enum dispatch.
 
 ### Phase A3 - RXHASH Runtime Validation
 
@@ -223,6 +302,21 @@ Validate with one RX queue first:
 If RXHASH-only needs RSS engine programming to generate hashes, that
 programming must be limited to one queue and must not enable the V2 multi-queue
 interrupt surface.
+
+### Phase A4 - Documentation & Gate Closure
+
+No code change in this phase. It records the implementation outcome and
+unblocks Track B decision:
+
+- If phase-0 empirics and A1/A2 are positive:
+  - update this plan status to `A1` / `A2` / `A3` complete,
+  - set `RXHASH` gate as satisfied in
+    `docs/perf/DRIVER_GAP_LEDGER.md`,
+  - move to Track B only if benchmark evidence shows a remaining gap.
+- If negative:
+  - keep `NETIF_F_RXHASH` hidden,
+  - mark Track A as intentionally blocked by `Track B` prerequisites,
+  - proceed to Phase B only if required by the broader roadmap.
 
 ## Track B - Full Hardware RSS
 
@@ -373,9 +467,11 @@ Add or evolve gates before enabling each feature:
 
 RXHASH-only gates:
 
-- descriptor capability for the running chip is documented
+- descriptor capability for the running chip is documented as RTL8125B V3.
 - descriptor layout size/offset checks for V3 on RTL8125B; V4 checks only
-  when a future V4-capable chip path is added
+  when a future V4-capable chip path is added.
+- RXHASH can remain on a single RX queue; no queue-count gate is required for
+  valid hash reporting.
 - `skb_set_hash` path exists and is countered
 - `NETIF_F_RXHASH` forbidden unless descriptor parser and hash reporting exist
 - no per-packet dynamic dispatch in NAPI
@@ -393,6 +489,11 @@ Full RSS gates:
 The existing `check_hw_offload_features.sh` should evolve from "forbid
 RXHASH" to "prove RXHASH prerequisites"; a separate RTL8125B RSS gate should
 cover the 22-vector V2 rule.
+`check_hw_offload_features.sh` should also include the explicit hard gate that
+Track A can advertise `receive-hashing` only if:
+
+- parser contract is compiled for RTL8125B V3, and
+- `rx_hash_missing == 0` for hashable TCP/UDP in a controlled bench run.
 
 ## Runtime Validation
 
@@ -409,6 +510,14 @@ Extend the Gateway benchmark to compare Rust vs C across:
 - CPU use
 - queue distribution
 - hash counters
+
+Required benchmark artifacts:
+
+- `raw/ethtool_k_before.txt`, `raw/ethtool_k_after.txt`
+- `raw/ethtool_S_before.txt`, `raw/ethtool_S_after.txt`
+- `raw/ethtool_x_before.txt`, `raw/ethtool_x_after.txt`
+- `raw/interrupts_before.txt`, `raw/interrupts_after.txt`
+- `features.csv`, `queues.csv`, `rxhash.csv`, `traffic.csv`, `latency.csv`
 
 Acceptance:
 
@@ -440,3 +549,36 @@ Acceptance:
 This order preserves the stable driver path and prevents repeating the
 single-vector V2/TX-completion failure while still leaving a low-risk
 RXHASH-only option open if the descriptor capability exists.
+
+## Phase-by-Phase Verification Matrix
+
+Track A validation evidence:
+
+- A1:
+  - `cargo check` and targeted `ring`/unsafe-boundary tests pass for descriptor
+    parse changes.
+  - A dedicated assertion verifies `RxDescFormat` is selected once per open.
+  - No regressions in legacy path behavior or ring canary checks.
+- A2:
+  - C shim compiles and accepts `(hash_valid, hash_value, hash_type)`.
+  - `ethtool -S` shows counters for `rx_hash_*` when enabled.
+  - `sk_buff` hash-path is only invoked on hash-valid V3 packets.
+- A3:
+  - `scripts/gateway_hw_offload_validate.sh` produces all required artifacts.
+  - `features.csv` shows `receive-hashing: on` after enable.
+  - `rx_hash_missing` remains bounded for hashable control traffic.
+  - Throughput/latency/IRQ deltas are within control budget.
+- B1:
+  - `cshim` vtable and queue-id contract compiles in lockstep.
+  - queue-id is fully threaded to RX pool allocation/poll/reap and page-pool
+    teardown.
+- B2:
+  - multi-ring memory allocation and tail updates are consistent with queue count.
+  - open/stop/reset paths cleanly release per-queue resources.
+- B3:
+  - vector ownership and affinity are statically asserted in code comments and
+    runtime checks.
+  - `proc/interrupts` deltas show TX completion on vector 16 for RTL8125B.
+- B4/B5:
+  - key/indir programming and RSS topology are reflected through `ethtool -x/-X`
+    and read back matches.

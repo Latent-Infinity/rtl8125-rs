@@ -16,7 +16,7 @@
 
 1. **Chip/Vendor capability (RTL8125B)**
    - Validated as `MAC_VER_63`, XID `0x641`.
-   - V3 descriptor capability is applicable (not V4); `EnablePtp` path exercises V3.
+   - V3 descriptor capability is applicable (not V4); XID-mapped mcfg confirms CFG_METHOD_4/5.
    - Status: **recorded and accepted**.
 
 2. **Descriptor hash population (go/no-go)**
@@ -43,19 +43,26 @@
 
 ## Required proof artifacts
 
+- Phase-0 probe:
+  - `scripts/phase0_rsshash_probe.sh` (single-queue legacy IRQ baseline + V3 hash-engine knob)
 - `scripts/gateway_hw_offload_validate.sh` comparison runs (Rust vs C) with:
   - `features.csv` (ETHTOOL `-k` + `receive-hashing` state)
   - `queues.csv` (RX/TX queue counts + `ethtool -x` support)
-  - `raw/ethtool_x*.txt`, `raw/ethtool_l_before.txt`, `raw/ethtool_l_after.txt`
+  - `raw/ethtool_x*.txt`, `raw/ethtool_k_initial.txt`, `raw/ethtool_S_*`
   - `raw/interrupts_*.txt` and `raw/ethtool_S_*.txt`
+  - `features.csv`, `hash_counters.csv`, `traffic.csv`, `queues.csv`, `irq_snapshot.csv`
 - `ci/check_hw_offload_features.sh`: current static gate keeps RXHASH hidden until `set_rss_ctrl_8125` + multi-ring + queue-id contract land.
 
 ## Open risk and decision point
 
-This plan is still at planning status because the V3 hash-population test has not been run. Without that empirical gate result, the driver should continue to keep `NETIF_F_RXHASH` and RSS disabled.
+Phase 0 execution is now complete in the repo (artifact capture + protocol), and the remaining open item is the hardware verdict:
+without the V3 single-queue RSS-normal hash-population run, the driver must keep
+`NETIF_F_RXHASH` and full RSS disabled.
 
 ## Next immediate artifact tasks
 
 1. Run a focused TX/RX probe on validated RTL8125B with V3 + one RX queue and minimal RSS hash-engine programming.
-2. Capture descriptor `RSSResult`/`HeaderInfo` fields and matched `skb->hash` from kernel/userspace (`ethtool -S` + packet tracing or temporary debug print).
+2. Capture descriptor `RSSResult`/`HeaderInfo` fields and `ethtool -S` counters;
+   capture `skb->hash` in A3 (`gateway_hw_offload_validate.sh`) after A2 exposes
+   hash reporting at the cshim boundary.
 3. Populate Track A decision line in this ledger from the result and either proceed with RXHASH-only implementation or jump to Track B prerequisites.

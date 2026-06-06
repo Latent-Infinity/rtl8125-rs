@@ -1,67 +1,331 @@
 // SPDX-License-Identifier: GPL-2.0
 //! TX / RX descriptor rings — plan §7 M3.
 //!
-//! - 16-byte hardware descriptors with explicit layout, matching r8169's
-//!   `struct TxDesc` / `struct RxDesc` (the validated MS-A2 chip uses the
-//!   same descriptor format for both directions).
-//! - Coherent DMA allocation via [`kernel::dma::CoherentAllocation`]; freed
-//!   automatically on `Ring` drop (which happens on unbind / `rmmod`).
+//! - 16-byte hardware TX descriptors (legacy `struct TxDesc` / `struct RxDesc`).
+//! - RX descriptors support legacy (16-byte), V3 (32-byte), and V4 (16-byte)
+//!   layouts. V3/V4 are modeled as separate typed views over a shared 32-byte
+//!   RX-ring storage.
+//! - DMA-coherent allocation via [`kernel::dma::CoherentAllocation`]; memory is
+//!   released on `Ring` drop (which happens on unbind / `rmmod`).
 //! - **Software-only canaries**: a parallel `[u64; N]` shadow array plus a
 //!   tail-canary descriptor at index `N` of the DMA ring. The shadow catches
-//!   driver-side overwrites of per-descriptor metadata; the tail canary
-//!   catches device-side one-off-the-end DMA writes (M4+ exercise).
+//!   driver-side overwrites of per-descriptor metadata; the tail canary catches
+//!   device-side one-off-the-end DMA writes (M4+ exercise).
 //! - **Typed ring indices**: newtype `TxHead`/`TxTail`/`RxHead`/`RxTail`
-//!   wrappers over `usize`; the type system distinguishes them so an
-//!   `RxTail` can't accidentally be passed where a `TxHead` is expected.
+//!   wrappers over `usize`; the type system distinguishes them so an `RxTail`
+//!   can't accidentally be passed where a `TxHead` is expected.
 //! - **Compile-time bounds**: `const RING_LEN: usize = 256`; ring sizes
-//!   propagate through `Ring<N>` const-generic parameter.
+//!   propagate through `Ring<_, N>` const-generic parameter.
 
+use crate::regs;
 use kernel::device;
 use kernel::dma::{CoherentAllocation, DmaAddress};
 use kernel::error::code::EIO;
 use kernel::prelude::*;
+use kernel::transmute::{AsBytes, FromBytes};
 
 /// Hardware descriptor count per direction. Matches r8169's `NUM_TX_DESC` /
 /// `NUM_RX_DESC` (= 256). RTL8125 supports up to 1024 but 256 is the
 /// well-trodden working default; bumping it is an M5 perf-tuning exercise.
 pub(crate) const RING_LEN: usize = 256;
 
-/// Software canary pattern for the per-descriptor shadow array. Picked so
-/// it's obvious in a hex dump and unlikely to occur naturally.
+/// Software canary pattern for the per-descriptor shadow array. Picked so it's
+/// obvious in a hex dump and unlikely to occur naturally.
 const CANARY_PATTERN: u64 = 0xDEAD_BEEF_CAFE_BABE;
 
-/// Tail-canary descriptor (slot `N` of the DMA ring; hardware only ever
-/// touches slots `0..N`). Distinct from the shadow canary so a hex dump can
-/// tell the two sources apart on failure.
-const TAIL_CANARY_OPTS1: u32 = 0xDEAD_BEEF;
-const TAIL_CANARY_OPTS2: u32 = 0xCAFE_BABE;
-const TAIL_CANARY_ADDR: u64 = 0xFEED_FACE_BAAD_F00D;
+// TX/RX descriptor format constants used to validate per-format parsing and
+// republish offsets in this module.
+const RSS_HEADER_INFO_V3_L3_MASK: u16 = (1 << 10) | (1 << 12);
+const RSS_HEADER_INFO_V3_L4_MASK: u16 = (1 << 13) | (1 << 9);
+const RSS_HEADER_INFO_V4_L3_MASK: u32 = (1 << 28) | (1 << 29);
+const RSS_HEADER_INFO_V4_L4_MASK: u32 = (1 << 30) | (1 << 27);
 
-/// One 16-byte hardware descriptor — same layout for TX and RX on this chip.
-/// Mirrors r8169's `struct TxDesc` / `struct RxDesc`:
+// TX-tail canary for 16-byte descriptor storage.
+const DESC_TAIL_CANARY_OPTS1: u32 = 0xDEAD_BEEF;
+const DESC_TAIL_CANARY_OPTS2: u32 = 0xCAFE_BABE;
+const DESC_TAIL_CANARY_ADDR: u64 = 0xFEED_FACE_BAAD_F00D;
+
+// RX-tail canary reuses the legacy field positions (qword 0 + qword 1 in the
+// 32-byte storage). The higher qwords are zeroed so V3/V4 reads detect a stride
+// and size bug quickly.
+const RX_TAIL_CANARY_DW0: u64 =
+    ((DESC_TAIL_CANARY_OPTS2 as u64) << 32) | DESC_TAIL_CANARY_OPTS1 as u64;
+const RX_TAIL_CANARY_DW1: u64 = DESC_TAIL_CANARY_ADDR;
+
+/// One 16-byte hardware descriptor — TX and legacy RX.
+///
+/// Mirrors r8169's `struct TxDesc` / legacy `struct RxDesc`:
 ///   `__le32 opts1; __le32 opts2; __le64 addr;`
 ///
-/// We use plain `u32`/`u64` because x86_64 is little-endian (matching the
-/// hardware byte order); a `cpu_to_le32` shim would be required if a big-
-/// endian host were ever targeted.
+/// We use plain `u32`/`u64` because x86_64 is little-endian (matching hardware
+/// byte order). A `cpu_to_le32` shim would be required for a big-endian host.
 #[repr(C)]
-#[derive(Copy, Clone, Default, Debug)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Descriptor {
     pub opts1: u32,
     pub opts2: u32,
     pub addr: u64,
 }
 
-// Compile-time assertions — descriptor size and alignment are part of the
-// hardware ABI and must not silently change.
+/// RX legacy alias kept explicit for clarity when parsing legacy V1/V2 layouts.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RxDescLegacy {
+    pub opts1: u32,
+    pub opts2: u32,
+    pub addr: u64,
+}
+
+/// RSS-capable RX descriptor (V3 path used by RTL8125B). This is the 32-byte
+/// layout with the hash fields at DDWord2.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RxDescV3 {
+    pub(crate) _rsv0: u32,
+    pub(crate) _rsv1: u32,
+    pub(crate) rss_result: u32,
+    pub(crate) header_buffer_len: u16,
+    pub(crate) header_info: u16,
+    pub(crate) addr: u64,
+    pub(crate) opts2: u32,
+    pub(crate) opts1: u32,
+}
+
+/// RSS-capable RX descriptor (V4 path). Kept for future chip generations.
+#[repr(C, align(8))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RxDescV4 {
+    /// `union { u64 addr; struct { u32 rss_info; u32 rss_result; } }`
+    pub(crate) addr_or_rss_info: u64,
+    pub(crate) opts2: u32,
+    pub(crate) opts1: u32,
+}
+
+/// RX ring storage type with maximum V3 width.
+#[repr(C, align(8))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RxDescriptor {
+    pub(crate) words: [u64; 4],
+}
+
+/// Marker for RX descriptor format selection.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum RxDescFormat {
+    /// Legacy 16-byte V1/V2-style layout.
+    #[default]
+    Legacy,
+    #[allow(dead_code)]
+    /// RTL8125B-capable RSS-capable layout.
+    V3,
+    #[allow(dead_code)]
+    /// RTL8125BP-capable RSS-capable layout.
+    V4,
+}
+
+impl RxDescFormat {
+    /// TX/RX descriptor byte stride for this format.
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) const fn descriptor_len(self) -> usize {
+        match self {
+            RxDescFormat::Legacy | RxDescFormat::V4 => 16,
+            RxDescFormat::V3 => 32,
+        }
+    }
+
+    #[inline]
+    const fn publish_offsets(self) -> (usize, usize, usize) {
+        match self {
+            // Legacy RX: opts2/opts1 at qword0, addr at qword1.
+            RxDescFormat::Legacy => (8, 4, 0),
+            // V3: addr at +16, opts2/opts1 at +24/+28.
+            RxDescFormat::V3 => (16, 24, 28),
+            // V4: addr at +0, opts2/opts1 at +8/+12.
+            RxDescFormat::V4 => (0, 8, 12),
+        }
+    }
+}
+
+/// RSS hash payload extracted from V3/V4 descriptor fields.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RxHashType {
+    L3,
+    L4,
+}
+
+/// Parsed hardware hash payload.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RxHash {
+    pub(crate) value: u32,
+    pub(crate) kind: RxHashType,
+}
+
+/// Normalized RX completion fields consumed by the Rust hot path.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RxCompletion {
+    pub(crate) len: usize,
+    pub(crate) opts1: u32,
+    pub(crate) opts2: u32,
+    pub(crate) rss_hash: Option<RxHash>,
+}
+
 const _: () = assert!(core::mem::size_of::<Descriptor>() == 16);
 const _: () = assert!(core::mem::align_of::<Descriptor>() == 8);
+const _: () = assert!(core::mem::size_of::<RxDescLegacy>() == 16);
+const _: () = assert!(core::mem::align_of::<RxDescLegacy>() == 8);
+const _: () = assert!(core::mem::size_of::<RxDescV3>() == 32);
+const _: () = assert!(core::mem::align_of::<RxDescV3>() == 8);
+const _: () = assert!(core::mem::size_of::<RxDescV4>() == 16);
+const _: () = assert!(core::mem::align_of::<RxDescV4>() == 8);
+const _: () = assert!(core::mem::size_of::<RxDescriptor>() == 32);
+const _: () = assert!(core::mem::align_of::<RxDescriptor>() == 8);
 
-// `unsafe impl AsBytes / FromBytes for Descriptor` lives in `unsafe_boundary`
-// per plan §6.2 (those traits are unsafe; implementing them is `unsafe impl`,
-// which the crate-root `#![deny(unsafe_code)]` rejects in other files).
+// `unsafe impl AsBytes / FromBytes for descriptors` lives in `unsafe_boundary`.
 
-// ── Typed ring indices ────────────────────────────────────────────────────
+// `RingCanary` is the minimum surface needed by [`Ring::new`] / `verify_canaries`.
+// Each descriptor type records its own tail sentinel so one allocation can carry
+// its matching runtime invariant.
+pub(crate) trait RingCanary: Copy + PartialEq {
+    fn tail_canary() -> Self;
+}
+
+impl RingCanary for Descriptor {
+    fn tail_canary() -> Self {
+        Descriptor {
+            opts1: DESC_TAIL_CANARY_OPTS1,
+            opts2: DESC_TAIL_CANARY_OPTS2,
+            addr: DESC_TAIL_CANARY_ADDR,
+        }
+    }
+}
+
+impl RingCanary for RxDescriptor {
+    fn tail_canary() -> Self {
+        RxDescriptor {
+            words: [RX_TAIL_CANARY_DW0, RX_TAIL_CANARY_DW1, 0, 0],
+        }
+    }
+}
+
+#[inline]
+fn rx_hash_type_v3(header_info: u16) -> Option<RxHashType> {
+    if header_info & RSS_HEADER_INFO_V3_L3_MASK == 0 {
+        return None;
+    }
+    if header_info & RSS_HEADER_INFO_V3_L4_MASK != 0 {
+        Some(RxHashType::L4)
+    } else {
+        Some(RxHashType::L3)
+    }
+}
+
+#[inline]
+fn rx_hash_type_v4(header_info: u32) -> Option<RxHashType> {
+    if header_info & RSS_HEADER_INFO_V4_L3_MASK == 0 {
+        return None;
+    }
+    if header_info & RSS_HEADER_INFO_V4_L4_MASK != 0 {
+        Some(RxHashType::L4)
+    } else {
+        Some(RxHashType::L3)
+    }
+}
+
+impl RxDescLegacy {
+    pub(crate) fn completion(self) -> RxCompletion {
+        RxCompletion {
+            len: (self.opts1 & regs::DESC_LEN_MASK) as usize,
+            opts1: self.opts1,
+            opts2: self.opts2,
+            rss_hash: None,
+        }
+    }
+}
+
+impl RxDescV3 {
+    #[allow(dead_code)]
+    pub(crate) fn completion(self) -> RxCompletion {
+        let hash = rx_hash_type_v3(self.header_info).map(|kind| RxHash {
+            value: self.rss_result,
+            kind,
+        });
+        RxCompletion {
+            len: (self.opts1 & regs::DESC_LEN_MASK) as usize,
+            opts1: self.opts1,
+            opts2: self.opts2,
+            rss_hash: hash,
+        }
+    }
+}
+
+impl RxDescV4 {
+    #[allow(dead_code)]
+    pub(crate) fn completion(self) -> RxCompletion {
+        let hash = rx_hash_type_v4(self.addr_or_rss_info as u32).map(|kind| RxHash {
+            value: (self.addr_or_rss_info >> 32) as u32,
+            kind,
+        });
+        RxCompletion {
+            len: (self.opts1 & regs::DESC_LEN_MASK) as usize,
+            opts1: self.opts1,
+            opts2: self.opts2,
+            rss_hash: hash,
+        }
+    }
+}
+
+impl RxDescriptor {
+    pub(crate) fn completion(self, format: RxDescFormat) -> RxCompletion {
+        match format {
+            RxDescFormat::Legacy => {
+                let first = self.words[0];
+                let second = self.words[1];
+                RxDescLegacy {
+                    opts1: (first & 0xFFFF_FFFF) as u32,
+                    opts2: (first >> 32) as u32,
+                    addr: second,
+                }
+                .completion()
+            }
+            RxDescFormat::V3 => {
+                let word2 = self.words[1];
+                let word3 = self.words[3];
+                let header_info = (word2 >> 48) as u16;
+                let hash = rx_hash_type_v3(header_info).map(|kind| RxHash {
+                    value: (word2 & 0xFFFF_FFFF) as u32,
+                    kind,
+                });
+                RxCompletion {
+                    len: ((word3 >> 32) & u64::from(regs::DESC_LEN_MASK)) as usize,
+                    opts1: (word3 >> 32) as u32,
+                    opts2: (word3 & 0xFFFF_FFFF) as u32,
+                    rss_hash: hash,
+                }
+            }
+            RxDescFormat::V4 => {
+                let word0 = self.words[0];
+                let word1 = self.words[1];
+                let hash = rx_hash_type_v4((word0 & 0xFFFF_FFFF) as u32).map(|kind| RxHash {
+                    value: (word0 >> 32) as u32,
+                    kind,
+                });
+                RxCompletion {
+                    len: ((word1 >> 32) & u64::from(regs::DESC_LEN_MASK)) as usize,
+                    opts1: (word1 >> 32) as u32,
+                    opts2: word1 as u32,
+                    rss_hash: hash,
+                }
+            }
+        }
+    }
+
+    /// Byte offsets used by `desc_publish_own` for each format.
+    pub(crate) const fn publish_offsets(format: RxDescFormat) -> (usize, usize, usize) {
+        format.publish_offsets()
+    }
+}
+
+// ── Typed ring indices ───────────────────────────────────────────────────
 // Newtype wrappers; the compiler distinguishes them at the type level so a
 // TX index can't be used where an RX index is expected (plan §7 M3).
 
@@ -97,45 +361,45 @@ ring_index!(RxTail, "RX ring consumer index (NAPI advances after rx).");
 // Power-of-two so the wrap mask above is a compile-time constant.
 const _: () = assert!(RING_LEN.is_power_of_two());
 
-// ── Ring ──────────────────────────────────────────────────────────────────
+/// Alias for the actual TX ring storage used by probe and open.
+pub(crate) type TxRing = Ring<Descriptor, RING_LEN>;
+/// Alias for the actual RX ring storage used by probe and open.
+pub(crate) type RxRing = Ring<RxDescriptor, RING_LEN>;
 
 /// One descriptor ring (TX or RX). `N` is the hardware-visible descriptor
-/// count; the underlying DMA allocation is `N + 1` slots so slot `N` can
-/// hold the tail canary without overlapping anything hardware writes.
-pub(crate) struct Ring<const N: usize> {
-    /// DMA-coherent descriptor array. Slots 0..N are hardware-visible;
-    /// slot N is the tail canary. Drops on `Ring` drop → `dma_free_coherent`.
-    desc: CoherentAllocation<Descriptor>,
-    /// Per-descriptor software canary shadow. Heap-allocated (`KBox`) and
-    /// filled in place so a large `N` never materialises an `[u64; N]` on the
-    /// kernel stack during probe (see `Ring::new`). Catches driver-side
-    /// scribbles in M4+ (in M3 it is vacuously preserved — no driver writes).
+/// count; the underlying DMA allocation is `N + 1` slots so slot `N` can hold
+/// the tail canary.
+pub(crate) struct Ring<D, const N: usize>
+where
+    D: Copy + Default + RingCanary + PartialEq + AsBytes + FromBytes,
+{
+    /// DMA-coherent descriptor array. Slots 0..N are hardware-visible; slot N is
+    /// the tail canary. Drops on `Ring` drop → `dma_free_coherent`.
+    desc: CoherentAllocation<D>,
+    /// Per-descriptor software canary shadow. Heap-allocated (`KBox`) and filled
+    /// in place so a large `N` never materialises an `[u64; N]` on the kernel
+    /// stack during probe (see `Ring::new`).
     shadow: KBox<[u64; N]>,
+    tail_canary: D,
 }
 
-impl<const N: usize> Ring<N> {
-    /// Allocate the descriptor ring against `dev`, zero the hardware
-    /// descriptors, plant the tail canary at slot `N`, and seed the software
-    /// shadow with the canary pattern. Returns `EIO` if the underlying
-    /// `dma_alloc_coherent` fails.
+impl<D, const N: usize> Ring<D, N>
+where
+    D: Copy + Default + RingCanary + PartialEq + AsBytes + FromBytes,
+{
+    /// Allocate the descriptor ring, zero the hardware-visible slots, and plant
+    /// the format-specific tail canary at slot `N`.
     pub(crate) fn new(dev: &device::Device<device::Bound>) -> Result<Self> {
-        let desc: CoherentAllocation<Descriptor> =
+        let tail_canary = D::tail_canary();
+        let desc: CoherentAllocation<D> =
             CoherentAllocation::alloc_coherent(dev, N + 1, GFP_KERNEL)?;
 
         // Hardware-visible slots: zero.
         for i in 0..N {
-            kernel::dma_write!(desc, [i]?, Descriptor::default());
+            kernel::dma_write!(desc, [i]?, D::default());
         }
         // Tail canary at slot N.
-        kernel::dma_write!(
-            desc,
-            [N]?,
-            Descriptor {
-                opts1: TAIL_CANARY_OPTS1,
-                opts2: TAIL_CANARY_OPTS2,
-                addr: TAIL_CANARY_ADDR,
-            }
-        );
+        kernel::dma_write!(desc, [N]?, tail_canary);
 
         // Build the shadow on the heap, filled in place: `init_array_from_fn`
         // never constructs the `[u64; N]` on the stack, so probe stays within
@@ -143,7 +407,12 @@ impl<const N: usize> Ring<N> {
         // A by-value `[CANARY_PATTERN; N]` here overflowed the stack at N>=512
         // under KASAN (corrupted-stack-end panic during insmod) — fixed.
         let shadow = KBox::init(pin_init::init_array_from_fn(|_| CANARY_PATTERN), GFP_KERNEL)?;
-        Ok(Self { desc, shadow })
+
+        Ok(Self {
+            desc,
+            shadow,
+            tail_canary,
+        })
     }
 
     /// DMA address of slot 0 of the ring — what gets programmed into the
@@ -152,11 +421,9 @@ impl<const N: usize> Ring<N> {
         self.desc.dma_handle()
     }
 
-    /// Raw CPU pointer to descriptor[0]. Stable for the lifetime of the
-    /// `Ring` (CoherentAllocation pins its backing memory). Used by the
-    /// M4 hot path to read/write descriptors via the `desc_read` /
-    /// `desc_write` helpers in `unsafe_boundary`.
-    pub(crate) fn desc_ptr_mut(&self) -> *mut Descriptor {
+    /// Raw CPU pointer to descriptor[0]. Stable for the lifetime of the `Ring`
+    /// (CoherentAllocation pins its backing memory).
+    pub(crate) fn desc_ptr_mut(&self) -> *mut D {
         self.desc.start_ptr().cast_mut()
     }
 
@@ -166,23 +433,15 @@ impl<const N: usize> Ring<N> {
         N
     }
 
-    /// Verify that the software shadow + tail-canary descriptor are intact.
-    /// Returns `EIO` and a `dev_err!` line on failure. In M3 this is
-    /// expected to pass trivially (no driver activity touches either area);
-    /// it gains teeth at M4+ where the hot path could in principle scribble.
+    /// Verify that software shadow + tail canary are intact.
     pub(crate) fn verify_canaries(&self) -> Result<()> {
         for c in self.shadow.iter() {
             if *c != CANARY_PATTERN {
                 return Err(EIO);
             }
         }
-        // Tail canary read-back. `dma_read!` and friends require the index
-        // to fit in the allocation (N + 1).
-        let tail: Descriptor = kernel::dma_read!(self.desc, [N]?);
-        if tail.opts1 != TAIL_CANARY_OPTS1
-            || tail.opts2 != TAIL_CANARY_OPTS2
-            || tail.addr != TAIL_CANARY_ADDR
-        {
+        let tail: D = kernel::dma_read!(self.desc, [N]?);
+        if tail != self.tail_canary {
             return Err(EIO);
         }
         Ok(())

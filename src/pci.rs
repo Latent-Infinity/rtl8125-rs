@@ -49,7 +49,7 @@ use crate::hw;
 use crate::mmio::{self, Regs};
 use crate::netdev::{IrqMode, NetdevHandle, NetdevState};
 use crate::pm;
-use crate::ring::{self, Ring};
+use crate::ring;
 use crate::unsafe_boundary;
 
 /// Realtek's PCI Vendor ID is exposed as [`pci::Vendor::REALTEK`] (0x10EC);
@@ -115,8 +115,8 @@ pub(crate) struct R8125Driver {
     _netdev: NetdevHandle,
     #[pin]
     _bar: Devres<pci::Bar<{ mmio::R8125_MMIO_LEN }>>,
-    tx_ring: Ring<{ ring::RING_LEN }>,
-    rx_ring: Ring<{ ring::RING_LEN }>,
+    tx_ring: ring::TxRing,
+    rx_ring: ring::RxRing,
     pdev: ARef<pci::Device>,
 }
 
@@ -208,8 +208,8 @@ impl pci::Driver for R8125Driver {
 
                     pm::log_aspm(pdev);
                 },
-                tx_ring: Ring::<{ ring::RING_LEN }>::new(pdev.as_ref())?,
-                rx_ring: Ring::<{ ring::RING_LEN }>::new(pdev.as_ref())?,
+                tx_ring: ring::TxRing::new(pdev.as_ref())?,
+                rx_ring: ring::RxRing::new(pdev.as_ref())?,
                 _: {
                     // M3 cold-ring sanity.
                     tx_ring.verify_canaries()?;
@@ -395,6 +395,7 @@ impl pci::Driver for R8125Driver {
                             rx <- crate::netdev::RxRingState::new(
                                 rx_ring.desc_ptr_mut(),
                                 rx_ring.dma_handle(),
+                                crate::ring::RxDescFormat::Legacy,
                             ),
                             irq <- crate::netdev::IrqState::new(
                                 irq_num,

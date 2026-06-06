@@ -107,7 +107,7 @@ pub(crate) fn note_napi_poll(state: &NetdevState) {
 
 use crate::mmio::{self, Regs};
 use crate::regs;
-use crate::ring::{Descriptor, RING_LEN};
+use crate::ring::{Descriptor, RxDescFormat, RxDescriptor, RING_LEN};
 use crate::unsafe_boundary::{self as ub, BridgeOps};
 
 /// `NETDEV_TX_OK` / `NETDEV_TX_BUSY` from `include/linux/netdevice.h`.
@@ -368,7 +368,7 @@ impl TxRingState {
 /// RX-ring slice — populated by `ndo_open` (per-slot streaming-DMA pages),
 /// drained by `ndo_stop`, hot-path read by NAPI poll.
 pub(crate) struct RxRingState {
-    pub(crate) desc: *mut Descriptor,
+    pub(crate) desc: *mut RxDescriptor,
     pub(crate) dma: u64,
 
     /// Per-slot streaming-DMA RX buffers (M6 #2 v3). Geometry comes from
@@ -398,12 +398,17 @@ pub(crate) struct RxRingState {
     /// RX consumer index (advanced by the NAPI RX path). Cache-padded so
     /// the RX hot loop's index doesn't ping-pong with TX indices.
     pub(crate) tail: CachePadded<AtomicUsize>,
+    /// Active RX descriptor format for this open. Kept fixed for the device
+    /// open/session for now; phase 0 defaults this to legacy layout until
+    /// explicit RSS layout enablement is plumbed.
+    pub(crate) format: RxDescFormat,
 }
 
 impl RxRingState {
     pub(crate) fn new(
-        desc: *mut Descriptor,
+        desc: *mut RxDescriptor,
         dma: u64,
+        format: RxDescFormat,
     ) -> impl pin_init::Init<Self, kernel::error::Error> {
         kernel::try_init!(Self {
             desc,
@@ -416,6 +421,7 @@ impl RxRingState {
             ),
             buf_len: CachePadded::new(AtomicU32::new(0)),
             tail: CachePadded::new(AtomicUsize::new(0)),
+            format,
         }? kernel::error::Error)
     }
 }
@@ -813,13 +819,14 @@ fn pre_post_rx_descriptors(state: &NetdevState) {
         // Initial RX ownership handoff follows the same ordering as NAPI
         // reposts: addr/opts2 first, then dma_wmb(), then OWN in opts1.
         ub::desc_publish_own(
-            state.rx.desc,
+            state.rx.desc.cast::<u8>(),
             i,
             Descriptor {
                 opts1,
                 opts2: 0,
                 addr: dma,
             },
+            state.rx.format,
         );
     }
 }
@@ -1274,7 +1281,7 @@ fn ndo_stop(state: &NetdevState) {
     // Zero the descriptor rings so a subsequent open starts fresh.
     for i in 0..RING_LEN {
         ub::desc_write(state.tx.desc, i, Descriptor::default());
-        ub::desc_write(state.rx.desc, i, Descriptor::default());
+        ub::desc_write_rx(state.rx.desc, i, RxDescriptor::default());
     }
 
     // M6 #2 — release every RX slot's page chunk + DMA mapping. The
@@ -1653,13 +1660,14 @@ fn ndo_start_xmit(state: &NetdevState, skb: crate::skb::DriverOwnedSkb) -> c_int
     // Publish OWN|FS only after addr/opts2 and earlier fragment
     // descriptors are visible to the device.
     ub::desc_publish_own(
-        state.tx.desc,
+        state.tx.desc.cast::<u8>(),
         first_slot,
         Descriptor {
             opts1: first_opts1,
             opts2: first_opts2,
             addr: linear_handle,
         },
+        crate::ring::RxDescFormat::Legacy,
     );
 
     let ndev = state.ndev.load(Ordering::Acquire);

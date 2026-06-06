@@ -26,6 +26,22 @@ The script writes comparable CSVs under
 - `raw/` keeps `ethtool -k`, `ethtool -S`, `ethtool -x`, interrupts, and
   ethtool topology (`-g`, `-l`, `-c`) and iperf3 JSON.
 
+Phase-0 RSS/hashability can be run with the focused probe script:
+
+```bash
+LABEL=rust     DUT_IFACE=enp3s0 PEER_IFACE=enp4s0 scripts/phase0_rsshash_probe.sh
+LABEL=c_r8169  DUT_IFACE=enp3s0 PEER_IFACE=enp4s0 scripts/phase0_rsshash_probe.sh
+```
+
+That phase-0 run writes:
+
+- `features.csv`
+- `queues.csv`
+- `hash_counters.csv`
+- `irq_snapshot.csv`
+- `traffic.csv`
+- `README.md` (decision notes)
+
 ## Acceptance Criteria
 
 - Rust and C both complete VLAN TCP/UDP traffic with no new loss/retransmit
@@ -45,13 +61,15 @@ Do not advertise `NETIF_F_RXHASH` until all of these are true:
    parsed instead of the current legacy 16-byte descriptor shape.
 2. The RX cshim can call `skb_set_hash(...)` with the descriptor's RSS result
    and the correct L3/L4 hash type.
-3. The driver owns multiple RX rings, including per-ring descriptors, tails,
-   page pools, and NAPI state.
-4. Queue count and RSS registers are programmed consistently, and the netdev
-   reports the real queue count to the stack.
-5. Interrupt/vector ownership is reviewed for multi-queue RX instead of the
-   current single-vector, single-queue mode.
-6. `ethtool -x/-X` support exists for RSS indirection/key visibility and
+3. Hash counters confirm `rx_hash_l3`/`rx_hash_l4` counters increase for hashable
+   TCP/UDP and `rx_hash_missing` is bounded in controlled runs.
+4. (Track B only) The driver owns multiple RX rings, including per-ring
+   descriptors, tails, page pools, and NAPI state.
+5. (Track B only) Queue count and RSS registers are programmed consistently, and
+   the netdev reports the real queue count to the stack.
+6. (Track B only) Interrupt/vector ownership is reviewed for multi-queue RX
+   instead of the current single-vector, single-queue mode.
+7. (Track B only) `ethtool -x/-X` support exists for RSS indirection/key visibility and
    control, matching r8169/vendor behavior where the chip supports it.
 
 Until then, advertising RXHASH would tell the stack that `skb->hash` is valid

@@ -100,9 +100,9 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
     let buf_desc_len = buf_len & regs::DESC_LEN_MASK;
     let buf_len = buf_len as usize;
     while work_done < budget_u {
-        let desc = ub::desc_read(state.rx.desc, rx_tail);
+        let completion = ub::desc_read_rx(state.rx.desc, rx_tail).completion(state.rx.format);
         // Hardware sets OWN; if still set, this slot isn't filled yet — stop.
-        if desc.opts1 & regs::DESC_OWN != 0 {
+        if completion.opts1 & regs::DESC_OWN != 0 {
             break;
         }
         // Pair with the device's OWN-clear publish before reading
@@ -112,7 +112,7 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
         // Lower 14 bits of opts1 are the RX frame length (incl. CRC; chip
         // typically strips CRC — same convention as r8169). Cap at the
         // buffer size for safety.
-        let len = (desc.opts1 & regs::DESC_LEN_MASK) as usize;
+        let len = completion.len;
         let len = core::cmp::min(len, buf_len);
 
         // Default re-post address is the slot's current DMA buffer (the
@@ -134,8 +134,8 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
                 slot_dma,
                 slot_cpu.cast_const(),
                 len,
-                desc.opts1,
-                desc.opts2,
+                completion.opts1,
+                completion.opts2,
             );
             // Publish the refilled buffer into the slot shadow so the next
             // wrap-around reads the live page, not the one now owned by the
@@ -157,13 +157,14 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
         }
         // Publish OWN only after addr/opts2 are visible to the device.
         ub::desc_publish_own(
-            state.rx.desc,
+            state.rx.desc.cast::<u8>(),
             rx_tail,
-            Descriptor {
+            crate::ring::Descriptor {
                 opts1,
                 opts2: 0,
                 addr: post_dma,
             },
+            state.rx.format,
         );
 
         rx_tail = (rx_tail + 1) % RING_LEN;

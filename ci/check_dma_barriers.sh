@@ -73,10 +73,10 @@ publish_body=$(
 		in_fn && /^}/ { exit }
 	' "$UB_RS"
 )
-addr_line=$(grep -n 'write_volatile(value.addr)' <<<"$publish_body" | head -n1 | cut -d: -f1)
-opts2_line=$(grep -n 'write_volatile(value.opts2)' <<<"$publish_body" | head -n1 | cut -d: -f1)
+addr_line=$(grep -nF 'value.addr' <<<"$publish_body" | head -n1 | cut -d: -f1)
+opts2_line=$(grep -nF 'value.opts2' <<<"$publish_body" | head -n1 | cut -d: -f1)
 wmb_line=$(grep -n '^[[:space:]]*dma_wmb();' <<<"$publish_body" | head -n1 | cut -d: -f1)
-opts1_line=$(grep -n 'write_volatile(value.opts1)' <<<"$publish_body" | head -n1 | cut -d: -f1)
+opts1_line=$(grep -nF 'value.opts1' <<<"$publish_body" | head -n1 | cut -d: -f1)
 if [[ -n "$addr_line" && -n "$opts2_line" && -n "$wmb_line" && -n "$opts1_line" ]] \
    && (( addr_line < wmb_line && opts2_line < wmb_line && wmb_line < opts1_line )); then
 	grn "rust: desc_publish_own orders addr/opts2 before dma_wmb before opts1"

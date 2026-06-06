@@ -51,7 +51,7 @@ use kernel::transmute::{AsBytes, FromBytes};
 use kernel::types::Opaque;
 
 use crate::netdev::{NetdevHandle, NetdevState};
-use crate::ring::Descriptor;
+use crate::ring::{Descriptor, RxDescFormat, RxDescLegacy, RxDescV3, RxDescV4, RxDescriptor};
 
 /// Configure 64-bit DMA addressing on `pdev` and its coherent allocator.
 /// Wraps the kernel-Rust `unsafe fn dma_set_mask_and_coherent`.
@@ -102,6 +102,38 @@ unsafe impl AsBytes for Descriptor {}
 // written fields (`opts1`, `opts2`) and the DMA address (`addr`) are all
 // fully defined for any bit pattern the device can produce.
 unsafe impl FromBytes for Descriptor {}
+
+// SAFETY: `RxDescLegacy`, `RxDescV3`, `RxDescV4`, and `RxDescriptor` are
+// `#[repr(C)]`/`#[repr(C, align(8))]` POD layouts with no pointer fields.
+// All bit patterns that fit the target byte width are admissible from DMA
+// sources, so broad `AsBytes`/`FromBytes` is sound for coherent allocation
+// and descriptor replay.
+// SAFETY: as above for `AsBytes`; `FromBytes` is symmetric for these POD types.
+unsafe impl AsBytes for RxDescriptor {}
+// SAFETY: as above for `RxDescriptor`; reconstructed `RxDescriptor` values are
+// valid for any 32-byte bit pattern.
+unsafe impl FromBytes for RxDescriptor {}
+
+// SAFETY: no padding or invalid invariants; `RxDescLegacy` mirrors the
+// 16-byte DMA descriptor for this chip family and is safe to round-trip
+// from any concrete bit pattern.
+unsafe impl AsBytes for RxDescLegacy {}
+// SAFETY: as above for `RxDescLegacy`.
+unsafe impl FromBytes for RxDescLegacy {}
+
+// SAFETY: `RxDescV3` is a 32-byte POD layout with only integer fields.
+// There are no ownership or pointer invariants, so arbitrary firmware bits
+// are valid to copy into this storage type.
+unsafe impl AsBytes for RxDescV3 {}
+// SAFETY: as above for `RxDescV3`.
+unsafe impl FromBytes for RxDescV3 {}
+
+// SAFETY: `RxDescV4` is a 16-byte POD layout with only integer fields.
+// There are no ownership or pointer invariants, so arbitrary firmware bits
+// are valid to copy into this storage type.
+unsafe impl AsBytes for RxDescV4 {}
+// SAFETY: as above for `RxDescV4`.
+unsafe impl FromBytes for RxDescV4 {}
 
 // The task #58 stack-overflow fix uses `KBox::init` with
 // `init_array_from_fn` to populate the giant 256-slot atomic arrays in
@@ -626,16 +658,42 @@ pub(crate) fn desc_write(ring: *mut Descriptor, idx: usize, value: Descriptor) {
 /// The final `opts1` write is the ownership transfer: on weakly ordered
 /// systems the chip must not observe `DESC_OWN` before the matching DMA
 /// address and secondary options are visible.
-pub(crate) fn desc_publish_own(ring: *mut Descriptor, idx: usize, value: Descriptor) {
+pub(crate) fn desc_publish_own(ring: *mut u8, idx: usize, value: Descriptor, format: RxDescFormat) {
     // SAFETY: caller guarantees idx < N+1 of the ring this pointer indexes.
     // These are descriptor-ring volatile writes, not MMIO. `dma_wmb()` is the
     // device-ordering boundary between the non-OWN fields and the OWN publish.
     unsafe {
-        let desc = ring.add(idx);
-        core::ptr::addr_of_mut!((*desc).addr).write_volatile(value.addr);
-        core::ptr::addr_of_mut!((*desc).opts2).write_volatile(value.opts2);
+        let stride = format.descriptor_len();
+        let slot = ring.add(idx * stride);
+        let (addr_off, opts2_off, opts1_off) = RxDescriptor::publish_offsets(format);
+        core::ptr::write_volatile(slot.add(addr_off).cast::<u64>(), value.addr);
+        core::ptr::write_volatile(slot.add(opts2_off).cast::<u32>(), value.opts2);
         dma_wmb();
-        core::ptr::addr_of_mut!((*desc).opts1).write_volatile(value.opts1);
+        core::ptr::write_volatile(slot.add(opts1_off).cast::<u32>(), value.opts1);
+    }
+}
+
+// ── RX descriptor helpers (phase 1) ───────────────────────────────────────
+
+/// Read one RX hardware descriptor from `ring[idx]` (volatile, 32-byte storage).
+///
+/// RX rings are now allocated with the `RxDescriptor` storage layout to cover
+/// both legacy and RSS-capable descriptor formats. The active parse format
+/// (legacy/V3/V4) is decided once at open.
+pub(crate) fn desc_read_rx(ring: *mut RxDescriptor, idx: usize) -> RxDescriptor {
+    // SAFETY: caller guarantees idx < N+1 of the ring this pointer indexes.
+    // Volatile to discipline against compiler reordering across OWN-bit
+    // handoff.
+    unsafe { core::ptr::read_volatile(ring.add(idx)) }
+}
+
+/// Write one RX descriptor slot (volatile, whole-struct). Use only when the
+/// descriptor is not currently being OWN-published to the device.
+pub(crate) fn desc_write_rx(ring: *mut RxDescriptor, idx: usize, value: RxDescriptor) {
+    // SAFETY: as `desc_read_rx`; used by stop/rollback paths where the device
+    // is quiesced and slot contents are inert.
+    unsafe {
+        core::ptr::write_volatile(ring.add(idx), value);
     }
 }
 
