@@ -7,6 +7,14 @@ paused and what to do next.
 
 ---
 
+## Current TX offload note — 2026-06-06
+
+The current xmit path uses `r8125_bridge_skb_tx_offload_prepare` /
+`DriverOwnedSkb::tx_offload_prepare()` to prepare opts1, opts2, and
+`nr_frags` in one FFI crossing before DMA mapping. Normal UDP
+`CHECKSUM_PARTIAL` packets stay on RTL8125 hardware checksum; software
+checksum is limited to unsupported/pad cases matching r8169/vendor behavior.
+
 ## TL;DR — M4-perf phase 1 ✅ (2026-05-25): HW CSUM offload + netdev stats
 
 Built on top of M4-traffic 2.5G. Now: link 2.5Gbps Full Duplex,

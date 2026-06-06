@@ -39,14 +39,14 @@ underlying classification rationale.
 | `check_no_bridge_exports.sh` | C shim helpers stay module-private; no accidental global `EXPORT_SYMBOL*` API |
 | `check_mdio_bridge.sh` | MDIO bus alloc/register/free lifecycle + PHY init failure unwinds via disconnect + reg-range validation |
 | `check_napi_contract.sh` | NAPI poll rules: `budget==0` no complete_done, `work_done<budget` complete_done+rearm, queue hysteresis, TX-tail-before-wake ordering |
-| `check_offload_path.sh` | TSO/CSUM setup BEFORE DMA map + linear unmap uses shadow length + short-UDP errata fallback present + TSO advertisement paired with chip max_segs/max_size |
+| `check_offload_path.sh` | TSO/CSUM setup BEFORE DMA map + one-call TX offload prep + normal UDP stays on HW checksum + scoped pad/software-CSUM fallback + linear unmap uses shadow length + TSO advertisement paired with chip max_segs/max_size |
 | `check_packet_mutation.sh` | `ndo_start_xmit` doesn't write shared-clone fields of skb |
 | `check_rmmod_while_up.sh` | `rmmod` under traffic completes without `BUG`/`WARN` — the #58 fix discipline |
 | `check_skb_ownership.sh` | `DriverOwnedSkb` shape: `#[must_use]`, `#[repr(transparent)]`, no `Drop`, FFI-only `from_raw`, consume verbs only |
 | `check_selftest_smoke.sh` | Upstream-style net selftest exists, emits TAP, skips cleanly, and covers load/netdev/unload shape |
 | `check_soak_harness.sh` | Long-running soak harnesses parse, report traffic-generator failures, and fail without observed packet progress |
 
-## RTL8125-specific — replace per chip (11 gates)
+## RTL8125-specific — replace per chip (12 gates)
 
 These encode chip knowledge: register names, masks, ASPM behavior,
 init sequence parity with `r8169_main.c`. For a different chip
@@ -55,6 +55,7 @@ they need rewriting against that chip's authoritative source.
 | Gate | Chip knowledge encoded |
 |---|---|
 | `check_hw_init.sh` | r8169-parity bring-up sequence; balanced config-unlock/lock around fallible init; PCIe power-state writes |
+| `check_hw_offload_features.sh` | RTL8125 VLAN descriptor/RxConfig contract and guard that RSS/RXHASH stays off until RxDescV3/V4 + multi-ring support exists |
 | `check_irq_mode_contract.sh` | `IrqMode` enum + `INT_CFG0_ENABLE_8125 = BIT(0)` chip-side V2 activation gated on probe-selected mode |
 | `check_isr_v2_paired.sh` | V2 ISR/IMR mask register pairing (`IMR_V2_CLEAR`/`IMR_V2_SET`/`ISR_V2`); reserved-bit avoidance |
 | `check_msix_static.sh` | RTL-specific MSI-X register surface; `intx_only` rollback module param exists |
@@ -76,8 +77,8 @@ netdev-pattern, partly RTL-specific.
 |---|---:|---|
 | `[generic]` | 11 | minutes (copy + adjust paths) |
 | `[netdev]` | 12 | ~1 h (copy + adjust symbol names) |
-| `[rtl8125]` | 11 | full rewrite per chip (~half a day each) |
-| **Total** | **34** | |
+| `[rtl8125]` | 12 | full rewrite per chip (~half a day each) |
+| **Total** | **35** | |
 
 The 11 `[generic]` + 12 `[netdev]` gates are the **starter pack** the
 next Rust NIC driver project should clone first. Together they

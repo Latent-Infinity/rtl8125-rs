@@ -24,6 +24,7 @@
 #include <linux/ipv6.h>
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
+#include <linux/swab.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <net/ip6_checksum.h>
@@ -36,6 +37,7 @@
 #define R8125_TCPHO_SHIFT	18
 #define R8125_TCPHO_MAX		0x3ffU
 #define R8125_TX_CSUM_OPTS_DROP	0xffffffffU
+#define R8125_TX_VLAN_TAG	BIT(17)
 
 /* RX descriptor opts1 bits. */
 #define R8125_RX_PID0		BIT(17)	/* TCP if set */
@@ -46,30 +48,75 @@
 #define R8125_RX_TCPFAIL	BIT(14)
 #define R8125_RX_FAIL_MASK	(R8125_RX_IPFAIL | R8125_RX_UDPFAIL | R8125_RX_TCPFAIL)
 
-/* 8125 hardware errata: UDP frames whose transport-data portion is
- * shorter than this length get a wrong UDP checksum from the chip.
- * Upstream r8169 has the same workaround at RTL_MIN_PATCH_LEN = 47
- * (r8169_main.c:4395).
+/* 8125 pad quirk: r8169 and the vendor driver only patch PTP UDP event
+ * frames (ports 319/320) whose transport-data portion is shorter than this
+ * length, plus packets too short to contain the transport header. Normal
+ * checksum-partial short UDP should stay on hardware checksum.
  */
 #define R8125_MIN_UDP_PATCH_LEN	47
+#define R8125_PTP_EVENT_PORT0	319
+#define R8125_PTP_EVENT_PORT1	320
 
-static bool r8125_short_udp_needs_sw_csum(struct sk_buff *skb)
+static unsigned int r8125_quirk_udp_padto(struct sk_buff *skb)
 {
-	unsigned int trans_data_len;
+	unsigned int padto = 0;
+	int trans_data_len;
 
 	if (!skb_transport_header_was_set(skb))
-		return false;
+		return 0;
+	if (skb->len >= 128 + R8125_MIN_UDP_PATCH_LEN)
+		return 0;
+
 	trans_data_len = skb_tail_pointer(skb) - skb_transport_header(skb);
-	return trans_data_len < R8125_MIN_UDP_PATCH_LEN;
+	if (trans_data_len >= offsetof(struct udphdr, len) &&
+	    trans_data_len < R8125_MIN_UDP_PATCH_LEN) {
+		u16 dest = ntohs(udp_hdr(skb)->dest);
+
+		if (dest == R8125_PTP_EVENT_PORT0 ||
+		    dest == R8125_PTP_EVENT_PORT1)
+			padto = skb->len + R8125_MIN_UDP_PATCH_LEN -
+				trans_data_len;
+	}
+	if (trans_data_len < (int)sizeof(struct udphdr)) {
+		int pad_len = (int)sizeof(struct udphdr) - trans_data_len;
+
+		padto = max_t(unsigned int, padto,
+			      skb->len + (unsigned int)pad_len);
+	}
+
+	return padto;
 }
 
-u32 r8125_bridge_skb_tx_csum_opts(struct sk_buff *skb)
+static u32 r8125_sw_csum_after_pad(struct sk_buff *skb, unsigned int padto)
+{
+	if (padto && __skb_put_padto(skb, padto, false))
+		return R8125_TX_CSUM_OPTS_DROP;
+	if (skb_checksum_help(skb))
+		return R8125_TX_CSUM_OPTS_DROP;
+	return 0;
+}
+
+static u32 r8125_bridge_skb_tx_vlan_opts(struct sk_buff *skb)
+{
+	if (skb_vlan_tag_present(skb))
+		return R8125_TX_VLAN_TAG | swab16(skb_vlan_tag_get(skb));
+	return 0;
+}
+
+static u32 r8125_bridge_skb_tx_csum_opts(struct sk_buff *skb)
 {
 	u32 opts2 = 0;
+	unsigned int padto = 0;
 	u8 ip_proto;
 
-	if (skb->ip_summed != CHECKSUM_PARTIAL)
+	if (skb->len < ETH_ZLEN)
+		padto = ETH_ZLEN;
+
+	if (skb->ip_summed != CHECKSUM_PARTIAL) {
+		if (padto && __skb_put_padto(skb, padto, false))
+			return R8125_TX_CSUM_OPTS_DROP;
 		return 0;
+	}
 
 	switch (vlan_get_protocol(skb)) {
 	case htons(ETH_P_IP):
@@ -81,27 +128,23 @@ u32 r8125_bridge_skb_tx_csum_opts(struct sk_buff *skb)
 		ip_proto = ipv6_hdr(skb)->nexthdr;
 		break;
 	default:
-		return 0;
+		return r8125_sw_csum_after_pad(skb, padto);
 	}
 
 	if (skb_transport_offset(skb) > R8125_TCPHO_MAX)
-		return 0;	/* header too far in; kernel does SW csum */
+		return r8125_sw_csum_after_pad(skb, padto);
 
 	if (ip_proto == IPPROTO_TCP) {
+		if (padto)
+			return r8125_sw_csum_after_pad(skb, padto);
 		opts2 |= R8125_TD1_TCP_CS;
 	} else if (ip_proto == IPPROTO_UDP) {
-		if (r8125_short_udp_needs_sw_csum(skb)) {
-			/* Chip miscomputes UDP CSUM for short transport-data
-			 * frames (vendor errata). Force the kernel to do it
-			 * in software and submit a fully-checksummed frame.
-			 */
-			if (skb_checksum_help(skb))
-				return R8125_TX_CSUM_OPTS_DROP;
-			return 0;
-		}
+		padto = max_t(unsigned int, padto, r8125_quirk_udp_padto(skb));
+		if (padto)
+			return r8125_sw_csum_after_pad(skb, padto);
 		opts2 |= R8125_TD1_UDP_CS;
 	} else {
-		return 0;
+		return r8125_sw_csum_after_pad(skb, padto);
 	}
 
 	opts2 |= (u32)skb_transport_offset(skb) << R8125_TCPHO_SHIFT;
@@ -151,11 +194,6 @@ void r8125_bridge_account_tx(struct net_device *ndev, unsigned int bytes)
 #define R8125_GTTCPHO_MAX	0x7fU
 #define R8125_TD1_MSS_SHIFT	18	/* opts2 MSS position (11 bits) */
 
-unsigned int r8125_bridge_skb_nr_frags(struct sk_buff *skb)
-{
-	return (unsigned int)skb_shinfo(skb)->nr_frags;
-}
-
 int r8125_bridge_skb_data_dma_map(struct device *dev, struct sk_buff *skb,
 				  dma_addr_t *out_handle, unsigned int *out_len)
 {
@@ -200,8 +238,8 @@ int r8125_bridge_skb_frag_dma_map(struct device *dev, struct sk_buff *skb,
 	return 0;
 }
 
-bool r8125_bridge_skb_tso_setup(struct sk_buff *skb,
-				u32 *opts1_bits, u32 *opts2_bits)
+static bool r8125_bridge_skb_tso_setup(struct sk_buff *skb,
+				       u32 *opts1_bits, u32 *opts2_bits)
 {
 	struct skb_shared_info *shinfo = skb_shinfo(skb);
 	unsigned int mss = shinfo->gso_size;
@@ -237,18 +275,97 @@ bool r8125_bridge_skb_tso_setup(struct sk_buff *skb,
 	return true;
 }
 
-void r8125_bridge_skb_consume_tx(struct net_device *ndev, struct sk_buff *skb)
+int r8125_bridge_skb_tx_offload_prepare(struct sk_buff *skb, u32 *opts1_bits,
+					u32 *opts2_bits,
+					unsigned int *nr_frags)
+{
+	bool is_gso = skb_shinfo(skb)->gso_size;
+
+	*opts1_bits = 0;
+	*opts2_bits = 0;
+
+	if (is_gso) {
+		if (!r8125_bridge_skb_tso_setup(skb, opts1_bits, opts2_bits))
+			return -EIO;
+		*opts2_bits |= r8125_bridge_skb_tx_vlan_opts(skb);
+		*nr_frags = (unsigned int)skb_shinfo(skb)->nr_frags;
+		return 0;
+	}
+
+	*opts2_bits = r8125_bridge_skb_tx_csum_opts(skb);
+	if (*opts2_bits == R8125_TX_CSUM_OPTS_DROP)
+		return -EIO;
+	*opts2_bits |= r8125_bridge_skb_tx_vlan_opts(skb);
+	*nr_frags = (unsigned int)skb_shinfo(skb)->nr_frags;
+	return 0;
+}
+
+unsigned int r8125_bridge_skb_consume_tx(struct net_device *ndev,
+					 struct sk_buff *skb)
 {
 	struct r8125_bridge *b = ndev ? netdev_priv(ndev) : NULL;
-
-	/* Account BEFORE napi_consume_skb — once consumed the pointer is
-	 * stale. The byte count comes from skb->len (the full logical-
-	 * packet size including all paged frags), not from any single
-	 * descriptor's LEN field (chip clears those on completion).
+	/* Snapshot wire length BEFORE napi_consume_skb — once consumed the
+	 * pointer is stale. skb->len is the full logical-packet size (incl.
+	 * all paged frags). Returned so the NAPI reaper can batch it into
+	 * netdev_completed_queue() for BQL (must balance netdev_sent_queue).
 	 */
+	unsigned int len = skb->len;
+
 	if (b)
 		this_cpu_inc(*b->tx_consumed);
 	if (ndev)
-		r8125_bridge_account_tx(ndev, skb->len);
+		r8125_bridge_account_tx(ndev, len);
 	napi_consume_skb(skb, 1);
+	return len;
+}
+
+/* Wire length (skb->len) for the BQL sent_queue at the xmit commit. */
+unsigned int r8125_bridge_skb_len(const struct sk_buff *skb)
+{
+	return skb->len;
+}
+
+/* ── BQL (byte queue limits) — Approach A (docs/BQL_RETRY_PLAN.md) ─────────
+ * Keeps the driver TX ring shallow so the qdisc (fq_codel) can protect
+ * latency-sensitive flows under a saturated bulk TX. We deliberately do NOT
+ * call netdev_reset_queue() (would set dql.limit=0 → bootstrap XOFF stall);
+ * instead we seed dql.min_limit at open so the first xmit can't drive
+ * dql_avail negative. r8169's rtl_open never resets the queue either.
+ */
+
+/* Seed dql.min_limit to one full current-MTU frame + headroom so the very
+ * first xmit keeps dql_avail >= 0. Idempotent; call once per ndo_open.
+ */
+void r8125_bridge_dql_seed_min_limit(struct net_device *ndev)
+{
+	struct netdev_queue *txq = netdev_get_tx_queue(ndev, 0);
+	unsigned int seed = READ_ONCE(ndev->mtu) + VLAN_ETH_HLEN + NET_SKB_PAD;
+
+	__netif_tx_lock_bh(txq);
+	netdev_queue_set_dql_min_limit(txq, seed);
+	/* There is no netdev helper for the bootstrap limit floor. Without this,
+	 * dql_avail can remain negative on the first sent_queue() even though
+	 * min_limit was set, reproducing the zero-limit BQL stall.
+	 */
+	if (txq->dql.limit < seed)
+		txq->dql.limit = seed;
+	__netif_tx_unlock_bh(txq);
+}
+
+/* Feed dql at the xmit commit and return whether the TX doorbell must be rung.
+ * This is the r8169 pattern: __netdev_sent_queue() folds netdev_xmit_more()
+ * into BQL so batched packets only defer the doorbell while the queue is not
+ * already stopped.
+ */
+bool r8125_bridge_netdev_sent_queue(struct net_device *ndev,
+				    unsigned int bytes, bool xmit_more)
+{
+	return __netdev_sent_queue(ndev, bytes, xmit_more);
+}
+
+/* Feed completed (pkts, bytes) once per NAPI TX reap; auto-wakes the queue. */
+void r8125_bridge_netdev_completed_queue(struct net_device *ndev,
+					 unsigned int pkts, unsigned int bytes)
+{
+	netdev_completed_queue(ndev, pkts, bytes);
 }

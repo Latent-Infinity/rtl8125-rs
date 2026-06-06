@@ -126,11 +126,12 @@ unsafe impl FromBytes for Descriptor {}
 /// we use `BridgeOps` in Rust and don't need to name the parameter.
 #[repr(C)]
 pub(crate) struct BridgeOps {
-    pub open: extern "C" fn(cookie: *mut c_void) -> c_int,
+    pub open: extern "C" fn(cookie: *mut c_void, feature_flags: u32) -> c_int,
     pub stop: extern "C" fn(cookie: *mut c_void),
     pub xmit: extern "C" fn(cookie: *mut c_void, skb: *mut bindings::sk_buff) -> c_int,
     pub poll: extern "C" fn(cookie: *mut c_void, budget: c_int) -> c_int,
     pub change_mtu: extern "C" fn(cookie: *mut c_void, new_mtu: c_int) -> c_int,
+    pub set_features: extern "C" fn(cookie: *mut c_void, feature_flags: u32) -> c_int,
 }
 
 // Bindgen emits `pci_dev` / `net_device` / `sk_buff` as opaque
@@ -163,6 +164,7 @@ extern "C" {
     fn r8125_bridge_dma_wmb();
     fn r8125_bridge_tx_stop_queue(ndev: *mut bindings::net_device);
     fn r8125_bridge_tx_wake_queue(ndev: *mut bindings::net_device);
+    fn r8125_bridge_netdev_xmit_more() -> bool;
     fn r8125_bridge_tx_disable(ndev: *mut bindings::net_device);
     fn r8125_bridge_carrier_off(ndev: *mut bindings::net_device);
 
@@ -178,11 +180,7 @@ extern "C" {
     );
     fn r8125_bridge_tx_busy_exception(ndev: *mut bindings::net_device);
 
-    // ── HW checksum offload + stats (M4-perf, task 48) ──────────────────
-    fn r8125_bridge_skb_tx_csum_opts(skb: *mut bindings::sk_buff) -> u32;
-
     // ── Scatter-gather + TSO (M4-perf phase 2, task 49) ─────────────────
-    fn r8125_bridge_skb_nr_frags(skb: *mut bindings::sk_buff) -> u32;
     fn r8125_bridge_skb_data_dma_map(
         dev: *mut bindings::device,
         skb: *mut bindings::sk_buff,
@@ -196,12 +194,28 @@ extern "C" {
         out_handle: *mut bindings::dma_addr_t,
         out_len: *mut u32,
     ) -> c_int;
-    fn r8125_bridge_skb_tso_setup(
+    fn r8125_bridge_skb_tx_offload_prepare(
         skb: *mut bindings::sk_buff,
         out_opts1: *mut u32,
         out_opts2: *mut u32,
+        out_nr_frags: *mut u32,
+    ) -> c_int;
+    fn r8125_bridge_skb_consume_tx(
+        ndev: *mut bindings::net_device,
+        skb: *mut bindings::sk_buff,
+    ) -> c_uint;
+    fn r8125_bridge_skb_len(skb: *const bindings::sk_buff) -> c_uint;
+    fn r8125_bridge_dql_seed_min_limit(ndev: *mut bindings::net_device);
+    fn r8125_bridge_netdev_sent_queue(
+        ndev: *mut bindings::net_device,
+        bytes: c_uint,
+        xmit_more: bool,
     ) -> bool;
-    fn r8125_bridge_skb_consume_tx(ndev: *mut bindings::net_device, skb: *mut bindings::sk_buff);
+    fn r8125_bridge_netdev_completed_queue(
+        ndev: *mut bindings::net_device,
+        pkts: c_uint,
+        bytes: c_uint,
+    );
 
     // ── PHY plumbing (M4-traffic) ────────────────────────────────────────
     fn r8125_bridge_phy_register(
@@ -239,6 +253,7 @@ extern "C" {
         buf: *const core::ffi::c_void,
         len: usize,
         desc_opts1: u32,
+        desc_opts2: u32,
         new_cpu: *mut *mut c_void,
         new_dma: *mut bindings::dma_addr_t,
     );
@@ -479,6 +494,7 @@ pub(crate) fn bridge_rx_one_packet(
     buf: *const core::ffi::c_void,
     len: usize,
     desc_opts1: u32,
+    desc_opts2: u32,
 ) -> (*mut c_void, bindings::dma_addr_t) {
     let mut new_cpu = buf.cast_mut();
     let mut new_dma: bindings::dma_addr_t = dma;
@@ -490,6 +506,7 @@ pub(crate) fn bridge_rx_one_packet(
             buf,
             len,
             desc_opts1,
+            desc_opts2,
             core::ptr::from_mut(&mut new_cpu),
             core::ptr::from_mut(&mut new_dma),
         )
@@ -726,6 +743,19 @@ pub(crate) fn bridge_tx_wake_queue(ndev: *mut bindings::net_device) {
     unsafe { r8125_bridge_tx_wake_queue(ndev) };
 }
 
+/// `netdev_xmit_more()` — does the qdisc have more packets queued behind this
+/// one in the current xmit burst? A batching hint only: when true the driver
+/// may defer the TX doorbell to the last packet of the burst (xmit_more ==
+/// false) to amortize the MMIO write. Reads the net core's per-CPU xmit state;
+/// it is independent of BQL, so it is MSI-safe.
+///
+/// # SAFETY: callable from any `ndo_start_xmit` context — it only reads the
+/// per-CPU state the net core sets before invoking the driver's xmit.
+pub(crate) fn netdev_xmit_more() -> bool {
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_netdev_xmit_more() }
+}
+
 pub(crate) fn bridge_tx_disable(ndev: *mut bindings::net_device) {
     // SAFETY: ndev alive.
     unsafe { r8125_bridge_tx_disable(ndev) };
@@ -854,32 +884,35 @@ pub(crate) fn skb_free_error(skb: *mut bindings::sk_buff) {
     unsafe { r8125_bridge_skb_free_error(skb) };
 }
 
-// ── HW checksum offload + stats safe wrappers (M4-perf, task 48) ────────
-
-/// Returns the `opts2` bits to OR into the TX descriptor for HW CSUM,
-/// or 0 to leave the descriptor unannotated (kernel did SW CSUM, or no
-/// CSUM requested). For short UDP frames hitting the chip errata, the
-/// cshim falls back to `skb_checksum_help` internally and returns 0. If
-/// that software fallback fails, it returns [`crate::regs::TX_CSUM_OPTS_DROP`]
-/// and the caller must drop the skb before DMA mapping.
-///
-/// # SAFETY: `skb` is the kernel-allocated buffer we just received from
-/// ndo_start_xmit — alive and exclusively owned by the driver right now.
-pub(crate) fn skb_tx_csum_opts(skb: *mut bindings::sk_buff) -> u32 {
-    // SAFETY: see fn-level contract.
-    unsafe { r8125_bridge_skb_tx_csum_opts(skb) }
-}
-
 // ── Scatter-gather + TSO safe wrappers (M4-perf phase 2, task 49) ───────
 
-/// Number of paged fragments in `skb` (0 if linear-only). The Rust TX
-/// path uses this to decide how many descriptors to post.
+/// Combined TX offload prep. Fills descriptor `opts1`/`opts2` bits and returns
+/// the post-mutation fragment count in one FFI crossing.
+///
+/// Normal TCP/UDP `CHECKSUM_PARTIAL` packets stay on hardware checksum. The C
+/// shim only falls back to software checksum for unsupported protocols,
+/// transport offsets the hardware cannot encode, ETH_ZLEN padding, or the
+/// narrow RTL8125 UDP pad quirk also used by r8169/vendor sources.
 ///
 /// # SAFETY: `skb` is the kernel-allocated buffer just received from
-/// ndo_start_xmit — alive and driver-owned at this moment.
-pub(crate) fn skb_nr_frags(skb: *mut bindings::sk_buff) -> u32 {
+/// ndo_start_xmit. The C side may mutate `skb` (`skb_cow_head` +
+/// `tcp_v6_gso_csum_prep` for IPv6 TSO, or pad/software-checksum for the
+/// narrow quirk), so callers must run this before DMA mapping.
+pub(crate) fn skb_tx_offload_prepare(skb: *mut bindings::sk_buff) -> Result<(u32, u32, u32)> {
+    let mut opts1 = 0u32;
+    let mut opts2 = 0u32;
+    let mut nr_frags = 0u32;
     // SAFETY: see fn-level contract.
-    unsafe { r8125_bridge_skb_nr_frags(skb) }
+    let rc = unsafe {
+        r8125_bridge_skb_tx_offload_prepare(
+            skb,
+            core::ptr::from_mut(&mut opts1),
+            core::ptr::from_mut(&mut opts2),
+            core::ptr::from_mut(&mut nr_frags),
+        )
+    };
+    to_result(rc)?;
+    Ok((opts1, opts2, nr_frags))
 }
 
 /// DMA-map the LINEAR head of `skb`. Returns the mapping length on
@@ -938,36 +971,56 @@ pub(crate) fn skb_frag_dma_map(
 /// # SAFETY: `ndev` is the registered net_device (alive while
 /// NetdevHandle lives); `skb` was just removed from the TX shadow and is
 /// driver-owned exclusively at this point.
-pub(crate) fn skb_consume_tx(ndev: *mut bindings::net_device, skb: *mut bindings::sk_buff) {
+pub(crate) fn skb_consume_tx(
+    ndev: *mut bindings::net_device,
+    skb: *mut bindings::sk_buff,
+) -> usize {
     // SAFETY: see fn-level contract.
-    unsafe { r8125_bridge_skb_consume_tx(ndev, skb) };
+    unsafe { r8125_bridge_skb_consume_tx(ndev, skb) as usize }
 }
 
-/// TSO descriptor-bit setup. Returns `Some((opts1_bits, opts2_bits))`
-/// if the skb is a TCPv4/v6 GSO super-skb, `None` otherwise (caller
-/// uses plain CSUM bits instead).
+/// Wire length (`skb->len`), read in `ndo_start_xmit` before the skb is
+/// handed to the ring, for the BQL `netdev_sent_queue` at the commit point.
 ///
-/// # SAFETY: `skb` is the kernel-allocated buffer just received from
-/// ndo_start_xmit. The C side may mutate `skb` (calls `skb_cow_head`
-/// + `tcp_v6_gso_csum_prep` for IPv6 TSO), but only on skbs the driver
-///
-/// owns exclusively.
-pub(crate) fn skb_tso_setup(skb: *mut bindings::sk_buff) -> Option<(u32, u32)> {
-    let mut opts1 = 0u32;
-    let mut opts2 = 0u32;
+/// # SAFETY: `skb` is the driver-owned skb passed into `ndo_start_xmit`.
+pub(crate) fn skb_len(skb: *const bindings::sk_buff) -> usize {
     // SAFETY: see fn-level contract.
-    let active = unsafe {
-        r8125_bridge_skb_tso_setup(
-            skb,
-            core::ptr::from_mut(&mut opts1),
-            core::ptr::from_mut(&mut opts2),
-        )
-    };
-    if active {
-        Some((opts1, opts2))
-    } else {
-        None
-    }
+    unsafe { r8125_bridge_skb_len(skb) as usize }
+}
+
+/// BQL: seed `dql.min_limit` at ndo_open (Approach A) so the first xmit
+/// can't drive `dql_avail` negative (no `netdev_reset_queue`). Idempotent.
+///
+/// # SAFETY: `ndev` is the registered net_device; called from ndo_open with
+/// the TX queue set up.
+pub(crate) fn dql_seed_min_limit(ndev: *mut bindings::net_device) {
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_dql_seed_min_limit(ndev) };
+}
+
+/// BQL: feed `bytes` to dql at the xmit commit and return whether the TX
+/// doorbell must be rung. This wraps the kernel's `__netdev_sent_queue()`,
+/// which accounts batched `xmit_more` packets without setting STACK_XOFF until
+/// the batch end, while still forcing a doorbell if the queue is already
+/// stopped.
+///
+/// # SAFETY: `ndev` is the registered net_device.
+pub(crate) fn netdev_sent_queue(
+    ndev: *mut bindings::net_device,
+    bytes: usize,
+    xmit_more: bool,
+) -> bool {
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_netdev_sent_queue(ndev, bytes as c_uint, xmit_more) }
+}
+
+/// BQL: feed completed `(pkts, bytes)` to dql once per NAPI TX reap; balances
+/// the per-packet `netdev_sent_queue` and auto-wakes the queue.
+///
+/// # SAFETY: `ndev` is the registered net_device.
+pub(crate) fn netdev_completed_queue(ndev: *mut bindings::net_device, pkts: usize, bytes: usize) {
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_netdev_completed_queue(ndev, pkts as c_uint, bytes as c_uint) };
 }
 
 // ── PHY plumbing safe wrappers (M4-traffic) ──────────────────────────────

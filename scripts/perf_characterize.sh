@@ -21,6 +21,13 @@
 #   scripts/perf_characterize.sh
 #   IFACE=enp3s0 PEER=10.0.0.1 scripts/perf_characterize.sh
 #   ONLY=2b scripts/perf_characterize.sh   # one sub-run only
+#
+# KVM/debug-guest note:
+#   Single-stream UDP TX at MTU 1500 is an iperf3/userspace packet-rate
+#   bottleneck on the KVM guest, and collapses for both r8169 and this driver.
+#   The default 2d guest→host UDP-1500 shape therefore uses 10 streams at
+#   250M each. Override UDP_G2H_1500_STREAMS=1 UDP_G2H_1500_BITRATE=3G when
+#   intentionally measuring the single-stream iperf3 ceiling.
 
 set -uo pipefail
 
@@ -33,6 +40,9 @@ LOCAL_PREFIX=${LOCAL_PREFIX:-24}
 PORT=${PORT:-5380}
 RUN_SECS=${RUN_SECS:-10}
 ONLY=${ONLY:-}                          # "2a" | "2b" | "2c" | "2d" | ""
+UDP_DEFAULT_BITRATE=${UDP_DEFAULT_BITRATE:-3G}
+UDP_G2H_1500_STREAMS=${UDP_G2H_1500_STREAMS:-10}
+UDP_G2H_1500_BITRATE=${UDP_G2H_1500_BITRATE:-250M}
 
 STAMP=$(date -u +'%Y%m%d_%H%M%S')
 OUT_DIR="$ROOT/docs/perf/captures/${STAMP}"
@@ -64,6 +74,28 @@ gbps() {
 	awk "BEGIN { printf \"%.3f\", $1/1e9 }"
 }
 
+udp_shape() {
+	local dir="$1" mtu="$2"
+	if [[ "$dir" == "g2h" && "$mtu" == "1500" ]]; then
+		printf '%sx%s' "$UDP_G2H_1500_STREAMS" "$UDP_G2H_1500_BITRATE"
+	else
+		printf '1x%s' "$UDP_DEFAULT_BITRATE"
+	fi
+}
+
+udp_args_for() {
+	local dir="$1" mtu="$2" blk="$3"
+	UDP_ARGS=(-u -l "$blk")
+	if [[ "$dir" == "g2h" && "$mtu" == "1500" ]]; then
+		UDP_ARGS+=(-b "$UDP_G2H_1500_BITRATE")
+		if (( UDP_G2H_1500_STREAMS > 1 )); then
+			UDP_ARGS+=(-P "$UDP_G2H_1500_STREAMS")
+		fi
+	else
+		UDP_ARGS+=(-b "$UDP_DEFAULT_BITRATE")
+	fi
+}
+
 # Address must be ready.
 sudo ip addr add "$LOCAL_IP/$LOCAL_PREFIX" dev "$IFACE" 2>/dev/null || true
 
@@ -72,6 +104,7 @@ cat > "$SUMMARY" <<EOF
 
 - Iface: $IFACE  ($LOCAL_IP/$LOCAL_PREFIX → $PEER:$PORT)
 - iperf3 duration: ${RUN_SECS}s per direction
+- UDP default bitrate: ${UDP_DEFAULT_BITRATE}; UDP g2h MTU1500 shape: $(udp_shape g2h 1500)
 - Driver: r8125_rust (commit $(cd "$ROOT" && git rev-parse --short HEAD 2>/dev/null))
 - Kernel: $(uname -r)
 
@@ -181,7 +214,8 @@ sub_2d() {
 		for dir in g2h h2g; do
 			flag=""
 			[[ "$dir" == "h2g" ]] && flag="-R"
-			iperf3 -c "$PEER" -B "$LOCAL_IP" -p "$PORT" -t "$RUN_SECS" -u -l "$blk" -b 3G -J $flag \
+			udp_args_for "$dir" "$mtu" "$blk"
+			iperf3 -c "$PEER" -B "$LOCAL_IP" -p "$PORT" -t "$RUN_SECS" "${UDP_ARGS[@]}" -J $flag \
 				> "$OUT_DIR/2d_${dir}_udp_${mtu}.json" 2>&1 || true
 		done
 	done
@@ -191,8 +225,8 @@ sub_2d() {
 		echo
 		echo "## 2d — Fresh capture matrix"
 		echo
-		echo "| Proto | Dir | MTU | Throughput | Retr / Loss |"
-		echo "|---|---|---:|---:|---:|"
+		echo "| Proto | Dir | MTU | Throughput | Retr / Loss | Shape |"
+		echo "|---|---|---:|---:|---:|---|"
 		for mtu in 1500 9000; do
 			for proto in tcp udp; do
 				for dir in g2h h2g; do
@@ -202,10 +236,10 @@ sub_2d() {
 						gb=$(gbps "$bps")
 						if [[ "$proto" == "tcp" ]]; then
 							retr=$(extract_retr "$f")
-							echo "| TCP | $dir | $mtu | $gb Gbps | $retr retr |"
+							echo "| TCP | $dir | $mtu | $gb Gbps | $retr retr | single stream |"
 						else
 							loss=$(extract_loss "$f")
-							echo "| UDP | $dir | $mtu | $gb Gbps | $loss % loss |"
+							echo "| UDP | $dir | $mtu | $gb Gbps | $loss % loss | $(udp_shape "$dir" "$mtu") |"
 						fi
 					fi
 				done
@@ -224,7 +258,7 @@ cat >> "$SUMMARY" <<EOF
 ## Next steps
 
 1. Paste the 2d table rows into \`docs/perf/r8169_comparison.md\`
-   under §"TCP, single stream" + §"UDP, single stream" to close
+   under §"TCP, single stream" + §"UDP" to close
    the *pending* lines.
 2. Paste the 2a + 2b + 2c sections into a new §"Tier 2 expanded
    capture" of \`r8169_comparison.md\`.

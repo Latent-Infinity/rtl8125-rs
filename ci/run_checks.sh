@@ -17,6 +17,9 @@ echo
 echo "== checksum/stat offload path =="
 bash "$CI/check_offload_path.sh" || rc=1
 echo
+echo "== hardware offload feature advertisement =="
+bash "$CI/check_hw_offload_features.sh" || rc=1
+echo
 echo "== RX skb-build hot path =="
 bash "$CI/check_rx_skb_build.sh" || rc=1
 echo
@@ -40,6 +43,9 @@ bash "$CI/check_cache_padding.sh" || rc=1
 echo
 echo "== M5 NAPI contract (poll budget, IRQ masking, queue hysteresis) =="
 bash "$CI/check_napi_contract.sh" || rc=1
+echo
+echo "== BQL sent/completed accounting contract =="
+bash "$CI/check_bql_accounting.sh" || rc=1
 echo
 echo "== clean implementation-contract docs =="
 bash "$CI/check_clean_contract_docs.sh" || rc=1

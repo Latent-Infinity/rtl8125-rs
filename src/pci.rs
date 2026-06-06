@@ -43,7 +43,7 @@ use kernel::{
     device::Core, devres::Devres, error::code::ENODEV, pci, prelude::*, sync::aref::ARef,
 };
 
-use core::sync::atomic::AtomicPtr;
+use core::sync::atomic::{AtomicBool, AtomicPtr};
 
 use crate::hw;
 use crate::mmio::{self, Regs};
@@ -253,14 +253,25 @@ impl pci::Driver for R8125Driver {
                         )?;
                         (IrqMode::Intx, false)
                     } else {
-                        // Prefer MSI-X first so the V2 ISR surface can stay
-                        // enabled where supported. If only MSI is available,
-                        // keep Msi mode but disable V2 and fall back to
-                        // legacy ISR layout.
+                        // Prefer MSI-X → MSI → INTx for delivery, but ALWAYS
+                        // use the legacy combined ISR/IMR surface (use_v2 =
+                        // false). The V2 per-queue ISR surface routes each
+                        // source to MSI-X entry == its bit position (RX Q0 →
+                        // entry 0, TX Q0 → entry 16); the vendor r8125 driver
+                        // only enables it with ≥ R8125_MIN_MSIX_VEC_8125B (22)
+                        // vectors allocated, and downgrades to the legacy
+                        // surface (HwCurrIsrVer = 1) otherwise. We allocate a
+                        // single vector, so under V2 the TX-completion message
+                        // (entry 16) is never delivered — TX-only flows (e.g.
+                        // unidirectional UDP) wedge because completions are
+                        // only reaped when an RX interrupt happens to run NAPI.
+                        // The legacy combined ISR (0x3C/0x38) delivers RxOK and
+                        // TxOK on the one vector, matching mainline r8169. See
+                        // docs/perf/byte_budget_20260605/UDP_TX_WEDGE.md.
                         let msix_only =
                             pci::IrqTypes::default().with(pci::IrqType::MsiX);
                         if unsafe_boundary::alloc_one_irq_vector(pdev, msix_only).is_ok() {
-                            (IrqMode::Msi, true)
+                            (IrqMode::Msi, false)
                         } else {
                             match unsafe_boundary::alloc_one_irq_vector(
                                 pdev,
@@ -375,6 +386,8 @@ impl pci::Driver for R8125Driver {
                             pdev: pdev.into(),
                             bar_ptr,
                             ndev: AtomicPtr::new(core::ptr::null_mut()),
+                            debug_counters: AtomicBool::new(false),
+                            bql_enabled: AtomicBool::new(false),
                             tx <- crate::netdev::TxRingState::new(
                                 tx_ring.desc_ptr_mut(),
                                 tx_ring.dma_handle(),

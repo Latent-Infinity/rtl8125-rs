@@ -119,12 +119,22 @@ pub(crate) const INT_CFG0: usize = 0x34;
 /// are authoritative. Set by `ndo_open` only when probe allocated an
 /// MSI/MSI-X vector.
 pub(crate) const INT_CFG0_ENABLE_8125: u8 = 0x01;
-/// `INT_CFG1` (16-bit at 0x7A) — write 0x0000 to disable interrupt
-/// coalescing on MAC_VER_63 (RTL8125B) per r8169.
+/// `INT_CFG0` bit 1 — timeout-bypass for the 8125 interrupt-mitigation block.
+/// r8169 clears this by writing `INT_CFG0 = 0`; the vendor driver clears it in
+/// `rtl8125_hw_clear_int_miti()`. Leaving it set can bypass the 0xa00 table.
+pub(crate) const INT_CFG0_TIMEOUT0_BYPASS_8125: u8 = 0x02;
+/// `INT_CFG0` bit 2 — mitigation-bypass for the 8125 interrupt-mitigation block.
+/// Clear before programming `INT_MITI_V2_*` timers on either legacy or V2
+/// interrupt surface.
+pub(crate) const INT_CFG0_MITIGATION_BYPASS_8125: u8 = 0x04;
+/// `INT_CFG1` (16-bit at 0x7A). r8169 and the vendor driver write 0x0000
+/// while clearing the MAC_VER_63 (RTL8125B) INT_MITI table.
 pub(crate) const INT_CFG1: usize = 0x7A;
-/// 8125 INT_MITI_V2 per-vector interrupt-moderation table. Each MSI(-X)
-/// vector gets an 8-byte slot: a 16-bit RX timer at +0 and a 16-bit TX
-/// timer at +2. We drive only queue 0 (vector 0).
+/// 8125 INT_MITI per-vector interrupt-moderation table. Vendor names this
+/// `INT_MITI_V2`, but the timer block is still the 8125 moderation surface
+/// when the chip delivers interrupts through the legacy ISR/IMR window. Each
+/// vector gets an 8-byte slot: a 16-bit RX timer at +0 and a 16-bit TX timer
+/// at +2. We drive only queue 0 (vector 0).
 pub(crate) const INT_MITI_V2_0_RX: usize = 0xA00;
 pub(crate) const INT_MITI_V2_0_TX: usize = 0xA02;
 /// Per-VER coalescing-table region: r8169 zeros 0xa00..0xa80 step 4 for
@@ -132,13 +142,18 @@ pub(crate) const INT_MITI_V2_0_TX: usize = 0xA02;
 /// We target VER_63 only.
 pub(crate) const COALESCE_TABLE_8125B_START: usize = 0xA00;
 pub(crate) const COALESCE_TABLE_8125B_END: usize = 0xA80;
-/// RX moderation timer for vector 0. Empirically tuned on the bare-metal
-/// gateway (docs/perf/cvr_20260604): 0x10 cuts the IRQ storm 7.5x with
-/// 0% loss in 64B RX tests.
-pub(crate) const RX_COALESCE_TIMER_8125B: u16 = 0x0010;
-/// TX moderation timer for vector 0 — 0 keeps TX completions prompt and
-/// avoids re-adding the BQL latency path we removed.
-pub(crate) const TX_COALESCE_TIMER_8125B: u16 = 0x0000;
+/// Candidate RX moderation timer for vector 0. `0x10` eliminated 64/128B
+/// packet loss but capped peak RX pps versus r8169, so the next validation
+/// pass starts lower and sweeps via the module parameter.
+pub(crate) const RX_COALESCE_TIMER_8125B_DEFAULT: u16 = 0x0008;
+/// Candidate TX moderation timer for vector 0. BQL is disabled on the tracked
+/// MSI path by default, so TX-completion timing is still swept separately from
+/// the INTx+BQL latency fix.
+pub(crate) const TX_COALESCE_TIMER_8125B_DEFAULT: u16 = 0x0010;
+
+// RTL8125B repurposes the older 8168/8169 `IntrMitigate` register at 0xE2 as
+// RX/TX FIFO-empty status (`RxTxFifo` in vendor references). Do not use 0xE2
+// for interrupt moderation on 8125-family chips; use the INT_MITI table above.
 
 // ── Configuration-register lock (Cfg9346 at 0x50, 8-bit) ────────────────
 //
@@ -255,11 +270,6 @@ pub(crate) const MII_PAGE_SELECT: u8 = 0x1F;
 pub(crate) const MDIO_MMD_VEND2: i32 = 31;
 pub(crate) const MDIO_STAT2: i32 = 8;
 
-// Sentinel returned by the cshim TX checksum helper when software checksum
-// completion failed. This is not a valid opts2 combination: real checksum
-// offload uses bits 28..31 plus TCPHO bits 18..27.
-pub(crate) const TX_CSUM_OPTS_DROP: u32 = 0xFFFF_FFFF;
-
 // ── TPPoll — 8125 layout (TxPoll_8125 = 0x90, 16-bit, NPQ = BIT(0)) ──────
 pub(crate) const TPPOLL: usize = 0x90;
 /// `NPQ` — Normal Priority Queue kick bit (write to TPPOLL after posting TX).
@@ -316,6 +326,11 @@ pub(crate) const CPLUSCMD: usize = 0xE0;
 pub(crate) const CPLUSCMD_RX_CHKSUM: u16 = 0x0020;
 #[allow(dead_code)]
 pub(crate) const CPLUSCMD_RX_VLAN: u16 = 0x0040;
+/// RTL8125 RxConfig VLAN strip enables. r8169 programs these instead of the
+/// older CPlusCmd RxVlan bit for 8125-family chips.
+pub(crate) const RX_VLAN_INNER_8125: u32 = 1 << 22;
+pub(crate) const RX_VLAN_OUTER_8125: u32 = 1 << 23;
+pub(crate) const RX_VLAN_8125: u32 = RX_VLAN_INNER_8125 | RX_VLAN_OUTER_8125;
 
 // ── RxMaxSize (MMIO 0xDA, 16-bit) — max RX frame the chip will accept ───
 pub(crate) const RX_MAX_SIZE: usize = 0xDA;

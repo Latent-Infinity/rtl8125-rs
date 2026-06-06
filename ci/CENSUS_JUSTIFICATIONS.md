@@ -284,3 +284,53 @@ Net change: -1 mechanical FFI wrapper and -1 raw-pointer C ABI copy, so the
 unsafe census returns to 52. The permanent §6.3 ethtool counters remain, and
 `ci/check_counter_infrastructure.sh` plus the runtime counter-invariant gate
 cover that retained surface.
+
+## 2026-06-05 — BQL retry wrappers bump 56 → 60
+
+Added four safe wrappers in `src/unsafe_boundary.rs` for the BQL retry path:
+
+- `skb_len(skb) -> usize` — wraps `r8125_bridge_skb_len` so
+  `ndo_start_xmit` can snapshot the byte count before ring ownership moves.
+- `dql_seed_min_limit(ndev)` — wraps `r8125_bridge_dql_seed_min_limit`, which
+  seeds the single TX queue's BQL floor at open.
+- `netdev_sent_queue(ndev, bytes, xmit_more) -> bool` — wraps the kernel
+  `__netdev_sent_queue` helper at the TX commit point, coupling BQL sent-side
+  accounting with the r8169-style doorbell decision for `xmit_more` batches.
+- `netdev_completed_queue(ndev, pkts, bytes)` — wraps the kernel BQL
+  completion helper once per NAPI TX reap batch.
+
+All four are mechanical FFI wrappers around kernel netdev queue helpers. The
+new `ci/check_bql_accounting.sh` gate enforces sent/completed pairing,
+pre-commit byte capture, the common `bql_active` predicate, the coupled
+`__netdev_sent_queue` doorbell decision, and the no-`netdev_reset_queue`
+bootstrap rule.
+
+## 2026-06-05 — netdev_xmit_more() batching wrapper bump 60 → 61
+
+Added one safe wrapper in `src/unsafe_boundary.rs`:
+
+- `netdev_xmit_more() -> bool` — wraps `r8125_bridge_netdev_xmit_more`, a
+  mechanical FFI read of the net core's per-CPU xmit-burst hint. `ndo_start_xmit`
+  uses it to defer the TX doorbell (`tx_poll`) while the qdisc has more queued
+  packets, amortizing one MMIO write across a burst (r8169
+  `rtl8169_start_xmit` pattern). On the default non-BQL MSI path it is a pure
+  batching hint; when BQL is enabled the same hint is passed into
+  `__netdev_sent_queue` so BQL accounting and doorbell forcing stay coupled.
+  The doorbell is still rung whenever the queue is stopped/throttled so no
+  descriptor is left unsignaled. A `TX_DOORBELLS` counter (ndo_stop log) tracks
+  the doorbells/xmit ratio for validation.
+
+## 2026-06-06 — TX offload prep consolidation decrement 61 → 59
+
+Collapsed the xmit hot-path offload setup into one C shim call:
+
+- Added `skb_tx_offload_prepare(skb) -> Result<(opts1, opts2, nr_frags)>`,
+  wrapping `r8125_bridge_skb_tx_offload_prepare`.
+- Removed Rust wrappers and extern declarations for `skb_tx_csum_opts`,
+  `skb_nr_frags`, and `skb_tso_setup`.
+
+Net change: +1 wrapper, -3 wrappers = **-2 unsafe blocks**. The lower-level
+checksum and TSO helpers are now file-local C implementation details, and the
+dead `r8125_bridge_skb_nr_frags` symbol was removed. This reduces per-packet
+FFI crossings on the single-buffer TX path while preserving the rule that all
+skb mutations happen before DMA mapping.

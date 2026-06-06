@@ -8,7 +8,7 @@
  * has no stable Rust API today: net_device + net_device_ops + NAPI +
  * sk_buff plumbing (plan §5.2 / §5.3).
  *
- * Hard cap: 480 LOC including comments. Candidate G/L/M additions fit
+ * Hard cap: 520 LOC including comments. Candidate G/L/M additions fit
  * under the original 450 cap after the dead RX helpers were removed;
  * raised to 480 for the two ndo_change_mtu accessors the per-MTU
  * zero-copy RX path needs (netif_running + WRITE_ONCE(dev->mtu)).
@@ -41,13 +41,25 @@
 
 /* ── ndo callbacks — each is a thin delegation to Rust ───────────────── */
 
+static unsigned int bridge_feature_flags(netdev_features_t features)
+{
+	unsigned int flags = 0;
+
+	if (features & NETIF_F_RXCSUM)
+		flags |= R8125_BRIDGE_FEATURE_RXCSUM;
+	if (features & NETIF_F_HW_VLAN_CTAG_RX)
+		flags |= R8125_BRIDGE_FEATURE_RXVLAN;
+
+	return flags;
+}
+
 static int bridge_ndo_open(struct net_device *ndev)
 {
 	struct r8125_bridge *b = netdev_priv(ndev);
 	int rc;
 
 	napi_enable(&b->napi);
-	rc = b->ops.open(b->priv);
+	rc = b->ops.open(b->priv, bridge_feature_flags(ndev->features));
 	if (rc) {
 		napi_disable(&b->napi);
 		return rc;
@@ -120,6 +132,17 @@ static netdev_features_t bridge_ndo_fix_features(struct net_device *ndev,
 	return features;
 }
 
+static int bridge_ndo_set_features(struct net_device *ndev,
+				   netdev_features_t features)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+
+	if (!netif_running(ndev))
+		return 0;
+
+	return b->ops.set_features(b->priv, bridge_feature_flags(features));
+}
+
 /* NAPI poll wrapper: same delegation pattern. */
 static int bridge_napi_poll(struct napi_struct *napi, int budget)
 {
@@ -134,6 +157,7 @@ static const struct net_device_ops bridge_ops = {
 	.ndo_start_xmit		= bridge_ndo_start_xmit,
 	.ndo_change_mtu		= bridge_ndo_change_mtu,
 	.ndo_fix_features	= bridge_ndo_fix_features,
+	.ndo_set_features	= bridge_ndo_set_features,
 	.ndo_set_mac_address	= eth_mac_addr,
 	.ndo_validate_addr	= eth_validate_addr,
 };
@@ -201,7 +225,9 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	 */
 	ndev->hw_features = NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
 			    NETIF_F_RXCSUM | NETIF_F_SG |
-			    NETIF_F_TSO | NETIF_F_TSO6;
+			    NETIF_F_TSO | NETIF_F_TSO6 |
+			    NETIF_F_HW_VLAN_CTAG_TX |
+			    NETIF_F_HW_VLAN_CTAG_RX;
 	ndev->features = ndev->hw_features;
 	ndev->vlan_features = NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
 			      NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6;
@@ -367,6 +393,19 @@ void r8125_bridge_tx_wake_queue(struct net_device *ndev)
 	netif_tx_wake_queue(netdev_get_tx_queue(ndev, 0));
 }
 
+/*
+ * netdev_xmit_more() batching hint: true when the qdisc has more packets
+ * queued behind this one in the current xmit burst. Lets ndo_start_xmit defer
+ * the TX doorbell to the last packet of a burst (xmit_more == false) so one
+ * MMIO write amortizes a batch — the same optimization r8169 uses in
+ * rtl8169_start_xmit. Pure read of the net core's per-CPU xmit state; it is a
+ * batching hint only and is independent of BQL, so it is MSI-safe.
+ */
+bool r8125_bridge_netdev_xmit_more(void)
+{
+	return netdev_xmit_more();
+}
+
 void r8125_bridge_napi_schedule(struct net_device *ndev)
 {
 	struct r8125_bridge *b = netdev_priv(ndev);
@@ -460,7 +499,7 @@ int r8125_bridge_reopen_for_mtu(struct net_device *ndev, int new_mtu)
 
 	WRITE_ONCE(ndev->mtu, new_mtu);
 	napi_enable(&b->napi);
-	rc = b->ops.open(b->priv);
+	rc = b->ops.open(b->priv, bridge_feature_flags(ndev->features));
 	if (!rc)
 		return 0;
 

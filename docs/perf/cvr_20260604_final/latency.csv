@@ -1,0 +1,5 @@
+driver,mtu,test,obs,p50_us,p99_us,p999_us,max_us
+r8125_rust,1500,icmp-rtt-idle,10000,34.0,36.0,55.0,141.0
+r8125_rust,1500,icmp-rtt-loaded,10000,1530.0,1710.0,1720.0,1870.0
+r8125_rust,9000,icmp-rtt-idle,10000,34.0,37.0,123.0,155.0
+r8125_rust,9000,icmp-rtt-loaded,10000,1620.0,1830.0,1990.0,1990.0

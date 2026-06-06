@@ -110,6 +110,13 @@ guest→host captures above. A real pps measurement would need
 pktgen or moongen (kernel-side TX driver) — out of scope for
 this dossier.
 
+2026-06-05 KVM follow-up: the C driver can reach near line rate for UDP
+guest→host inside the debug guest when iperf3 uses enough parallel streams
+to avoid the single-stream userspace pacing ceiling. r8169 measured
+2.36 Gbps with `-u -l 1448 -b 250M -P 10`, 0% loss. The perf harness now
+uses that shape for the KVM-sensitive MTU-1500 UDP TX case; see
+[`kvm_udp_tx_20260605/RESULTS.md`](kvm_udp_tx_20260605/RESULTS.md).
+
 ## RX-asymmetry finding + fix (MTU 1500)
 
 ### What we observed

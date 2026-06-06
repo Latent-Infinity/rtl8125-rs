@@ -102,6 +102,11 @@ impl<'a> Regs<'a> {
         self.bar.write32(value, regs::RCR);
     }
 
+    /// Read the Receive Configuration Register.
+    pub(crate) fn rcr(&self) -> u32 {
+        self.bar.read32(regs::RCR)
+    }
+
     /// Write CPlusCmd.
     pub(crate) fn set_cpluscmd(&self, value: u16) {
         self.bar.write16(value, regs::CPLUSCMD);
@@ -186,12 +191,18 @@ impl<'a> Regs<'a> {
         self.int_cfg0()
     }
 
-    /// Read back `IMR_V2_SET` (0x0D0C) for open-time verification.
-    pub(crate) fn imr_v2_readback(&self) -> u32 {
+    /// Diagnostic read of `IMR_V2_SET` (0x0D0C).
+    ///
+    /// This register uses write-to-set unmask semantics; on RTL8125B/KVM it
+    /// can read back as zero even after the baseline mask has been accepted
+    /// and interrupts can fire. Treat the value as evidence only, not as a
+    /// latched-mask truth source.
+    pub(crate) fn imr_v2_set_diagnostic(&self) -> u32 {
         self.bar.read32(regs::IMR_V2_SET)
     }
 
-    /// Write `INT_CFG1_8125` (0x7A, 16-bit). 0x0000 disables coalescing.
+    /// Write `INT_CFG1_8125` (0x7A, 16-bit). RTL8125B baseline is 0x0000
+    /// alongside the 0xa00 INT_MITI table.
     pub(crate) fn set_int_cfg1(&self, value: u16) {
         self.bar.write16(value, regs::INT_CFG1);
     }
@@ -373,13 +384,17 @@ impl<'a> Regs<'a> {
         }
     }
 
-    /// Program 8125 INT_MITI_V2 vector 0 moderation:
-    /// RX/TX timer values are written after first zeroing the full table.
-    /// Returns immediate RX timer readback for diagnostics.
-    pub(crate) fn set_coalesce_8125b(&self, rx_timer: u16, tx_timer: u16) -> u16 {
+    /// Program RTL8125B INT_MITI vector 0 moderation. Vendor names the registers
+    /// `INT_MITI_V2_*`, but the timer table applies to the 8125 interrupt block
+    /// before the driver selects either the legacy or V2 ISR/IMR surface.
+    /// Returns immediate RX/TX timer readbacks for diagnostics.
+    pub(crate) fn set_coalesce_8125b(&self, rx_timer: u16, tx_timer: u16) -> (u16, u16) {
         self.zero_coalesce_table_8125b();
         self.bar.write16(rx_timer, regs::INT_MITI_V2_0_RX);
         self.bar.write16(tx_timer, regs::INT_MITI_V2_0_TX);
-        self.bar.read16(regs::INT_MITI_V2_0_RX)
+        (
+            self.bar.read16(regs::INT_MITI_V2_0_RX),
+            self.bar.read16(regs::INT_MITI_V2_0_TX),
+        )
     }
 }

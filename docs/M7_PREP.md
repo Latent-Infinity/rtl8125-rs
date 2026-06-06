@@ -72,19 +72,21 @@ Breakdown by what kernel C struct each symbol wraps:
 ### NAPI surface (3 symbols)
 - `r8125_bridge_napi_schedule` / `r8125_bridge_napi_complete_done` / `r8125_bridge_napi` (getter)
 
-### sk_buff path (8 symbols)
+### sk_buff path
 - `r8125_bridge_skb_build_rx` — `netdev_alloc_skb` + `eth_type_trans` + skb_put_data
 - `r8125_bridge_skb_deliver_rx` — `napi_gro_receive`
 - `r8125_bridge_skb_consume_tx` — `napi_consume_skb`
 - `r8125_bridge_skb_free_error` / `r8125_bridge_skb_drop_rx` — `dev_kfree_skb_any`
 - `r8125_bridge_skb_data_dma_map` / `r8125_bridge_skb_frag_dma_map` — `dma_map_single` / `skb_frag_dma_map`
 - `r8125_bridge_skb_dma_unmap_tx` / `r8125_bridge_skb_dma_unmap_frag_tx` — `dma_unmap_single` / `dma_unmap_page`
+- `r8125_bridge_skb_len` — wire length accessor for BQL sent accounting
 
-### Offload encoders (4 symbols)
-- `r8125_bridge_skb_tx_csum_opts` — reads skb csum_partial, returns opts2 bits
+### Offload prep / encoders
+- `r8125_bridge_skb_tx_offload_prepare` — combined TX opts1/opts2/nr_frags prep
+  in one hot-path FFI call; normal UDP checksum-partial packets stay on
+  hardware checksum, with software checksum limited to unsupported/pad quirk
+  cases before DMA mapping
 - `r8125_bridge_skb_rx_csum_set` — sets skb->ip_summed from opts1
-- `r8125_bridge_skb_tso_setup` — TSO opts bits (tcp_v6_gso_csum_prep for v6)
-- `r8125_bridge_skb_nr_frags` / `r8125_bridge_skb_len` — accessors
 
 ### PHY (4 symbols)
 - `r8125_bridge_phy_connect_and_reset` — mdiobus register + phy_attach_direct + genphy_soft_reset

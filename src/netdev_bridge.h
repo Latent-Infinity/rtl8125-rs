@@ -50,7 +50,7 @@ struct napi_struct;
  */
 struct r8125_bridge_ops {
 	/*
-	 * open(priv) — full device bring-up
+	 * open(priv, feature_flags) — full device bring-up
 	 * ─────────
 	 * Pre   : netdev is registered, RTNL held, device hardware is in
 	 *         the post-reset / post-probe state from probe-time M2.
@@ -77,7 +77,7 @@ struct r8125_bridge_ops {
 	 *         in the down state and the kernel will not call any
 	 *         other ndo until open succeeds.
 	 */
-	int (*open)(void *priv);
+	int (*open)(void *priv, unsigned int feature_flags);
 
 	/*
 	 * stop(priv)
@@ -142,7 +142,20 @@ struct r8125_bridge_ops {
 	 *         offloads that are not safe at that MTU.
 	 */
 	int (*change_mtu)(void *priv, int new_mtu);
+
+	/*
+	 * set_features(priv, feature_flags) — runtime ethtool -K update
+	 * ─────────────────────────────────
+	 * Pre   : RTNL held and the netdev is running. C translated the kernel's
+	 *         netdev_features_t mask into R8125_BRIDGE_FEATURE_* flags.
+	 * Post  : Rust has programmed the chip-side RX checksum/VLAN feature bits
+	 *         to match the effective netdev feature mask.
+	 */
+	int (*set_features)(void *priv, unsigned int feature_flags);
 };
+
+#define R8125_BRIDGE_FEATURE_RXCSUM	0x00000001U
+#define R8125_BRIDGE_FEATURE_RXVLAN	0x00000002U
 
 /* ──────────────────────────────────────────────────────────────────────
  *  Lifecycle: alloc → register → … → unregister_and_free.
@@ -230,6 +243,11 @@ void r8125_bridge_tx_stop_queue(struct net_device *ndev);
  */
 void r8125_bridge_tx_wake_queue(struct net_device *ndev);
 
+/* netdev_xmit_more() batching hint — true if the qdisc has more queued packets
+ * for this xmit burst, so the driver may defer the TX doorbell. MSI-safe.
+ */
+bool r8125_bridge_netdev_xmit_more(void);
+
 /* Schedule a NAPI poll. Safe to call from atomic (IRQ) context. */
 void r8125_bridge_napi_schedule(struct net_device *ndev);
 
@@ -294,7 +312,7 @@ void r8125_bridge_rx_free(struct net_device *ndev, void *cpu);
  */
 void r8125_bridge_rx_one_packet(struct net_device *ndev,
 				dma_addr_t dma, const void *buf,
-				size_t len, u32 desc_opts1,
+				size_t len, u32 desc_opts1, u32 desc_opts2,
 				void **new_cpu, dma_addr_t *new_dma);
 
 /*
@@ -325,10 +343,10 @@ int  r8125_bridge_reopen_for_mtu(struct net_device *ndev, int new_mtu);
  *
  *  The Rust ndo_start_xmit / napi::poll paths don't peek into sk_buff
  *  internals; the cshim does the protocol introspection and tells the
- *  Rust side what TX descriptor `opts2` bits to OR in (or 0 = pass-
- *  through software checksum), and consumes the RX descriptor `opts1`
- *  to set `skb->ip_summed = CHECKSUM_UNNECESSARY` when the chip
- *  validated the checksum.
+ *  Rust side what TX descriptor bits to OR in (or returns an error if
+ *  software checksum completion fails before DMA mapping), and consumes the
+ *  RX descriptor `opts1` to set `skb->ip_summed = CHECKSUM_UNNECESSARY`
+ *  when the chip validated the checksum.
  *
  *  Bit values mirror both r8169_main.c (TD1_*_CS) and Realtek's r8125
  *  vendor driver (TxTCPCS_C / TxUDPCS_C / TxIPCS_C / TxIPV6F_C):
@@ -338,14 +356,14 @@ int  r8125_bridge_reopen_for_mtu(struct net_device *ndev, int new_mtu);
  *    bit 28 (TxIPV6F_C) — frame is IPv6
  *    bits [27:18] TCPHO_SHIFT — transport header offset
  *
- *  For short UDP frames (transport data < 47 bytes) the chip computes
- *  the WRONG checksum (vendor errata, upstream r8169 has the same
- *  workaround). This helper calls `skb_checksum_help` to fall back to
- *  software in that case and returns 0 so the TX descriptor goes out
- *  with no HW-CSUM bits set. If `skb_checksum_help` itself fails, the
- *  helper returns `0xffffffff`; Rust drops the skb before DMA mapping.
+ *  The RTL8125 pad quirk mirrors r8169/vendor scope: normal short UDP
+ *  checksum-partial packets stay on hardware checksum; only PTP event
+ *  UDP ports 319/320 with transport data < 47 bytes, packets shorter
+ *  than their transport header, or frames below ETH_ZLEN are padded and
+ *  software-checksummed before DMA mapping. If padding or checksum
+ *  completion fails, combined TX offload prep returns a negative errno; Rust
+ *  drops the skb before DMA mapping.
  */
-u32 r8125_bridge_skb_tx_csum_opts(struct sk_buff *skb);
 
 /* Inspect RX descriptor `opts1` and, if it indicates a successfully
  * checksummed TCP or UDP packet (PID bits set, no fail bits),
@@ -377,9 +395,6 @@ void r8125_bridge_account_tx(struct net_device *ndev, unsigned int bytes);
  * ──────────────────────────────────────────────────────────────────────
  */
 
-/* Number of paged fragments. 0 if the skb is linear-only. */
-unsigned int r8125_bridge_skb_nr_frags(struct sk_buff *skb);
-
 /* Map the LINEAR head of `skb` (skb->data .. +skb_headlen) for TX DMA.
  * Returns 0 on success, negative errno on mapping failure.
  */
@@ -393,20 +408,36 @@ int r8125_bridge_skb_frag_dma_map(struct device *dev, struct sk_buff *skb,
 				  unsigned int frag_idx,
 				  dma_addr_t *out_handle, unsigned int *out_len);
 
-/* TSO descriptor-bit setup. If `skb_shinfo(skb)->gso_size != 0` and the
- * GSO type is TCPv4 or TCPv6, fills `*opts1_bits` with
- * `GiantSendv4|6 | (transport_offset << GTTCPHO_SHIFT)` and `*opts2_bits`
- * with `(mss << TD1_MSS_SHIFT)` and returns true. Otherwise zeros both
- * and returns false (caller falls back to plain CSUM bits).
+/* Combined TX offload prep for Rust's hot xmit path: fills opts1/opts2 and
+ * returns nr_frags in one FFI crossing. May mutate skb for v6 TSO or the
+ * narrow RTL8125 pad/software-checksum quirk, so call before DMA mapping.
  */
-bool r8125_bridge_skb_tso_setup(struct sk_buff *skb,
-				u32 *opts1_bits, u32 *opts2_bits);
+int r8125_bridge_skb_tx_offload_prepare(struct sk_buff *skb,
+					u32 *opts1_bits, u32 *opts2_bits,
+					unsigned int *nr_frags);
 
 /* Consume an skb on TX completion (no DMA unmap — caller did per-
  * descriptor unmap already). Bumps netdev->stats.tx_{packets,bytes}
- * from skb->len and hands the skb back to NAPI for recycling.
+ * from skb->len and hands the skb back to NAPI for recycling. Returns the
+ * wire length (skb->len) so the NAPI reaper can batch it into
+ * netdev_completed_queue() for BQL.
  */
-void r8125_bridge_skb_consume_tx(struct net_device *ndev, struct sk_buff *skb);
+unsigned int r8125_bridge_skb_consume_tx(struct net_device *ndev,
+					 struct sk_buff *skb);
+
+/* Wire length (skb->len) for the BQL sent_queue at the xmit commit. */
+unsigned int r8125_bridge_skb_len(const struct sk_buff *skb);
+
+/* BQL (byte queue limits) — Approach A (docs/BQL_RETRY_PLAN.md). Seed the
+ * dql floor at open (no netdev_reset_queue), feed sent at the xmit commit
+ * and completed (batched) at the NAPI reap. Bounds TX ring residency so
+ * fq_codel can protect latency under a saturated bulk flow.
+ */
+void r8125_bridge_dql_seed_min_limit(struct net_device *ndev);
+bool r8125_bridge_netdev_sent_queue(struct net_device *ndev,
+				    unsigned int bytes, bool xmit_more);
+void r8125_bridge_netdev_completed_queue(struct net_device *ndev,
+					 unsigned int pkts, unsigned int bytes);
 
 /* ──────────────────────────────────────────────────────────────────────
  *  Counter snapshot — §6.3 invariant `tx_received == tx_consumed +

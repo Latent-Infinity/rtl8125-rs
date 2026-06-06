@@ -67,21 +67,42 @@ use kernel::sync::aref::ARef;
 static XMIT_CALLS: CachePadded<AtomicU32> = CachePadded::new(AtomicU32::new(0));
 static IRQ_FIRES: CachePadded<AtomicU32> = CachePadded::new(AtomicU32::new(0));
 static NAPI_POLLS: CachePadded<AtomicU32> = CachePadded::new(AtomicU32::new(0));
+/// TX doorbells (`tx_poll` writes). With `netdev_xmit_more()` batching this is
+/// strictly ≤ XMIT_CALLS; the ratio doorbells/xmit_calls under small-frame TX
+/// load shows how well the burst is being amortized (≈1.0 = no batching).
+static TX_DOORBELLS: CachePadded<AtomicU32> = CachePadded::new(AtomicU32::new(0));
 
-pub(crate) fn debug_counts() -> (u32, u32, u32) {
+pub(crate) fn debug_counts() -> (u32, u32, u32, u32) {
     (
         XMIT_CALLS.load(Ordering::Relaxed),
         IRQ_FIRES.load(Ordering::Relaxed),
         NAPI_POLLS.load(Ordering::Relaxed),
+        TX_DOORBELLS.load(Ordering::Relaxed),
     )
 }
 
-pub(crate) fn note_irq_fire() {
-    IRQ_FIRES.fetch_add(1, Ordering::Relaxed);
+fn reset_debug_counts() {
+    XMIT_CALLS.store(0, Ordering::Relaxed);
+    IRQ_FIRES.store(0, Ordering::Relaxed);
+    NAPI_POLLS.store(0, Ordering::Relaxed);
+    TX_DOORBELLS.store(0, Ordering::Relaxed);
 }
 
-pub(crate) fn note_napi_poll() {
-    NAPI_POLLS.fetch_add(1, Ordering::Relaxed);
+#[inline]
+pub(crate) fn debug_counters_active(state: &NetdevState) -> bool {
+    state.debug_counters.load(Ordering::Relaxed)
+}
+
+pub(crate) fn note_irq_fire(state: &NetdevState) {
+    if debug_counters_active(state) {
+        IRQ_FIRES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn note_napi_poll(state: &NetdevState) {
+    if debug_counters_active(state) {
+        NAPI_POLLS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 use crate::mmio::{self, Regs};
@@ -92,6 +113,8 @@ use crate::unsafe_boundary::{self as ub, BridgeOps};
 /// `NETDEV_TX_OK` / `NETDEV_TX_BUSY` from `include/linux/netdevice.h`.
 const NETDEV_TX_OK: c_int = 0;
 const NETDEV_TX_BUSY: c_int = 0x10;
+const BRIDGE_FEATURE_RXCSUM: u32 = 0x0000_0001;
+const BRIDGE_FEATURE_RXVLAN: u32 = 0x0000_0002;
 
 /// Stop the TX queue preemptively when fewer than this many descriptor
 /// slots remain free. **Must pair** with [`napi::TX_START_THRS`]
@@ -103,6 +126,46 @@ const NETDEV_TX_BUSY: c_int = 0x10;
 /// descriptors). When changing this, also revisit
 /// [`napi::TX_START_THRS`] — they're a paired tuning surface.
 const TX_STOP_THRS: usize = 32;
+const TX_BUDGET_DESC_WINDOW: usize = RING_LEN - TX_STOP_THRS;
+
+/// Combined wake predicate for the TX queue, shared by the reaper
+/// ([`napi::poll`]) and the xmit-side stop recheck below. The queue may
+/// resume only when BOTH halves of the hysteresis permit it:
+///   - descriptor slots have drained past [`napi::TX_START_THRS`], AND
+///   - in-flight TX bytes have fallen below the byte-budget low-water
+///     (`max(1, tx_byte_budget / 2)`).
+///
+/// The byte half is a no-op when `tx_byte_budget == 0` (the throttle is
+/// off). Routing every wake decision through one predicate is what makes
+/// the two independent stop reasons — ring-full and byte-budget — safe to
+/// coexist: whichever reason stopped the queue, the wake side re-checks
+/// both, so the queue can never strand because one condition cleared while
+/// the other was still being evaluated against a stale index.
+pub(crate) fn tx_should_wake(state: &NetdevState, free: usize) -> bool {
+    if free <= crate::napi::TX_START_THRS {
+        return false;
+    }
+    let budget = state.tx.byte_budget.inner.load(Ordering::Relaxed) as usize;
+    if budget == 0 {
+        return true;
+    }
+    let low_water = (budget / 2).max(1);
+    state.tx.inflight_bytes.inner.load(Ordering::Acquire) < low_water
+}
+
+#[inline]
+fn tx_budget_tracked_bytes(byte_budget: usize, wire_len: usize) -> usize {
+    if byte_budget == 0 || wire_len.saturating_mul(TX_BUDGET_DESC_WINDOW) < byte_budget {
+        0
+    } else {
+        wire_len
+    }
+}
+
+#[inline]
+fn tx_budget_shadow_len(bytes: usize) -> u32 {
+    core::cmp::min(bytes, u32::MAX as usize) as u32
+}
 
 /// Stop the TX queue, then recheck the producer/consumer indices to cover
 /// the race where NAPI freed descriptors just before or during the stop.
@@ -112,9 +175,24 @@ fn stop_tx_queue_with_recheck(state: &NetdevState, head: usize) {
     let ndev = state.ndev.load(Ordering::Acquire);
     ub::bridge_tx_stop_queue(ndev);
 
+    // CRITICAL barrier (the kernel `netif_subqueue_maybe_stop` / r8169
+    // `smp_mb__after_atomic` pattern). The stop above and the reaper's
+    // drain run on different CPUs; without a full StoreLoad fence here the
+    // recheck below can read a *stale* (pre-drain) tail/inflight even though
+    // the reaper already completed every in-flight packet. When that happens
+    // the queue stays XOFF and — because the reaper only wakes on
+    // `reaped > 0` — no future completion ever arrives to wake it, so the TX
+    // path wedges permanently. UDP exposes this readily (it floods the qdisc
+    // and trips the stop threshold every ~90 packets at tight margins), while
+    // TSO/ACK-clocked TCP almost never does. The reaper pairs this with its
+    // own `fence(SeqCst)` after publishing `tx_tail`; together they give the
+    // Dekker guarantee that at least one side observes the other, so the wake
+    // is never lost. See docs/perf/byte_budget_20260605/UDP_TX_WEDGE.md.
+    core::sync::atomic::fence(Ordering::SeqCst);
+
     let tail_now = state.tx.tail.inner.load(Ordering::Acquire);
     let in_flight_now = head.wrapping_sub(tail_now);
-    if RING_LEN - in_flight_now > crate::napi::TX_START_THRS {
+    if tx_should_wake(state, RING_LEN - in_flight_now) {
         ub::bridge_tx_wake_queue(ndev);
     }
 }
@@ -129,7 +207,9 @@ fn stop_tx_queue_with_recheck(state: &NetdevState, head: usize) {
 /// poll reads them through `cpu`. Stored as a pair of per-slot atomics
 /// (`RxRingState::slot_cpu` + `RxRingState::slot_dma`) so probe → ndo_open
 /// allocation, the NAPI hot path, and ndo_stop free can all access the
-/// pool through `&NetdevState` without unsafe interior mutability.
+/// pool through `&NetdevState` without unsafe interior mutability. The
+/// atomics provide interior mutability; their hot-path accesses are relaxed
+/// because open/stop/MTU rebuild disable NAPI before mutating slots.
 ///
 /// `cpu` is the kernel-virtual `page_address(...)` from
 /// `r8125_bridge_rx_alloc` — guaranteed-lowmem on x86_64 because
@@ -173,9 +253,10 @@ pub(crate) enum IrqMode {
     /// Legacy INTx pin assertion. Requires `IRQF_SHARED` on registration,
     /// drives the original `IMR`/`ISR` register window at 0x38/0x3C.
     Intx = 0,
-    /// Message-Signaled (MSI or MSI-X). Registers without `IRQF_SHARED`,
-    /// drives the `IMR_V2`/`ISR_V2` window at 0x0D0C/0x0D04 with
-    /// `INT_CFG0_ENABLE_8125` set in the chip.
+    /// Message-Signaled delivery (MSI or MSI-X). Registers without
+    /// `IRQF_SHARED`. The register surface is selected separately by
+    /// `IrqState::use_v2`; with one allocated vector we intentionally keep
+    /// the legacy combined `IMR`/`ISR` window so TX completions share vector 0.
     Msi = 1,
 }
 
@@ -215,6 +296,7 @@ pub(crate) struct TxRingState {
     pub(crate) shadow_dma: [AtomicU64; RING_LEN],
     pub(crate) shadow_len: [AtomicU32; RING_LEN],
     pub(crate) shadow_is_frag: [AtomicBool; RING_LEN],
+    pub(crate) shadow_budget_len: [AtomicU32; RING_LEN],
 
     /// Producer index (advanced by `ndo_start_xmit`). Cache-padded per
     /// RUST_STANDARDS.md §15.2 — written by xmit, read by NAPI poll.
@@ -222,11 +304,27 @@ pub(crate) struct TxRingState {
     /// Consumer index (advanced by the NAPI TX reaper). Cache-padded; read
     /// by xmit's ring-full check.
     pub(crate) tail: CachePadded<AtomicUsize>,
+
+    /// Driver-owned TX byte-budget accounting (the MSI-safe latency throttle —
+    /// test 5 / docs/BQL_RETRY_PLAN.md). xmit adds the wire length here at the
+    /// commit for packets large enough to hit the budget before descriptor
+    /// hysteresis, and the NAPI reaper subtracts the per-packet budget shadow;
+    /// when tracked in-flight bytes exceed `tx_byte_budget` we stop the txq
+    /// (and wake when they fall back below). This bounds TX ring residency so
+    /// fq_codel can protect latency under a bulk flow — same effect as BQL,
+    /// without `netdev_sent_queue` (which suppresses MSI-X delivery on this
+    /// chip's V2 surface; see docs/perf/bql_20260605/). Cache-padded: xmit writes,
+    /// reaper writes — keep it off the head/tail lines.
+    pub(crate) inflight_bytes: CachePadded<AtomicUsize>,
+
+    /// Per-open snapshot of `tx_byte_budget`. Module-param reads stay out of
+    /// the TX/NAPI hot paths; `ndo_open` snapshots the value for this open.
+    pub(crate) byte_budget: CachePadded<AtomicU32>,
 }
 
 impl TxRingState {
     /// Heap-in-place initializer (task #58 stack-overflow fix). Each of
-    /// the 4 × `RING_LEN` shadow arrays is constructed slot-by-slot via
+    /// the 5 × `RING_LEN` shadow arrays is constructed slot-by-slot via
     /// `init_array_from_fn`, never materialised on the stack.
     pub(crate) fn new(
         desc: *mut Descriptor,
@@ -247,8 +345,13 @@ impl TxRingState {
             shadow_is_frag <- pin_init::init_array_from_fn(
                 |_| AtomicBool::new(false)
             ),
+            shadow_budget_len <- pin_init::init_array_from_fn(
+                |_| AtomicU32::new(0)
+            ),
             head: CachePadded::new(AtomicUsize::new(0)),
             tail: CachePadded::new(AtomicUsize::new(0)),
+            inflight_bytes: CachePadded::new(AtomicUsize::new(0)),
+            byte_budget: CachePadded::new(AtomicU32::new(0)),
         }? kernel::error::Error)
     }
 
@@ -257,6 +360,7 @@ impl TxRingState {
         self.shadow_dma[slot].store(0, Ordering::Release);
         self.shadow_len[slot].store(0, Ordering::Release);
         self.shadow_is_frag[slot].store(false, Ordering::Release);
+        self.shadow_budget_len[slot].store(0, Ordering::Release);
         self.shadow[slot].store(core::ptr::null_mut(), Ordering::Release);
     }
 }
@@ -402,6 +506,19 @@ pub(crate) struct NetdevState {
     // context — no concurrent writer means no false-sharing pressure.
     pub(crate) ndev: AtomicPtr<bindings::net_device>,
 
+    /// Per-open snapshot of `debug_counters`. When false, TX/IRQ/NAPI hot
+    /// paths skip debug atomic RMWs entirely.
+    // NOT-PADDED: written once per open/stop, read by hot paths; no packet-rate
+    // writer exists, so there is no cross-context false sharing pressure.
+    pub(crate) debug_counters: AtomicBool,
+
+    /// BQL decision snapshotted at `ndo_open`. Module parameters can be
+    /// operator-controlled, but sent/completed BQL accounting must stay paired
+    /// for the lifetime of one open, so hot paths read this per-open value.
+    // NOT-PADDED: written only under open/stop teardown, read from TX/NAPI.
+    // It is not independently mutated at packet rate.
+    pub(crate) bql_enabled: AtomicBool,
+
     /// TX descriptor ring + producer/consumer indices + shadow.
     pub(crate) tx: TxRingState,
     /// RX descriptor ring + per-slot streaming-DMA pages + consumer index.
@@ -436,25 +553,24 @@ impl NetdevState {
     }
 
     /// Snapshot RX slot `i`'s (cpu, dma) pair. Both atomics are read
-    /// with `Acquire` so a fresh `set_rx_slot` on the same slot from
-    /// the `ndo_open`/`ndo_stop` context is observed atomically by the
-    /// NAPI poll context.
+    /// with `Relaxed`: open/stop and MTU rebuild run with NAPI disabled, so
+    /// there is no concurrent writer while the RX hot path is active.
     #[inline]
     pub(crate) fn rx_slot(&self, i: usize) -> RxSlot {
         RxSlot {
-            cpu: self.rx.slot_cpu[i].load(Ordering::Acquire),
-            dma: self.rx.slot_dma[i].load(Ordering::Acquire),
+            cpu: self.rx.slot_cpu[i].load(Ordering::Relaxed),
+            dma: self.rx.slot_dma[i].load(Ordering::Relaxed),
         }
     }
 
-    /// Publish a slot's (cpu, dma) pair. Paired with `rx_slot` —
-    /// stores are `Release`, so the NAPI side's `Acquire` sees the
-    /// pair as a unit. The empty sentinel (`RxSlot::EMPTY`) signals
-    /// "freed" to the rmmod / failure-rollback paths.
+    /// Publish a slot's (cpu, dma) pair. Paired with `rx_slot` — stores are
+    /// `Relaxed` because the NAPI lifecycle, not the atomics, serializes
+    /// open/stop against the RX hot path. The empty sentinel (`RxSlot::EMPTY`)
+    /// signals "freed" to the rmmod / failure-rollback paths.
     #[inline]
     pub(crate) fn set_rx_slot(&self, i: usize, slot: RxSlot) {
-        self.rx.slot_cpu[i].store(slot.cpu, Ordering::Release);
-        self.rx.slot_dma[i].store(slot.dma, Ordering::Release);
+        self.rx.slot_cpu[i].store(slot.cpu, Ordering::Relaxed);
+        self.rx.slot_dma[i].store(slot.dma, Ordering::Relaxed);
     }
 
     /// Reset all atomic indices and clear stale TX shadow metadata.
@@ -464,6 +580,8 @@ impl NetdevState {
         self.tx.head.inner.store(0, Ordering::Relaxed);
         self.tx.tail.inner.store(0, Ordering::Relaxed);
         self.rx.tail.inner.store(0, Ordering::Relaxed);
+        self.tx.inflight_bytes.inner.store(0, Ordering::Relaxed);
+        self.tx.byte_budget.inner.store(0, Ordering::Relaxed);
         for i in 0..RING_LEN {
             self.tx.clear_shadow_slot(i);
         }
@@ -477,9 +595,9 @@ fn state_from<'a>(cookie: *mut c_void) -> &'a NetdevState {
     ub::state_from_cookie(cookie)
 }
 
-extern "C" fn rust_open(cookie: *mut c_void) -> c_int {
+extern "C" fn rust_open(cookie: *mut c_void, feature_flags: u32) -> c_int {
     let state = state_from(cookie);
-    match ndo_open(state) {
+    match ndo_open(state, feature_flags) {
         Ok(()) => 0,
         Err(e) => e.to_errno(),
     }
@@ -530,19 +648,26 @@ extern "C" fn rust_change_mtu(cookie: *mut c_void, new_mtu: c_int) -> c_int {
     ub::reopen_for_mtu(ndev, new_mtu)
 }
 
+extern "C" fn rust_set_features(cookie: *mut c_void, feature_flags: u32) -> c_int {
+    let state = state_from(cookie);
+    apply_netdev_features(state, feature_flags);
+    0
+}
+
 pub(crate) const M4_FULL_OPS: BridgeOps = BridgeOps {
     open: rust_open,
     stop: rust_stop,
     xmit: rust_xmit,
     poll: rust_poll,
     change_mtu: rust_change_mtu,
+    set_features: rust_set_features,
 };
 
 // Skeleton vtable retained as a load-test fallback. Flip `ACTIVE_OPS`
 // to point at `M4_SKELETON_OPS` for a no-traffic insmod/rmmod
 // regression with no chip interaction. Not wired by default.
 #[allow(dead_code)]
-extern "C" fn skel_open(_cookie: *mut c_void) -> c_int {
+extern "C" fn skel_open(_cookie: *mut c_void, _feature_flags: u32) -> c_int {
     0
 }
 #[allow(dead_code)]
@@ -562,6 +687,10 @@ extern "C" fn skel_poll(_cookie: *mut c_void, _budget: c_int) -> c_int {
 extern "C" fn skel_change_mtu(_cookie: *mut c_void, _new_mtu: c_int) -> c_int {
     0
 }
+#[allow(dead_code)]
+extern "C" fn skel_set_features(_cookie: *mut c_void, _feature_flags: u32) -> c_int {
+    0
+}
 
 #[allow(dead_code)]
 pub(crate) const M4_SKELETON_OPS: BridgeOps = BridgeOps {
@@ -570,6 +699,7 @@ pub(crate) const M4_SKELETON_OPS: BridgeOps = BridgeOps {
     xmit: skel_xmit,
     poll: skel_poll,
     change_mtu: skel_change_mtu,
+    set_features: skel_set_features,
 };
 
 /// Active vtable. M4-full is the production path; M4-skeleton is kept
@@ -590,7 +720,7 @@ fn free_rx_slots(state: &NetdevState) {
     // page_pool_destroy requires every page returned first — only safe
     // after the slot loop above. Idempotent against a NULL pool, so the
     // ndo_open rollback path (failed mid-alloc, or before create) is fine.
-    state.rx.buf_len.inner.store(0, Ordering::Release);
+    state.rx.buf_len.inner.store(0, Ordering::Relaxed);
     ub::rx_pool_destroy(ndev);
 }
 
@@ -604,16 +734,40 @@ fn free_rx_slots(state: &NetdevState) {
 // Rollback stays inline at the call site so the unwind order — which
 // is direction-sensitive — is visible where it matters.
 
+#[inline]
+fn rx_feature_rcr(base: u32, feature_flags: u32) -> u32 {
+    if feature_flags & BRIDGE_FEATURE_RXVLAN != 0 {
+        base | regs::RX_VLAN_8125
+    } else {
+        base & !regs::RX_VLAN_8125
+    }
+}
+
+#[inline]
+fn rx_feature_cpluscmd(feature_flags: u32) -> u16 {
+    if feature_flags & BRIDGE_FEATURE_RXCSUM != 0 {
+        regs::CPLUSCMD_RX_CHKSUM
+    } else {
+        0
+    }
+}
+
+fn apply_netdev_features(state: &NetdevState, feature_flags: u32) {
+    let regs = state.regs();
+    regs.set_rcr(rx_feature_rcr(regs.rcr(), feature_flags));
+    regs.set_cpluscmd(rx_feature_cpluscmd(feature_flags));
+}
+
 /// Map TX/RX ring DMA bases + program RxConfig / CPlusCmd. `RxMaxSize`
 /// is set inside `hw_start_8125b` so all chip-side init lives in one
 /// place; this helper only touches registers that program the rings
 /// the kernel-Rust DMA layer allocated for us.
 #[inline]
-fn program_dma_rings(state: &NetdevState, regs: &Regs<'_>) {
+fn program_dma_rings(state: &NetdevState, regs: &Regs<'_>, feature_flags: u32) {
     regs.set_tx_ring_base(state.tx.dma);
     regs.set_rx_ring_base(state.rx.dma);
-    regs.set_rcr(regs::RCR_M4_BASELINE);
-    regs.set_cpluscmd(regs::CPLUSCMD_RX_CHKSUM);
+    regs.set_rcr(rx_feature_rcr(regs::RCR_M4_BASELINE, feature_flags));
+    regs.set_cpluscmd(rx_feature_cpluscmd(feature_flags));
 }
 
 /// Allocate one streaming-DMA page chunk per RX slot (M6 #2).
@@ -628,7 +782,7 @@ fn allocate_rx_pool(state: &NetdevState) -> Result<()> {
     // the chip RxMaxSize register. On any failure below, `free_rx_slots`
     // frees whatever was allocated and destroys the pool (both idempotent).
     let buf_len = ub::rx_pool_create(ndev, RING_LEN)?;
-    state.rx.buf_len.inner.store(buf_len, Ordering::Release);
+    state.rx.buf_len.inner.store(buf_len, Ordering::Relaxed);
     for i in 0..RING_LEN {
         match ub::rx_alloc(ndev) {
             Ok((cpu, dma)) => state.set_rx_slot(i, RxSlot { cpu, dma }),
@@ -649,7 +803,7 @@ fn allocate_rx_pool(state: &NetdevState) -> Result<()> {
 /// jumbo max, so a 4 KiB MTU-1500 buffer can never be overrun by a giant
 /// frame. `buf_len` is already ≤ `DESC_LEN_MASK` (the cshim caps it).
 fn pre_post_rx_descriptors(state: &NetdevState) {
-    let buf_len = state.rx.buf_len.inner.load(Ordering::Acquire) & regs::DESC_LEN_MASK;
+    let buf_len = state.rx.buf_len.inner.load(Ordering::Relaxed) & regs::DESC_LEN_MASK;
     for i in 0..RING_LEN {
         let dma = state.rx_slot(i).dma;
         let mut opts1 = regs::DESC_OWN | buf_len;
@@ -736,18 +890,24 @@ fn free_irq_if_registered(state: &NetdevState) {
     }
 }
 
-/// r8169 RTL8125B (MAC_VER_63) baseline: disable interrupt coalescing
-/// before enabling IRQ sources. Mirrors `rtl_hw_start_8125` in
-/// `r8169_main.c`. Zeros `INT_CFG0`, the 0xa00..0xa80 coalescing table,
-/// and `INT_CFG1`. Without this the chip may delay/suppress IRQs.
+/// r8169 RTL8125B (MAC_VER_63) baseline: reset interrupt moderation before
+/// enabling IRQ sources. Mirrors `rtl_hw_start_8125` in `r8169_main.c` and
+/// vendor `rtl8125_hw_clear_int_miti`: clear the V2-surface and mitigation
+/// bypass bits, zero the 0xa00..0xa80 INT_MITI table, and set `INT_CFG1 = 0`.
+/// `program_interrupt_moderation` installs the current timer values later,
+/// after the final IRQ surface is selected.
 /// Sticky `ISR` bits are W1C-acked here too so the first post-unmask
 /// edge into the IO-APIC isn't lost.
 #[inline]
 fn setup_interrupt_config(regs: &Regs<'_>) {
-    // Clear the V2-enable bit without clobbering any other INT_CFG0 fields.
-    // V2 enable itself is written later, once IRQ mode is known.
+    // Clear V2-enable plus the bypass bits that can suppress the INT_MITI
+    // timer table. V2 enable itself is written later, once IRQ mode is known.
     let cfg0 = regs.int_cfg0();
-    regs.set_int_cfg0(cfg0 & !regs::INT_CFG0_ENABLE_8125);
+    regs.set_int_cfg0(
+        cfg0 & !(regs::INT_CFG0_ENABLE_8125
+            | regs::INT_CFG0_TIMEOUT0_BYPASS_8125
+            | regs::INT_CFG0_MITIGATION_BYPASS_8125),
+    );
     regs.zero_coalesce_table_8125b();
     regs.set_int_cfg1(0);
     regs.ack_isr(0xFFFF_FFFF);
@@ -756,11 +916,10 @@ fn setup_interrupt_config(regs: &Regs<'_>) {
 
 /// M6 #1 Phase A.2 — chip-side activation of the per-message-id
 /// ISR_V2 register layout. Only flip `INT_CFG0_ENABLE_8125` when probe
-/// actually obtained an MSI/MSI-X vector; in INTx fallback the chip
-/// must keep asserting the INTx pin (see `hw.rs` Phase A.1 comment +
-/// `docs/M6_MSIX_DESIGN.md` for the empirical reason). Must run BEFORE
-/// the matching `set_imr_v2_mask` write — `rearm_irq_baseline` then
-/// targets the V2 surface.
+/// selected `use_v2`; with one MSI/MSI-X vector we keep V2 disabled so
+/// TX completions use the legacy combined ISR/IMR surface on vector 0.
+/// Must run BEFORE the matching `set_imr_v2_mask` write — `rearm_irq_baseline`
+/// then targets the V2 surface.
 #[inline]
 fn activate_v2_isr_for_msi(state: &NetdevState, regs: &Regs<'_>) {
     if state.irq_mode() != IrqMode::Intx && state.use_v2_irq_surface() {
@@ -772,6 +931,25 @@ fn activate_v2_isr_for_msi(state: &NetdevState, regs: &Regs<'_>) {
             );
         }
     }
+}
+
+/// Program RTL8125B interrupt moderation for the IRQ surface selected at probe.
+/// The hardware timer block is the 0xa00 INT_MITI table even when interrupts
+/// are delivered through the legacy ISR/IMR window (`use_v2=false`).
+#[inline]
+fn program_interrupt_moderation(state: &NetdevState, regs: &Regs<'_>) {
+    let rx_timer = *crate::module_parameters::rx_coalesce_timer.value();
+    let tx_timer = *crate::module_parameters::tx_coalesce_timer.value();
+    let use_v2 = state.irq_mode() == IrqMode::Msi && state.use_v2_irq_surface();
+    let (rx_rb, tx_rb) = regs.set_coalesce_8125b(rx_timer, tx_timer);
+    pr_info!(
+        "r8125_rust: INT_MITI timers use_v2={} RX=0x{:04x}/rb=0x{:04x} TX=0x{:04x}/rb=0x{:04x}\n",
+        use_v2,
+        rx_timer,
+        rx_rb,
+        tx_timer,
+        tx_rb
+    );
 }
 
 /// Enable RX + TX in the chip-command register. Per r8169 the IMR write
@@ -799,8 +977,14 @@ fn quiesce_chip(regs: &Regs<'_>) {
 /// `dma_unmap_single`; the (last-frag-only) skb pointer is freed via
 /// `skb_free_error` so the §6.3 disposition counter records a TX error.
 fn reap_inflight_tx_shadow(state: &NetdevState) {
+    let ndev = state.ndev.load(Ordering::Acquire);
+    let bql_was_active = bql_active(state);
+    let mut bql_pkts = 0usize;
+    let mut bql_bytes = 0usize;
+
     for i in 0..RING_LEN {
         let len = state.tx.shadow_len[i].swap(0, Ordering::AcqRel) as usize;
+        state.tx.shadow_budget_len[i].store(0, Ordering::Release);
         if len > 0 {
             let handle = state.tx.shadow_dma[i].load(Ordering::Acquire);
             if state.tx.shadow_is_frag[i].swap(false, Ordering::AcqRel) {
@@ -811,10 +995,21 @@ fn reap_inflight_tx_shadow(state: &NetdevState) {
         }
         let raw_skb = state.tx.shadow[i].swap(ptr::null_mut(), Ordering::AcqRel);
         if let Some(skb) = crate::skb::DriverOwnedSkb::from_raw_nullable(raw_skb) {
+            if bql_was_active {
+                bql_bytes += skb.wire_len();
+                bql_pkts += 1;
+            }
             // Reclaim the disposition obligation from the shadow and
             // route the skb through the §6.3 error counter.
             skb.free_with_error();
         }
+    }
+    // Balance any packets that were counted by netdev_sent_queue but were
+    // freed during stop before hardware completion. We still report them to
+    // DQL so a later reopen of the same netdev does not inherit stale queued
+    // bytes.
+    if bql_pkts > 0 {
+        ub::netdev_completed_queue(ndev, bql_pkts, bql_bytes);
     }
 }
 
@@ -827,10 +1022,10 @@ fn log_ndo_open_complete(state: &NetdevState, regs: &Regs<'_>) {
     let (isr, imr, isr_v2, imr_v2) = match (irq_mode, use_v2) {
         (IrqMode::Intx, _) => (regs.isr(), regs.imr_readback(), 0, 0),
         (IrqMode::Msi, false) => (regs.isr(), regs.imr_readback(), 0, 0),
-        (IrqMode::Msi, true) => (0, 0, regs.isr_v2(), regs.imr_v2_readback()),
+        (IrqMode::Msi, true) => (0, 0, regs.isr_v2(), regs.imr_v2_set_diagnostic()),
     };
     pr_info!(
-        "r8125_rust ndo_open complete: mode={:?} use_v2={} IRQ={} ChipCmd=0x{:02x} ISR=0x{:08x} IMR_rb=0x{:08x} ISR_v2=0x{:08x} IMR_V2_rb=0x{:08x} INT_CFG0=0x{:02x} PHYStatus=0x{:02x} tx_dma=0x{:016x} rx_dma=0x{:016x}\n",
+        "r8125_rust ndo_open complete: mode={:?} use_v2={} IRQ={} ChipCmd=0x{:02x} ISR=0x{:08x} IMR_rb=0x{:08x} ISR_v2=0x{:08x} IMR_V2_SET_diag=0x{:08x} INT_CFG0=0x{:02x} PHYStatus=0x{:02x} tx_dma=0x{:016x} rx_dma=0x{:016x}\n",
         irq_mode,
         use_v2,
         state.irq.num,
@@ -937,14 +1132,24 @@ impl<'a> Drop for IrqGuard<'a> {
 
 // ── ndo_open ──────────────────────────────────────────────────────────────
 
-fn ndo_open(state: &NetdevState) -> Result<()> {
+fn ndo_open(state: &NetdevState, feature_flags: u32) -> Result<()> {
+    let debug_counters = *crate::module_parameters::debug_counters.value() != 0;
+    state
+        .debug_counters
+        .store(debug_counters, Ordering::Relaxed);
+    reset_debug_counts();
+    state.bql_enabled.store(false, Ordering::Release);
     state.reset_indices();
+    state.tx.byte_budget.inner.store(
+        *crate::module_parameters::tx_byte_budget.value(),
+        Ordering::Relaxed,
+    );
     let regs = state.regs();
 
     // Bus-mastering on. (DMA mask was set at probe.)
     ub::pci_set_master(&state.pdev);
 
-    program_dma_rings(state, &regs);
+    program_dma_rings(state, &regs, feature_flags);
     let rx_pool = RxPoolGuard::allocate(state)?;
     pre_post_rx_descriptors(state);
     zero_tx_descriptors(state);
@@ -977,19 +1182,11 @@ fn ndo_open(state: &NetdevState) -> Result<()> {
     // pool's buffers hold. Set after hw_start, before the RX engine is
     // enabled below. `buf_len` is the pool's device-writable length, ≤
     // RX_MAX_SIZE_JUMBO (0x3FFF), so it fits the 16-bit register.
-    regs.set_rx_max_size(state.rx.buf_len.inner.load(Ordering::Acquire) as u16);
+    regs.set_rx_max_size(state.rx.buf_len.inner.load(Ordering::Relaxed) as u16);
 
     enable_chip_engines(&regs);
     activate_v2_isr_for_msi(state, &regs);
-    if state.use_v2_irq_surface() {
-        let coal_rb =
-            regs.set_coalesce_8125b(regs::RX_COALESCE_TIMER_8125B, regs::TX_COALESCE_TIMER_8125B);
-        pr_info!(
-            "r8125_rust: INT_MITI_V2 RX timer set to 0x{:04x}, immediate readback=0x{:04x}\n",
-            regs::RX_COALESCE_TIMER_8125B,
-            coal_rb
-        );
-    }
+    program_interrupt_moderation(state, &regs);
 
     // Unmask the chosen IRQ surface LAST — mirrors r8169 `rtl_irq_enable`.
     // `rearm_irq_baseline` picks legacy `IMR` or V2 `IMR_V2_SET` based
@@ -1010,6 +1207,18 @@ fn ndo_open(state: &NetdevState) -> Result<()> {
         ub::bridge_phy_stop(ndev);
         return Err(e);
     }
+    // BQL: seed dql.min_limit to one full MTU frame + headroom BEFORE the
+    // queue is woken, so the first xmit can't drive dql_avail negative (no
+    // netdev_reset_queue — Approach A, BQL_RETRY_PLAN.md). Bounds TX ring
+    // residency so fq_codel can protect latency under a saturated bulk flow.
+    // Gated by bql_mode (safe default: skip on MSI delivery). Snapshot the decision
+    // for this open so sent/completed accounting cannot be imbalanced by a
+    // runtime module-parameter change.
+    let bql_enabled = select_bql_active(state);
+    state.bql_enabled.store(bql_enabled, Ordering::Release);
+    if bql_enabled {
+        ub::dql_seed_min_limit(ndev);
+    }
     ub::bridge_tx_wake_queue(ndev);
     log_ndo_open_complete(state, &regs);
     // Transfer ownership of the IRQ + RX pool to the bound netdev so
@@ -1025,12 +1234,13 @@ fn ndo_stop(state: &NetdevState) {
     let regs = state.regs();
     let ndev = state.ndev.load(Ordering::Acquire);
 
-    let (x, i, n) = debug_counts();
+    let (x, i, n, d) = debug_counts();
     pr_info!(
-        "r8125_rust ndo_stop: xmit_calls={} irq_fires={} napi_polls={}\n",
+        "r8125_rust ndo_stop: xmit_calls={} irq_fires={} napi_polls={} tx_doorbells={}\n",
         x,
         i,
-        n
+        n,
+        d
     );
 
     // Stop kernel TX submissions + carrier first so xmit can't race the
@@ -1058,6 +1268,8 @@ fn ndo_stop(state: &NetdevState) {
     }
 
     reap_inflight_tx_shadow(state);
+    state.debug_counters.store(false, Ordering::Relaxed);
+    state.bql_enabled.store(false, Ordering::Release);
 
     // Zero the descriptor rings so a subsequent open starts fresh.
     for i in 0..RING_LEN {
@@ -1074,40 +1286,19 @@ fn ndo_stop(state: &NetdevState) {
 
 // ── ndo_start_xmit phase helpers (tasks #60 + #62) ────────────────────────
 
-/// Disposition of the TSO/CSUM offload phase.
-///
-/// `Tso` and `Csum` both signal "skb still alive, post these bits";
-/// `Drop` signals "chip can't honour the request and SW fallback also
-/// failed — caller must dispose of the skb via `free_with_error`."
-/// Modelling this as an enum (instead of `Option<(u32, u32)>` plus an
-/// implicit-free contract) keeps disposal explicit on the caller's
-/// side, which is what task #62's [`crate::skb::DriverOwnedSkb`]
-/// discipline wants.
-enum OffloadOutcome {
-    Tso { opts1: u32, opts2: u32 },
-    Csum { opts2: u32 },
-    Drop,
-}
-
-/// TSO/CSUM offload bit computation. The skb is BORROWED — caller
-/// retains ownership and is responsible for `free_with_error` on the
-/// `Drop` outcome (so the §6.3 `tx_dropped_error` counter increments
-/// at the right level).
+/// TSO/CSUM offload bit computation plus post-mutation fragment count. The skb
+/// is BORROWED — caller retains ownership and is responsible for
+/// `free_with_error` on an error outcome so the §6.3 `tx_dropped_error` counter
+/// increments at the right level.
 ///
 /// May mutate the skb (`skb_cow_head` + `tcp_v6_gso_csum_prep` for IPv6
-/// TSO; `skb_checksum_help` for the short-UDP errata). Both write the
-/// linear data, so any subsequent DMA map sees the final bytes — which
-/// is why this phase MUST run before `map_skb_linear`.
-fn compute_offload_bits(skb: &crate::skb::DriverOwnedSkb) -> OffloadOutcome {
-    if let Some((opts1, opts2)) = skb.tso_setup() {
-        return OffloadOutcome::Tso { opts1, opts2 };
-    }
-    let csum_opts2 = skb.tx_csum_opts();
-    if csum_opts2 == regs::TX_CSUM_OPTS_DROP {
-        OffloadOutcome::Drop
-    } else {
-        OffloadOutcome::Csum { opts2: csum_opts2 }
-    }
+/// TSO; padding plus `skb_checksum_help` for the narrow RTL8125 UDP pad quirk
+/// or unsupported checksum-partial cases). These paths write linear data, so
+/// any subsequent DMA map sees the final bytes — which is why this phase MUST
+/// run before `map_skb_linear`.
+fn compute_offload_bits(skb: &crate::skb::DriverOwnedSkb) -> Result<(u32, u32, usize)> {
+    let (opts1, opts2, nr_frags) = skb.tx_offload_prepare()?;
+    Ok((opts1, opts2, nr_frags as usize))
 }
 
 /// Check ring capacity for a logical packet of `n_desc` descriptors. We
@@ -1248,10 +1439,10 @@ impl<'a> Drop for TxMapGuard<'a> {
 /// the FirstFrag write commits LAST) so it's safe to publish fragment
 /// descriptors with `OWN` set as we go.
 ///
-/// On any per-fragment failure the [`TxMapGuard`] drops and unmaps the
-/// linear head + every already-mapped fragment, clears any pre-staged
-/// fragment descriptors, then frees the skb; the caller just observes
-/// `Err(())` and returns `NETDEV_TX_OK`.
+/// Caller bypasses this helper for `nr_frags == 0`. On any per-fragment failure
+/// the [`TxMapGuard`] drops and unmaps the linear head + every already-mapped
+/// fragment, clears any pre-staged fragment descriptors, then frees the skb;
+/// the caller just observes `Err(())` and returns `NETDEV_TX_OK`.
 ///
 /// Per r8169 `rtl8169_tx_map` and Realtek vendor `rtl8125_xmit_frags`,
 /// BOTH opts[0] (TSO GTSEN bits) AND opts[1] (CSUM bits / MSS) get
@@ -1267,6 +1458,7 @@ fn map_skb_fragments(
     linear_len: u32,
     tso_opts1: u32,
     first_opts2: u32,
+    budget_len: u32,
 ) -> Result<*mut bindings::sk_buff, ()> {
     let mut guard = TxMapGuard::new(state, skb, head, linear_handle, linear_len);
     for i in 0..nr_frags {
@@ -1296,6 +1488,9 @@ fn map_skb_fragments(
         state.tx.shadow_dma[slot].store(h, Ordering::Release);
         state.tx.shadow_len[slot].store(l, Ordering::Release);
         state.tx.shadow_is_frag[slot].store(true, Ordering::Release);
+        if is_last_frag && budget_len != 0 {
+            state.tx.shadow_budget_len[slot].store(budget_len, Ordering::Release);
+        }
         // skb pointer lives on the LAST descriptor only; intermediate
         // fragments stay null so the reaper only consumes the skb once.
         state.tx.shadow[slot].store(
@@ -1326,20 +1521,44 @@ fn map_skb_fragments(
 
 // ── ndo_start_xmit ────────────────────────────────────────────────────────
 
+/// Select whether BQL should run for the next open. Safe default runs BQL only
+/// over INTx; on MSI/MSI-X the driver-owned `tx_byte_budget` throttle is the
+/// latency mechanism instead (`netdev_sent_queue` historically suppressed MSI-X
+/// delivery on the V2 surface — docs/perf/bql_20260605/). The gate is on the
+/// delivery mode directly (the V2 ISR surface is no longer used — see
+/// docs/perf/byte_budget_20260605/UDP_TX_WEDGE.md — so the old
+/// `!use_v2_irq_surface()` proxy would now read true on MSI and is wrong).
+fn select_bql_active(state: &NetdevState) -> bool {
+    match *crate::module_parameters::bql_mode.value() {
+        0 => false,
+        2 => true,
+        _ => state.irq_mode() == IrqMode::Intx,
+    }
+}
+
+/// Whether BQL sent/completed accounting is active for this open. Gates the
+/// `netdev_sent_queue`/`netdev_completed_queue` pair consistently: open
+/// snapshots the module-param decision once, and xmit/reap/stop all read this
+/// same per-open value so DQL never sees completed without sent or vice versa.
+pub(crate) fn bql_active(state: &NetdevState) -> bool {
+    state.bql_enabled.load(Ordering::Acquire)
+}
+
 fn ndo_start_xmit(state: &NetdevState, skb: crate::skb::DriverOwnedSkb) -> c_int {
-    XMIT_CALLS.fetch_add(1, Ordering::Relaxed);
+    let debug_counters = debug_counters_active(state);
+    if debug_counters {
+        XMIT_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
 
     // Offload bits — may mutate skb data; must precede the DMA map.
-    let (tso_opts1, first_opts2) = match compute_offload_bits(&skb) {
-        OffloadOutcome::Tso { opts1, opts2 } => (opts1, opts2),
-        OffloadOutcome::Csum { opts2 } => (0u32, opts2),
-        OffloadOutcome::Drop => {
+    let (tso_opts1, first_opts2, nr_frags) = match compute_offload_bits(&skb) {
+        Ok(bits) => bits,
+        Err(_) => {
             skb.free_with_error();
             return NETDEV_TX_OK;
         }
     };
 
-    let nr_frags = skb.nr_frags() as usize;
     let n_desc = 1 + nr_frags;
     let head = state.tx.head.inner.load(Ordering::Relaxed);
 
@@ -1360,26 +1579,42 @@ fn ndo_start_xmit(state: &NetdevState, skb: crate::skb::DriverOwnedSkb) -> c_int
             return NETDEV_TX_OK;
         }
     };
+    // The default small-frame path is single-buffer and BQL-inactive, so
+    // `linear_len` is the wire length and avoids a per-packet skb_len FFI call.
+    // BQL and SG/TSO still use the skb's logical length for balanced accounting.
+    let bql_enabled = bql_active(state);
+    let wire_len = if bql_enabled || nr_frags != 0 {
+        skb.wire_len()
+    } else {
+        linear_len as usize
+    };
+    let byte_budget = state.tx.byte_budget.inner.load(Ordering::Relaxed) as usize;
+    let budgeted_wire_len = tx_budget_tracked_bytes(byte_budget, wire_len);
+    let budget_len = tx_budget_shadow_len(budgeted_wire_len);
+    let budgeted_wire_len = budget_len as usize;
 
-    // `map_skb_fragments` takes ownership of `skb`. On error the
-    // TxMapGuard inside it has already unmapped the linear head + every
-    // published fragment and freed the skb. On success it returns the
-    // raw pointer to install into the FirstFrag shadow (for n_desc==1,
-    // where FirstFrag is also the LastFrag) or to record as the LastFrag
-    // owner (for n_desc>1, where the last-frag iteration of the loop
-    // already wrote it).
-    let skb_raw = match map_skb_fragments(
-        state,
-        skb,
-        head,
-        nr_frags,
-        linear_handle,
-        linear_len,
-        tso_opts1,
-        first_opts2,
-    ) {
-        Ok(r) => r,
-        Err(()) => return NETDEV_TX_OK,
+    // Single-buffer packets have no fallible work left after the linear DMA
+    // map, so consume the wrapper directly and skip the SG rollback guard.
+    // SG packets hand ownership to `map_skb_fragments`; on error its
+    // TxMapGuard has already unmapped linear + published fragment mappings and
+    // freed the skb. On success it returns the raw pointer for shadow storage.
+    let skb_raw = if nr_frags == 0 {
+        skb.into_raw()
+    } else {
+        match map_skb_fragments(
+            state,
+            skb,
+            head,
+            nr_frags,
+            linear_handle,
+            linear_len,
+            tso_opts1,
+            first_opts2,
+            budget_len,
+        ) {
+            Ok(r) => r,
+            Err(()) => return NETDEV_TX_OK,
+        }
     };
 
     // ── Write FirstFrag descriptor LAST — this is the commit point ─────
@@ -1400,10 +1635,13 @@ fn ndo_start_xmit(state: &NetdevState, skb: crate::skb::DriverOwnedSkb) -> c_int
     state.tx.shadow_dma[first_slot].store(linear_handle, Ordering::Release);
     state.tx.shadow_len[first_slot].store(linear_len, Ordering::Release);
     state.tx.shadow_is_frag[first_slot].store(false, Ordering::Release);
+    if n_desc == 1 && budget_len != 0 {
+        state.tx.shadow_budget_len[first_slot].store(budget_len, Ordering::Release);
+    }
     if n_desc == 1 {
         // Single-fragment skb — LastFrag is also the FirstFrag. The
-        // raw pointer returned by `map_skb_fragments` is the value the
-        // shadow's disposition obligation now references.
+        // raw pointer consumed above is the value the shadow's disposition
+        // obligation now references.
         state.tx.shadow[first_slot].store(skb_raw, Ordering::Release);
     } else {
         // The LastFrag slot already received the raw pointer inside
@@ -1424,23 +1662,82 @@ fn ndo_start_xmit(state: &NetdevState, skb: crate::skb::DriverOwnedSkb) -> c_int
         },
     );
 
+    let ndev = state.ndev.load(Ordering::Acquire);
+    let xmit_more = ub::netdev_xmit_more();
+
+    // BQL sent accounting (gated by bql_mode — safe default skips MSI delivery
+    // until the netdev_sent_queue/MSI interaction is revalidated with the
+    // legacy ISR surface; see `bql_active` + docs/perf/bql_20260605/). Over
+    // INTx this recaptures r8169 loaded-latency parity. The reaper can't
+    // complete this packet until tx_head advances below, so this still precedes
+    // its completed_queue (no completed-before-sent); the open-time seed keeps
+    // dql_avail >= 0 on the first xmit.
+    //
+    // When BQL is active, use the kernel's r8169-style helper so
+    // `xmit_more` batching and STACK_XOFF state produce one doorbell decision.
+    // Without BQL, the doorbell rule is simply "ring at the end of the qdisc
+    // batch".
+    let should_doorbell_for_batch = if bql_enabled {
+        ub::netdev_sent_queue(ndev, wire_len, xmit_more)
+    } else {
+        !xmit_more
+    };
+
+    // Driver-owned byte-budget accounting (the MSI-safe latency throttle —
+    // test 5). Only packet sizes that can hit the byte budget before descriptor
+    // hysteresis are counted. Tiny packets are already bounded by ring
+    // occupancy, so skipping their inflight atomic removes a measurable
+    // small-frame TX cost without weakening the latency throttle for bulk
+    // frames.
+    let inflight_after_bytes = if budgeted_wire_len != 0 {
+        state
+            .tx
+            .inflight_bytes
+            .inner
+            .fetch_add(budgeted_wire_len, Ordering::AcqRel)
+            + budgeted_wire_len
+    } else {
+        0
+    };
+
     // Update tx_head BEFORE touching the queue-state helper — the NAPI
     // reaper reads tx_head (via `in_flight`) to decide when to wake the
     // queue back up, so the stop+head ordering must be Release-Acquire
-    // sync'd. Then check whether to preemptively stop the queue: if
-    // free slots after THIS xmit are under TX_STOP_THRS, the next xmit
-    // would likely BUSY, so we stop now and let the reaper wake us.
+    // sync'd. Then check whether to preemptively stop the queue: stop if
+    // EITHER free slots after THIS xmit are under TX_STOP_THRS (the next
+    // xmit would likely BUSY) OR in-flight bytes have reached the byte
+    // budget (bound TX ring residency so fq_codel keeps latency low).
     let new_head = head.wrapping_add(n_desc);
     state.tx.head.inner.store(new_head, Ordering::Release);
     let in_flight_after = new_head.wrapping_sub(tail);
     let free_after = RING_LEN - in_flight_after;
-    if free_after < TX_STOP_THRS {
+    let over_byte_budget = budgeted_wire_len != 0 && inflight_after_bytes >= byte_budget;
+    let stop_for_ring_or_budget = free_after < TX_STOP_THRS || over_byte_budget;
+    if stop_for_ring_or_budget {
         // Matches the r8169 `netif_subqueue_maybe_stop` SMP-race
-        // discipline: stop, then recheck the consumer index and wake
-        // immediately if the reaper already freed enough descriptors.
+        // discipline: stop, then recheck (via `tx_should_wake`, which folds
+        // in the byte-budget low-water) and wake immediately if the reaper
+        // already drained enough descriptors AND bytes.
         stop_tx_queue_with_recheck(state, new_head);
     }
-    state.regs().tx_poll();
+
+    // `xmit_more` doorbell batching (r8169 `rtl8169_start_xmit` pattern). When
+    // the qdisc has more packets queued for this burst, defer the TX doorbell
+    // so one MMIO write amortizes the whole batch — this cuts doorbells/packet
+    // under small-frame TX load and recovers the PPS gap vs the C driver. The
+    // non-BQL path uses the raw batching hint directly, and the BQL path uses
+    // `__netdev_sent_queue()` so accounting and the doorbell decision stay
+    // coupled like r8169.
+    //
+    // We MUST still ring when we just stopped/throttled the queue: in that case
+    // there is no guaranteed follow-on xmit to ring the bell, so the
+    // descriptors we just posted would sit unsignaled behind a stopped queue.
+    if should_doorbell_for_batch || stop_for_ring_or_budget {
+        state.regs().tx_poll();
+        if debug_counters {
+            TX_DOORBELLS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     NETDEV_TX_OK
 }
@@ -1466,7 +1763,7 @@ extern "C" fn raw_irq_handler(_irq: c_int, dev_id: *mut c_void) -> bindings::irq
         // MSI/MSI-X 0 should be rare but is still benign to early-out.
         return bindings::irqreturn_IRQ_NONE as bindings::irqreturn_t;
     }
-    note_irq_fire();
+    note_irq_fire(state);
     // Ack everything we saw, mask further IRQs, hand off to NAPI.
     // NAPI's re-arm calls `rearm_irq_baseline` which selects the same
     // window after `napi_complete_done`, closing the loop.

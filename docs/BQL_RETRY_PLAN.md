@@ -1,6 +1,10 @@
-# BQL + `netdev_xmit_more()` — retry design (RX Opt #2 v2)
+# BQL retry design (RX Opt #2 v2)
 
-Status: **design only**, awaiting soak completion before implementation.
+Status: **implemented behind `bql_mode`**. The safe default runs BQL on INTx
+only (`bql_mode=1`). `netdev_sent_queue()` was isolated as unsafe on the
+one-vector V2/MSI-X surface; the driver now uses MSI delivery with the legacy
+ISR surface, but BQL remains INTx-only until that MSI path is separately
+revalidated. See `docs/perf/bql_20260605/`.
 Supersedes the failed first attempt logged in
 [`RX_OPTIMIZATION_CANDIDATES.md`](RX_OPTIMIZATION_CANDIDATES.md)
 ("RX Opt #2 — REVERTED" section). Task #91.
@@ -47,30 +51,30 @@ cannot make `dql_avail` go negative. A safe seed is
 plus headroom). For MTU > 1500 the seed scales with `dev->mtu`.
 
 ```c
-/* New cshim helper. Call from open after netif_start_queue is set up
+/* cshim helper. Call from open after netif_start_queue is set up
  * but before any xmit can fire. Safe to call multiple times (idempotent). */
-void r8125_bridge_dql_seed_min_limit(struct net_device *ndev, unsigned int seed)
+void r8125_bridge_dql_seed_min_limit(struct net_device *ndev)
 {
     struct netdev_queue *txq = netdev_get_tx_queue(ndev, 0);
+    unsigned int seed = READ_ONCE(ndev->mtu) + VLAN_ETH_HLEN + NET_SKB_PAD;
 
     /* Hold the queue lock so any concurrent xmit observes the new
      * baseline before its dql_queued() probe. */
     __netif_tx_lock_bh(txq);
-    txq->dql.min_limit = seed;
+    netdev_queue_set_dql_min_limit(txq, seed);
     if (txq->dql.limit < seed)
         txq->dql.limit = seed;
     __netif_tx_unlock_bh(txq);
 }
-EXPORT_SYMBOL_GPL(r8125_bridge_dql_seed_min_limit);
 ```
 
 Pros: minimal cshim surface, fixes the zero-limit bootstrap explicitly,
 and doesn't require a reset-time BQL state transition.
 
-Cons: reaches into `struct netdev_queue->dql` directly. Stable enough
-in mainline (the field is exported via `BQL_SHOW`/`BQL_STORE` sysfs)
-but counts as "cshim peeks at kernel internals" and needs its own
-CI invariant check.
+Cons: `min_limit` uses a public helper, but there is no helper for the
+initial `limit` floor. The cshim still sets `txq->dql.limit` directly
+under the TX queue lock to avoid the first-packet negative-availability
+stall. `ci/check_bql_accounting.sh` enforces this shape.
 
 ### Approach B — Skip `netdev_reset_queue()` entirely; ramp from zero
 
@@ -80,14 +84,17 @@ Combined with a TX path that **always rings the doorbell when
 `dql_avail < 0`** — see below — the first xmit goes through, completes,
 the limit grows, and BQL settles into its normal envelope.
 
-The TX path becomes:
+The TX path becomes the same shape r8169 uses: `xmit_more` and BQL are coupled
+inside `__netdev_sent_queue()`, which returns true when the doorbell must be
+used to kick the NIC.
 
 ```rust
-let should_doorbell = !ub::bridge_netdev_xmit_more()
-    || ub::bridge_netdev_xmit_more_force_doorbell(ndev);  // returns true
-                                                          // when queue is
-                                                          // STACK_XOFF'd
-                                                          // or first xmit
+let xmit_more = ub::netdev_xmit_more();
+let should_doorbell = if bql_active(state) {
+    ub::netdev_sent_queue(ndev, bytes, xmit_more)
+} else {
+    !xmit_more
+};
 if should_doorbell {
     state.regs().tx_poll();
 }
@@ -111,52 +118,45 @@ and matches what r8169 does — upstream `rtl_open` never calls
 ## TX path (with A in place)
 
 ```rust
-// in ndo_start_xmit, after publishing the descriptor with dma_wmb():
+// in ndo_start_xmit, after publishing the descriptor but before tx_head + doorbell:
 let bytes = skb.len();  // captured before consume
-let more = ub::bridge_netdev_xmit_more();
-
-let must_doorbell = ub::bridge_netdev_sent_queue(ndev, bytes, more);
-// bridge_netdev_sent_queue wraps __netdev_sent_queue and returns the
-// kernel's "ring now" decision. The safe Rust wrapper owns the FFI
-// unsafety; ndo_start_xmit must not contain an unsafe block.
-
-if must_doorbell {
-    state.regs().tx_poll();
-}
+let xmit_more = ub::netdev_xmit_more();
+let should_doorbell = ub::netdev_sent_queue(ndev, bytes, xmit_more);
 ```
 
 In the NAPI TX reap path:
 
 ```rust
 // after we've drained N completed packets totalling `bytes_completed`:
-ub::bridge_netdev_completed_queue(ndev, n_reaped, bytes_completed);
+ub::netdev_completed_queue(ndev, n_reaped, bytes_completed);
 ```
 
-The current reap path does not track completed byte counts; v2 must add
-that in the same patch that consumes it. Reintroducing a
-`DriverOwnedSkb::consume_tx -> u32` byte return is acceptable only if
-`bytes_completed` feeds `bridge_netdev_completed_queue` immediately and
-the gate rejects unused `_bytes_completed` plumbing.
+The reap path tracks completed byte counts by returning `skb->len` from
+`DriverOwnedSkb::consume_tx`. That value feeds `netdev_completed_queue`
+immediately in the same NAPI batch.
 
 ## ndo_open / ndo_stop boundaries
 
 * **open**, after `netif_start_queue`:
   `bridge_dql_seed_min_limit(ndev, ETH_DATA_LEN + headroom)`. Seed
   scales with current `dev->mtu`.
-* **stop**: nothing. The queue is going down; BQL state will be
-  discarded with the next netdev unregister.
+* **stop**: free any in-flight TX shadows and complete their BQL bytes before
+  clearing `bql_enabled`, so sent/completed accounting remains balanced across
+  explicit stop and Drop-driven teardown.
 
-## CI gates needed
+## CI gates
 
-1. **`ci/check_bql_xmit_more.sh`** — add a fresh static gate. Static
+1. **`ci/check_bql_accounting.sh`** — static gate. Static
    checks for:
    * cshim helper `r8125_bridge_dql_seed_min_limit` present
-   * cshim helper `r8125_bridge_netdev_sent_queue` present + returns `bool`
-   * Rust `bridge_dql_seed_min_limit` wrapper called from
+   * cshim helper `r8125_bridge_netdev_sent_queue` present
+   * Rust `dql_seed_min_limit` wrapper called from
      `ndo_open` exactly once
+   * `ndo_start_xmit` feeds `xmit_more` into `__netdev_sent_queue` so BQL and
+     the doorbell decision cannot drift
    * `ndo_start_xmit` has no local `unsafe` block for BQL
    * completed byte accounting is used, not parked in `_bytes_completed`
-   * `netdev_reset_queue` not referenced from either Rust or C
+   * `netdev_reset_queue` not called from either Rust or C
      (proves we're using Approach A, not v1's broken pattern)
 2. **New runtime gate (guest-CI-only)** —
    `ci/check_bql_bootstrap.sh`: insmod the module, drive a single
@@ -165,11 +165,11 @@ the gate rejects unused `_bytes_completed` plumbing.
 
 ## Census + LOC
 
-* Adds **4** safe Rust wrappers over unsafe FFI calls (sent_queue,
-  xmit_more, completed_queue, dql_seed_min_limit). Census 52 -> 56.
-  Justification entry needed in `ci/CENSUS_JUSTIFICATIONS.md`.
+* Adds **4** safe Rust wrappers over unsafe FFI calls (`skb_len`,
+  `sent_queue`, `completed_queue`, `dql_seed_min_limit`). Census 56 -> 60.
+  Justification is recorded in `ci/CENSUS_JUSTIFICATIONS.md`.
 * cshim helpers fit inside `netdev_bridge_offload.c` (currently
-  ~250 LOC, cap 400) — no LOC cap bump expected.
+  ~300 LOC, cap 400) — no LOC cap bump expected.
 
 ## Open questions
 
@@ -187,11 +187,10 @@ the gate rejects unused `_bytes_completed` plumbing.
 
 ## Expected gain
 
-Same as v1 (it's the same optimization, just bootstrap-safe). Per
-docs/RX_OPTIMIZATION_CANDIDATES.md original analysis: 10–20% TX path
-when xmit_more bursts batch doorbells. KVM measured noise on v1
-because the stall masked any potential gain; Gateway should be the
-real measurement target.
+BQL fixes loaded latency by bounding TX ring residency so fq_codel can
+protect interactive packets under a saturated bulk TX flow. Gateway results
+on 2026-06-05 show p99.9 latency returning to r8169 parity over INTx; see
+`docs/perf/bql_20260605/RESULTS.md`.
 
 ## Test plan post-soak
 

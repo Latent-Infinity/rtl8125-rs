@@ -30,6 +30,11 @@
 #      `free > TX_START_THRS` check, not unconditional.
 #   7. Stop-side hysteresis: xmit's preemptive stop is guarded by
 #      a `free_after < TX_STOP_THRS` check.
+#   8. Doorbell batching: xmit must couple `netdev_xmit_more()` with the
+#      doorbell predicate and still force a doorbell when stop/throttle fires.
+#   9. Byte-budget accounting must use a per-packet shadow so small packets
+#      that cannot hit the byte budget before ring stop do not pay inflight
+#      atomics and do not subtract untracked bytes at completion.
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -106,6 +111,7 @@ fi
 # store because no descriptors were posted in that branch (we return
 # BUSY). Regex tolerates the task #59 `tx.head` nesting.
 xmit_body=$(awk '/fn ndo_start_xmit/,/^}/' "$NETDEV")
+tx_reap_body=$(awk '/fn process_tx_completions/,/^}/' "$NAPI")
 if echo "$xmit_body" | awk '
 	/tx[_.]head\.inner\.store/ { stored = 1 }
 	/regs\(\)\.tx_poll/ { if (!stored) print "BAD"; exit }
@@ -116,10 +122,27 @@ else
 fi
 
 # -- 6. wake-side hysteresis -------------------------------------------------
+# The wake is guarded either directly by `if free > TX_START_THRS`, or via the
+# shared `tx_should_wake(state, free)` predicate that folds the same
+# `free <= TX_START_THRS` floor together with the byte-budget low-water (the
+# test-5 MSI-safe throttle). For the predicate form we also confirm the floor
+# actually lives inside `tx_should_wake` so the hysteresis cannot be bypassed.
 if echo "$poll_body" | grep -qE 'if free > TX_START_THRS'; then
 	grn "poll: tx_wake_queue is guarded by 'free > TX_START_THRS' (hysteresis)"
+elif echo "$poll_body" | grep -qE 'tx_should_wake\(state, free\)'; then
+	tsw_body=$(awk '/fn tx_should_wake\(/,/^}/' "$NETDEV")
+	if echo "$tsw_body" | grep -qE 'free <= .*TX_START_THRS'; then
+		grn "poll: tx_wake_queue guarded via tx_should_wake (TX_START_THRS floor + byte budget)"
+	else
+		red "poll: tx_should_wake is missing the TX_START_THRS hysteresis floor"
+	fi
+	if echo "$tsw_body" | grep -qE '\(budget / 2\)\.max\(1\)'; then
+		grn "poll: tx_should_wake keeps byte-budget low-water nonzero"
+	else
+		red "poll: tx_should_wake must keep byte-budget low-water nonzero"
+	fi
 else
-	red "poll: tx_wake_queue not guarded by 'free > TX_START_THRS'"
+	red "poll: tx_wake_queue not guarded by 'free > TX_START_THRS' or tx_should_wake"
 fi
 
 # -- 7. stop-side hysteresis -------------------------------------------------
@@ -129,6 +152,29 @@ if echo "$xmit_body" | grep -qE 'free_after < TX_STOP_THRS'; then
 	grn "xmit: preemptive tx_stop_queue is guarded by 'free_after < TX_STOP_THRS'"
 else
 	red "xmit: preemptive stop not guarded by 'free_after < TX_STOP_THRS'"
+fi
+
+# -- 8. xmit_more doorbell batching -----------------------------------------
+if echo "$xmit_body" | grep -q 'let xmit_more = ub::netdev_xmit_more();' \
+   && echo "$xmit_body" | grep -q 'let should_doorbell_for_batch = if bql_enabled' \
+   && echo "$xmit_body" | grep -q 'ub::netdev_sent_queue(ndev, wire_len, xmit_more)' \
+   && echo "$xmit_body" | grep -q 'if should_doorbell_for_batch || stop_for_ring_or_budget' \
+   && echo "$xmit_body" | grep -q 'TX_DOORBELLS.fetch_add'; then
+	grn "xmit: xmit_more/BQL doorbell batching is gated and stop/throttle forces tx_poll"
+else
+	red "xmit: doorbell batching must use xmit_more/BQL and force tx_poll on stop/throttle"
+fi
+
+# -- 9. byte-budget tracked-byte shadow ---------------------------------------
+if grep -Fq 'tx_budget_tracked_bytes(byte_budget, wire_len)' <<<"$xmit_body" \
+   && grep -Fq 'state.tx.shadow_budget_len' <<<"$xmit_body" \
+   && grep -Fq 'fetch_add(budgeted_wire_len, Ordering::AcqRel)' <<<"$xmit_body" \
+   && grep -Fq 'completed_budget_bytes' <<<"$tx_reap_body" \
+   && grep -Fq 'state.tx.shadow_budget_len[slot].swap' <<<"$tx_reap_body" \
+   && grep -Fq 'saturating_sub(completed_budget_bytes)' <<<"$tx_reap_body"; then
+	grn "tx byte-budget uses tracked-byte shadow and skips untracked small-frame atomics"
+else
+	red "tx byte-budget must add/subtract the per-packet tracked-byte shadow"
 fi
 
 exit $rc

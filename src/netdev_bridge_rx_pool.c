@@ -49,6 +49,7 @@
 #include <linux/mm.h>
 #include <linux/prefetch.h>
 #include <linux/skbuff.h>
+#include <linux/swab.h>
 
 #include <net/page_pool/helpers.h>
 #include <net/page_pool/types.h>
@@ -64,6 +65,8 @@
 
 /* 14-bit descriptor LEN / RxMaxSize ceiling (DESC_LEN_MASK on the Rust side). */
 #define R8125_RX_DESC_MAX	0x3FFF
+#define R8125_RX_VLAN_TAG	BIT(16)
+#define R8125_RX_VLAN_MASK	0xffffU
 
 /*
  * Compute the per-MTU RX buffer geometry and stash it in the bridge.
@@ -116,7 +119,12 @@ int r8125_bridge_rx_pool_create(struct net_device *ndev, unsigned int ring_len,
 
 	pp.order = b->rx_order;
 	pp.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV;
-	pp.pool_size = ring_len;
+	/* Zero-copy RX can have up to one ring worth of pages posted to the
+	 * device while another burst is still returning from the stack via skb
+	 * recycle. A 2x recycle cache smooths small-frame bursts without
+	 * preallocating pages; it only sizes page_pool's ptr_ring.
+	 */
+	pp.pool_size = ring_len * 2;
 	pp.nid = dev_to_node(&b->pdev->dev);
 	pp.dev = &b->pdev->dev;
 	pp.napi = &b->napi;
@@ -211,7 +219,8 @@ void r8125_bridge_rx_free(struct net_device *ndev, void *cpu)
  */
 void r8125_bridge_rx_one_packet(struct net_device *ndev, dma_addr_t dma,
 				const void *buf, size_t len, u32 desc_opts1,
-				void **new_cpu, dma_addr_t *new_dma)
+				u32 desc_opts2, void **new_cpu,
+				dma_addr_t *new_dma)
 {
 	struct r8125_bridge *b = netdev_priv(ndev);
 	struct page *newpage;
@@ -242,6 +251,10 @@ void r8125_bridge_rx_one_packet(struct net_device *ndev, dma_addr_t dma,
 		__skb_put(skb, len);
 		skb->protocol = eth_type_trans(skb, ndev);
 		r8125_bridge_skb_rx_csum_set(skb, desc_opts1);
+		if (desc_opts2 & R8125_RX_VLAN_TAG)
+			__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
+						swab16(desc_opts2 &
+						       R8125_RX_VLAN_MASK));
 		this_cpu_inc(*b->rx_handed_to_stack);
 		dev_sw_netstats_rx_add(ndev, len);
 		napi_gro_receive(&b->napi, skb);

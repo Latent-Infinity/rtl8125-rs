@@ -48,11 +48,12 @@ use crate::unsafe_boundary as ub;
 /// the probe-chosen [`IrqMode`]:
 ///
 ///   * `Intx` → write `INTR_M4_BASELINE` to legacy `IMR` (0x38).
-///   * `Msi` with V2 capability → write `INTR_V2_M4_BASELINE` to
-///     `IMR_V2_SET` (0x0D0C);
-///     without V2 capability, `Msi` falls back to legacy `IMR`.
-///     bits in this register are unmask-set semantics, so the same write
+///   * `Msi` with `use_v2=true` → write `INTR_V2_M4_BASELINE` to
+///     `IMR_V2_SET` (0x0D0C).
+///     Bits in this register are unmask-set semantics, so the same write
 ///     re-arms after each NAPI cycle without first clearing.
+///   * `Msi` with `use_v2=false` → write legacy `IMR`; this is the default
+///     one-vector MSI/MSI-X path so TX completions share vector 0.
 ///
 /// Centralized here so the three call sites (ndo_open initial unmask,
 /// the IRQ handler tail, and napi_complete_done) read the same surface
@@ -95,7 +96,7 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
     // Per-MTU buffer length for this open (M6 #2 v3): drives both the
     // frame-length clamp and the descriptor LEN field. Invariant across
     // the poll, so load once. Already ≤ DESC_LEN_MASK (the cshim caps it).
-    let buf_len = state.rx.buf_len.load(Ordering::Acquire);
+    let buf_len = state.rx.buf_len.load(Ordering::Relaxed);
     let buf_desc_len = buf_len & regs::DESC_LEN_MASK;
     let buf_len = buf_len as usize;
     while work_done < budget_u {
@@ -117,7 +118,7 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
         // Default re-post address is the slot's current DMA buffer (the
         // `len == 0` case below never consumes it, so it stays
         // device-owned and needs no refill).
-        let slot_dma = state.rx.slot_dma[rx_tail].load(Ordering::Acquire);
+        let slot_dma = state.rx.slot_dma[rx_tail].load(Ordering::Relaxed);
         let mut post_dma = slot_dma;
         if len > 0 {
             // RX super-call (RX_OPTIMIZATION_CANDIDATES.md §B + per-MTU #3):
@@ -127,9 +128,15 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
             // page; the call returns the slot's new (cpu, dma). On a refill
             // failure it drops the frame and returns the old (cpu, dma)
             // unchanged. The cshim handles all §6.3 counter accounting.
-            let slot_cpu = state.rx.slot_cpu[rx_tail].load(Ordering::Acquire);
-            let (new_cpu, new_dma) =
-                ub::bridge_rx_one_packet(ndev, slot_dma, slot_cpu.cast_const(), len, desc.opts1);
+            let slot_cpu = state.rx.slot_cpu[rx_tail].load(Ordering::Relaxed);
+            let (new_cpu, new_dma) = ub::bridge_rx_one_packet(
+                ndev,
+                slot_dma,
+                slot_cpu.cast_const(),
+                len,
+                desc.opts1,
+                desc.opts2,
+            );
             // Publish the refilled buffer into the slot shadow so the next
             // wrap-around reads the live page, not the one now owned by the
             // stack. (No-op store on the drop path — values are unchanged.)
@@ -176,7 +183,14 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
 fn process_tx_completions(state: &NetdevState) -> (usize, usize, usize) {
     let mut tx_tail = state.tx.tail.inner.load(Ordering::Acquire);
     let tx_head = state.tx.head.inner.load(Ordering::Acquire);
+    let ndev = state.ndev.load(Ordering::Acquire);
     let mut reaped = 0usize;
+    // Completed logical packets (skbs = LastFrag slots), full wire bytes for
+    // stats/BQL, and the subset that was tracked by the driver-owned
+    // byte-budget throttle at xmit commit.
+    let mut completed_pkts = 0usize;
+    let mut completed_bytes = 0usize;
+    let mut completed_budget_bytes = 0usize;
     while tx_tail != tx_head {
         let slot = tx_tail % RING_LEN;
         let desc = ub::desc_read(state.tx.desc, slot);
@@ -207,7 +221,10 @@ fn process_tx_completions(state: &NetdevState) -> (usize, usize, usize) {
             // (stats drain happens inside `consume_tx`). The DMA unmap
             // for THIS slot already happened above; for SG packets the
             // intermediate slots' unmaps happened in earlier loop iters.
-            skb.consume_tx(state.ndev.load(Ordering::Acquire));
+            completed_budget_bytes +=
+                state.tx.shadow_budget_len[slot].swap(0, Ordering::AcqRel) as usize;
+            completed_bytes += skb.consume_tx(ndev);
+            completed_pkts += 1;
         }
         // Clear the descriptor (preserve EOR if last slot).
         let mut opts1 = 0u32;
@@ -226,6 +243,31 @@ fn process_tx_completions(state: &NetdevState) -> (usize, usize, usize) {
         tx_tail = tx_tail.wrapping_add(1);
         reaped += 1;
     }
+    // Byte-budget throttle (test 5): return this batch's tracked bytes to the
+    // driver-owned in-flight counter. Small packets whose full descriptor window
+    // is below the budget are not tracked, so their shadow contributes zero.
+    // `saturating_sub` makes the decrement underflow-proof — if the counter
+    // ever drifted below the batch (it shouldn't, since xmit writes the same
+    // shadow length that the reaper consumes here),
+    // wrapping to usize::MAX would wedge the queue stopped forever via
+    // tx_should_wake, so we floor at 0 instead.
+    if completed_budget_bytes > 0 {
+        let _ =
+            state
+                .tx
+                .inflight_bytes
+                .inner
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                    Some(v.saturating_sub(completed_budget_bytes))
+                });
+    }
+    // BQL: report the completed batch once (dql_completed + auto-wake). Gated
+    // by the SAME predicate as the xmit-side netdev_sent_queue (bql_active) so
+    // dql can never imbalance (completed without a matching sent). Safe default
+    // skips MSI delivery; see crate::netdev::bql_active + docs/perf/bql_20260605/.
+    if completed_pkts > 0 && crate::netdev::bql_active(state) {
+        ub::netdev_completed_queue(ndev, completed_pkts, completed_bytes);
+    }
     (tx_tail, tx_head, reaped)
 }
 
@@ -236,7 +278,7 @@ fn process_tx_completions(state: &NetdevState) -> (usize, usize, usize) {
 /// Returns `work_done` in `[0, budget]`. See the module docstring for
 /// the §6.3 / §7-M5 contract this function must satisfy.
 pub(crate) fn poll(state: &NetdevState, budget: c_int) -> c_int {
-    crate::netdev::note_napi_poll();
+    crate::netdev::note_napi_poll(state);
     // `budget == 0` is the explicit "TX-cleanup only" path (plan §7 M5).
     // The kernel uses it during netpoll / netconsole and during certain
     // shutdown sequences. We skip the RX loop entirely (no skb-build,
@@ -253,13 +295,22 @@ pub(crate) fn poll(state: &NetdevState, budget: c_int) -> c_int {
         // to start posting again. Stale tail with woken queue means an
         // immediate NETDEV_TX_BUSY.
         state.tx.tail.inner.store(tx_tail, Ordering::Release);
+        // Pair with the `fence(SeqCst)` in `stop_tx_queue_with_recheck`: this
+        // full StoreLoad barrier orders the `tx_tail` publish (and the
+        // inflight-bytes subtract done in `process_tx_completions` above)
+        // before the wake decision, so xmit's recheck and our wake can never
+        // both miss each other (Dekker). Without it the queue can wedge XOFF
+        // forever under UDP TX. See netdev::stop_tx_queue_with_recheck.
+        core::sync::atomic::fence(Ordering::SeqCst);
         let in_flight = tx_head.wrapping_sub(tx_tail);
         let free = RING_LEN - in_flight;
-        // Wake only when we've drained past the start threshold. This is
-        // the wake-side half of the hysteresis (xmit stops the queue at
-        // `TX_STOP_THRS`); without it we'd thrash kernel queue state on
-        // every single reaped descriptor.
-        if free > TX_START_THRS {
+        // Wake only when we've drained past the start threshold AND in-flight
+        // bytes are back under the byte-budget low-water. This is the wake-side
+        // half of the hysteresis (xmit stops the queue at `TX_STOP_THRS` or at
+        // the byte budget); `tx_should_wake` folds in both so we don't thrash
+        // kernel queue state on every reaped descriptor, and don't re-open the
+        // queue while it's still over the latency byte budget.
+        if crate::netdev::tx_should_wake(state, free) {
             let ndev = state.ndev.load(Ordering::Acquire);
             ub::bridge_tx_wake_queue(ndev);
         }

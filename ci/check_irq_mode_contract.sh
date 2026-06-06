@@ -48,6 +48,21 @@ else
 	red "probe does not allocate/store IRQ mode with MSI/MSI-X plus INTx fallback"
 fi
 
+# We allocate exactly one MSI/MSI-X vector. RTL8125's V2 per-queue interrupt
+# surface routes TX Q0 to MSI-X table entry 16, so enabling V2 with one vector
+# loses TX-only completions. MSI/MSI-X delivery is fine, but it must use the
+# legacy combined ISR/IMR surface until the driver allocates the vendor-required
+# vector count for V2.
+probe_irq_block=$(awk '/let \(irq_mode, use_v2\) = if intx_only/,/pr_info!/' "$PCI")
+if echo "$probe_irq_block" | grep -qE 'IrqType::MsiX' &&
+   echo "$probe_irq_block" | grep -qE 'IrqType::Msi' &&
+   echo "$probe_irq_block" | grep -qE '\(IrqMode::Msi,[[:space:]]*false\)' &&
+   ! echo "$probe_irq_block" | grep -qE '\(IrqMode::Msi,[[:space:]]*true\)'; then
+	grn "single-vector MSI/MSI-X uses legacy ISR/IMR surface (use_v2=false)"
+else
+	red "single-vector MSI/MSI-X must not enable the V2 ISR surface"
+fi
+
 if grep -qE 'request_irq\([^,]+,[^,]+,[^,]+,[[:space:]]*irq_flags\)' "$NETDEV" &&
    awk '/let irq_flags = match state\.irq_mode\(\)/,/};/' "$NETDEV" | \
 		grep -qE 'IrqMode::Intx[[:space:]]*=>[[:space:]]*ub::IRQF_SHARED' &&
@@ -92,6 +107,34 @@ if grep -qE 'pub\(crate\)[[:space:]]+const[[:space:]]+INT_CFG0_ENABLE_8125:[[:sp
 	grn "INT_CFG0_ENABLE_8125 uses the reviewed BIT(0) value"
 else
 	red "INT_CFG0_ENABLE_8125 must stay at BIT(0) (0x01)"
+fi
+
+if grep -qE 'INT_CFG0_TIMEOUT0_BYPASS_8125:[[:space:]]*u8[[:space:]]*=[[:space:]]*0x02;' "$REGS" &&
+   grep -qE 'INT_CFG0_MITIGATION_BYPASS_8125:[[:space:]]*u8[[:space:]]*=[[:space:]]*0x04;' "$REGS"; then
+	grn "INT_CFG0 mitigation bypass bits use the reviewed RTL8125 values"
+else
+	red "INT_CFG0 mitigation bypass constants must stay at BIT(1)/BIT(2)"
+fi
+
+setup_irq_block=$(awk '/fn setup_interrupt_config/,/^}/' "$NETDEV")
+if echo "$setup_irq_block" | grep -qE 'INT_CFG0_ENABLE_8125' &&
+   echo "$setup_irq_block" | grep -qE 'INT_CFG0_TIMEOUT0_BYPASS_8125' &&
+   echo "$setup_irq_block" | grep -qE 'INT_CFG0_MITIGATION_BYPASS_8125' &&
+   echo "$setup_irq_block" | grep -qE 'zero_coalesce_table_8125b\(\)' &&
+   echo "$setup_irq_block" | grep -qE 'set_int_cfg1\(0\)'; then
+	grn "open clears V2 and mitigation-bypass bits before programming IRQ moderation"
+else
+	red "setup_interrupt_config must clear V2 + mitigation-bypass bits and reset INT_MITI"
+fi
+
+moderation_block=$(awk '/fn program_interrupt_moderation/,/^}/' "$NETDEV")
+if grep -qE 'program_interrupt_moderation\(state,[[:space:]]*&regs\)' "$NETDEV" &&
+   echo "$moderation_block" | grep -qE 'irq_mode\(\)[[:space:]]*==[[:space:]]*IrqMode::Msi[[:space:]]*&&[[:space:]]*state\.use_v2_irq_surface\(\)' &&
+   echo "$moderation_block" | grep -qE 'set_coalesce_8125b\(rx_timer,[[:space:]]*tx_timer\)' &&
+   echo "$moderation_block" | grep -qE 'INT_MITI timers use_v2='; then
+	grn "RTL8125 INT_MITI timers are programmed for the selected IRQ surface"
+else
+	red "INT_MITI timers must be programmed outside the V2-only branch"
 fi
 
 request_irq_body=$(awk '/fn[[:space:]]+request_irq\(/,/^}/' "$UB")

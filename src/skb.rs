@@ -10,8 +10,8 @@
 //! raw skb pointer is immediately wrapped, mapped, either submitted to
 //! the TX ring or freed, and later consumed by the TX reaper. Every TX
 //! skb operation the Rust driver performs goes through one of its
-//! inherent methods — `dma_map_linear`, `dma_map_frag`, `tso_setup`,
-//! `tx_csum_opts`, `nr_frags` — so the underlying raw pointer never
+//! inherent methods — `tx_offload_prepare`, `dma_map_linear`,
+//! `dma_map_frag` — so the underlying raw pointer never
 //! leaks into arbitrary Rust code.
 //!
 //! Consumption is by-value: exactly one of [`DriverOwnedSkb::consume_tx`],
@@ -56,9 +56,9 @@ use crate::unsafe_boundary as ub;
 /// **Consumption discipline.** Exactly one of the methods marked
 /// `(consumes)` below MUST be called on every value, or the skb leaks
 /// (`#[must_use]` warns at compile time, kmemleak catches the leak at
-/// runtime). The intermediate borrow methods (`dma_map_*`, `tso_setup`,
-/// `tx_csum_opts`, `nr_frags`) take `&self` so the
-/// caller can compose them before deciding the disposition.
+/// runtime). The intermediate borrow methods (`tx_offload_prepare`,
+/// `dma_map_*`) take `&self` so the caller can compose them before
+/// deciding the disposition.
 ///
 /// **Hot path.** Constructor + Drop are zero-cost: the wrapper is a
 /// `repr(transparent)` newtype around `*mut sk_buff`. All method bodies
@@ -100,28 +100,12 @@ impl DriverOwnedSkb {
         }
     }
 
-    /// Number of paged fragments (TX path). 0 for linear-only skbs.
+    /// Combined TX offload prep: returns `(opts1, opts2, nr_frags)` for
+    /// descriptor programming after any C-side skb mutation. This must run
+    /// before DMA mapping.
     #[inline]
-    pub(crate) fn nr_frags(&self) -> u32 {
-        ub::skb_nr_frags(self.raw)
-    }
-
-    /// TSO descriptor-bit setup (TX path). Returns `Some((opts1, opts2))`
-    /// for TCPv4/v6 GSO super-skbs, `None` otherwise. The cshim may
-    /// mutate the skb (`skb_cow_head` + `tcp_v6_gso_csum_prep` for v6);
-    /// any later DMA map sees the final bytes.
-    #[inline]
-    pub(crate) fn tso_setup(&self) -> Option<(u32, u32)> {
-        ub::skb_tso_setup(self.raw)
-    }
-
-    /// Plain (non-TSO) CSUM offload bits (TX path). Returns the opts2
-    /// value to OR into the descriptor, or
-    /// `crate::regs::TX_CSUM_OPTS_DROP` if the skb must be dropped
-    /// (chip can't compute the CSUM and software fallback failed).
-    #[inline]
-    pub(crate) fn tx_csum_opts(&self) -> u32 {
-        ub::skb_tx_csum_opts(self.raw)
+    pub(crate) fn tx_offload_prepare(&self) -> Result<(u32, u32, u32)> {
+        ub::skb_tx_offload_prepare(self.raw)
     }
 
     /// DMA-map the linear head for TX (`dma_map_single` under the hood).
@@ -187,10 +171,18 @@ impl DriverOwnedSkb {
 
     /// `(consumes)` TX completion path — give the skb back to NAPI
     /// for recycling. §6.3 TX disposition (a). `tx_consumed++` happens
-    /// inside the cshim helper.
+    /// inside the cshim helper. Returns the wire length (`skb->len`) so the
+    /// reaper can batch it into the BQL completed-queue accounting.
     #[inline]
-    pub(crate) fn consume_tx(self, ndev: *mut bindings::net_device) {
-        ub::skb_consume_tx(ndev, self.raw);
+    pub(crate) fn consume_tx(self, ndev: *mut bindings::net_device) -> usize {
+        ub::skb_consume_tx(ndev, self.raw)
+    }
+
+    /// Wire length (`skb->len`) — read in `ndo_start_xmit` before the skb is
+    /// handed to the ring, for the BQL `netdev_sent_queue` at the commit.
+    #[inline]
+    pub(crate) fn wire_len(&self) -> usize {
+        ub::skb_len(self.raw)
     }
 
     /// `(consumes)` TX error disposition — `dev_kfree_skb_any` under

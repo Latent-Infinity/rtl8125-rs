@@ -8,6 +8,7 @@
 #   - every page_pool_create has a matching page_pool_destroy,
 #   - allocated pages either go to the stack (recycle) or back to the pool
 #     (page_pool_put_full_page) — no bare alloc without a return path,
+#   - recycle cache is deeper than the descriptor ring for zero-copy RX bursts,
 #   - ndo_stop frees all slots AND destroys the pool,
 #   - ndo_open failure paths release the pool (RAII guard or manual).
 
@@ -54,7 +55,15 @@ if [[ "$alloc_count" -gt 0 ]]; then
 	fi
 fi
 
-# 3. The driver must NOT mix the bare-page allocator with page_pool — that
+# 3. The page_pool recycle cache should absorb at least one ring of posted
+#    buffers plus one ring of stack-delayed recycled buffers.
+if grep -q 'pp.pool_size = ring_len \* 2;' "$ROOT/src/netdev_bridge_rx_pool.c"; then
+	grn "RX page_pool recycle cache is 2x ring length for zero-copy bursts"
+else
+	red "RX page_pool pool_size must be ring_len * 2 for small-frame burst stability"
+fi
+
+# 4. The driver must NOT mix the bare-page allocator with page_pool — that
 #    would double-own buffers. (The v2 alloc_pages/dma_map_page path is gone.)
 if grep -qE '\balloc_pages\(|\bdma_map_page\(' "$ROOT/src/"*.c 2>/dev/null; then
 	red "bare alloc_pages/dma_map_page present alongside page_pool — buffer ownership ambiguity"
@@ -62,14 +71,14 @@ else
 	grn "RX path uses page_pool exclusively (no bare alloc_pages/dma_map_page)"
 fi
 
-# 4. Per-slot DMA shadow tracking (NAPI needs to re-post the refilled addr).
+# 5. Per-slot DMA shadow tracking (NAPI needs to re-post the refilled addr).
 if grep -qE 'slot_dma\s*:\s*\[' "$ROOT/src/netdev.rs" 2>/dev/null; then
 	grn "RX per-slot DMA shadow tracking is present"
 else
 	red "RX pool uses streaming DMA but no slot_dma shadow — re-post/leak risk"
 fi
 
-# 5. ndo_stop frees all slots AND destroys the pool.
+# 6. ndo_stop frees all slots AND destroys the pool.
 stop_body=$(awk '/fn[[:space:]]+ndo_stop\(/,/^}/' "$ROOT/src/netdev.rs" 2>/dev/null)
 if grep -q 'free_rx_slots(state)' <<<"$stop_body"; then
 	grn "ndo_stop frees the RX pool slots (free_rx_slots also destroys the pool)"
@@ -84,14 +93,14 @@ else
 	red "free_rx_slots must rx_pool_destroy() after freeing all slots"
 fi
 
-# 6. ndo_open post-allocation failure paths release the pool. The RxPoolGuard
+# 7. ndo_open post-allocation failure paths release the pool. The RxPoolGuard
 #    RAII form: its Drop calls free_rx_slots (which destroys the pool), so any
 #    `?`/`return Err` after RxPoolGuard::allocate unwinds automatically.
 raii_ok=1
 grep -qE 'struct RxPoolGuard' "$ROOT/src/netdev.rs" || raii_ok=0
 grep -qE 'impl(<[^>]+>)?[[:space:]]+Drop[[:space:]]+for[[:space:]]+RxPoolGuard' "$ROOT/src/netdev.rs" || raii_ok=0
 grep -q 'free_rx_slots(self.state)' "$ROOT/src/netdev.rs" || raii_ok=0
-awk '/fn[[:space:]]+ndo_open\(/,/^}/' "$ROOT/src/netdev.rs" | grep -q 'RxPoolGuard::allocate' || raii_ok=0
+grep -q 'RxPoolGuard::allocate(state)' "$ROOT/src/netdev.rs" || raii_ok=0
 if grep -qE 'fn[[:space:]]+free_rx_slots\(' "$ROOT/src/netdev.rs" && [[ $raii_ok -eq 1 ]]; then
 	grn "ndo_open failure paths release the RX pool (RxPoolGuard RAII)"
 else

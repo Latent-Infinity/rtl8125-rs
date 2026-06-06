@@ -40,6 +40,21 @@ Other A + B wins that are not perf-numbers:
 - The cshim `r8125_bridge_rx_one_packet` mirrors r8169's `rtl_rx`
   inline-everything shape exactly.
 
+## Hardware offload state — VLAN vs RSS/RXHASH
+
+2026-06-06: VLAN hardware acceleration is wired into the current RX/TX
+descriptor path. TX encodes the VLAN TCI into descriptor `opts2`, and RX
+passes descriptor `opts2` through `__vlan_hwaccel_put_tag` after enabling the
+RTL8125 RxConfig VLAN strip bits.
+
+RSS/RXHASH is intentionally **not** advertised yet. The current Rust RX ring
+uses the legacy 16-byte descriptor shape (`opts1`, `opts2`, `addr`), while
+Realtek's RSS hash result and packet-type metadata live in RxDescV3/V4 fields.
+Enabling `NETIF_F_RXHASH` before migrating the descriptor parser and adding a
+multi-RX-ring topology would give the stack invalid hash promises. The runtime
+C-vs-Rust validation harness and the checklist for enabling RXHASH are in
+[`perf/HW_OFFLOAD_VALIDATE.md`](perf/HW_OFFLOAD_VALIDATE.md).
+
 ## FFI crossings per packet — the structural finding
 
 Our `napi::process_rx_completions` hot-path makes **7 FFI
@@ -414,9 +429,13 @@ every packet (or close to it) so the LB sees an honest signal of
 device capacity and doesn't introduce hidden delay.
 
 Target chip programming when J is exercised:
-- `IntrMitigate` (offset 0xE2) — set `rx_count = 1, rx_usecs = 0`;
-  same for TX. r8169's `rtl_set_coalesce` is the reference.
-- `CPlusCmd[14:13]` (CMTR enable) — leave cleared / explicitly clear.
+- RTL8125B `INT_MITI` table (offset 0xA00 for queue/vector 0) — sweep low
+  RX/TX timer values while keeping `INT_CFG0_TIMEOUT0_BYPASS_8125` and
+  `INT_CFG0_MITIGATION_BYPASS_8125` cleared. The old 8168/8169 `IntrMitigate`
+  address at 0xE2 is RX/TX FIFO status on RTL8125-family chips, not the
+  coalescing control path.
+- `CPlusCmd[14:13]` (CMTR enable in older references) — leave cleared /
+  explicitly clear.
 
 Trade: higher CPU at line rate, lower tail latency + lower jitter.
 
