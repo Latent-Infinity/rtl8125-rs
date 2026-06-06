@@ -678,25 +678,50 @@ pub(crate) fn desc_publish_own(ring: *mut u8, idx: usize, value: Descriptor, for
 
 // ── RX descriptor helpers (phase 1) ───────────────────────────────────────
 
-/// Read one RX hardware descriptor from `ring[idx]` (volatile, 32-byte storage).
+/// Read one RX hardware descriptor at `ring + idx * format_stride` (volatile).
 ///
-/// RX rings are now allocated with the `RxDescriptor` storage layout to cover
-/// both legacy and RSS-capable descriptor formats. The active parse format
-/// (legacy/V3/V4) is decided once at open.
-pub(crate) fn desc_read_rx(ring: *mut RxDescriptor, idx: usize) -> RxDescriptor {
-    // SAFETY: caller guarantees idx < N+1 of the ring this pointer indexes.
-    // Volatile to discipline against compiler reordering across OWN-bit
-    // handoff.
-    unsafe { core::ptr::read_volatile(ring.add(idx)) }
+/// CRITICAL: the stride MUST be `format.descriptor_len()` — the same stride the
+/// chip uses for the active descriptor format (16B legacy, 32B V3) and the same
+/// one [`desc_publish_own`] writes at. Indexing a typed `*mut RxDescriptor`
+/// (always 32B) while the chip writes legacy 16B descriptors silently
+/// misaligns the reaper after slot 0 and wedges RX (validated 2026-06-06: RX
+/// stalled at 18 packets). All three RX accessors route their stride through
+/// `descriptor_len()` so they cannot disagree; `ci/check_rx_desc_stride.sh`
+/// enforces it.
+pub(crate) fn desc_read_rx(ring: *mut u8, idx: usize, format: RxDescFormat) -> RxDescriptor {
+    // SAFETY: caller guarantees idx < N of the ring this pointer indexes, and
+    // the ring storage (RxDescriptor, 32B) is >= the read width for any format.
+    // Volatile to discipline against compiler reordering across OWN-bit handoff.
+    unsafe {
+        let stride = format.descriptor_len();
+        let slot = ring.add(idx * stride);
+        let slot_u64 = slot.cast::<u64>();
+        let nwords = stride / 8;
+        let mut out = RxDescriptor::default();
+        let mut w = 0;
+        while w < nwords {
+            out.words[w] = core::ptr::read_volatile(slot_u64.add(w));
+            w += 1;
+        }
+        out
+    }
 }
 
-/// Write one RX descriptor slot (volatile, whole-struct). Use only when the
-/// descriptor is not currently being OWN-published to the device.
-pub(crate) fn desc_write_rx(ring: *mut RxDescriptor, idx: usize, value: RxDescriptor) {
+/// Write one RX descriptor slot (volatile) at the format stride. Use only when
+/// the descriptor is not currently being OWN-published to the device.
+pub(crate) fn desc_write_rx(ring: *mut u8, idx: usize, value: RxDescriptor, format: RxDescFormat) {
     // SAFETY: as `desc_read_rx`; used by stop/rollback paths where the device
-    // is quiesced and slot contents are inert.
+    // is quiesced and slot contents are inert. Same `descriptor_len()` stride.
     unsafe {
-        core::ptr::write_volatile(ring.add(idx), value);
+        let stride = format.descriptor_len();
+        let slot = ring.add(idx * stride);
+        let slot_u64 = slot.cast::<u64>();
+        let nwords = stride / 8;
+        let mut w = 0;
+        while w < nwords {
+            core::ptr::write_volatile(slot_u64.add(w), value.words[w]);
+            w += 1;
+        }
     }
 }
 

@@ -104,9 +104,15 @@ process_rx_body=$(
 	' "$napi_rs"
 )
 
-own_line=$(grep -n 'desc.opts1 & regs::DESC_OWN' <<<"$process_rx_body" | head -n1 | cut -d: -f1)
+own_line=$(awk '/DESC_OWN/ && /opts1/ { print NR; exit }' <<<"$process_rx_body")
 rmb_line=$(grep -n 'ub::dma_rmb()' <<<"$process_rx_body" | head -n1 | cut -d: -f1)
 len_line=$(grep -n 'let len = (desc.opts1 & regs::DESC_LEN_MASK)' <<<"$process_rx_body" | head -n1 | cut -d: -f1)
+if [[ -z "$len_line" ]]; then
+	len_line=$(grep -n 'let len = completion.len' <<<"$process_rx_body" | head -n1 | cut -d: -f1)
+fi
+if [[ -z "$len_line" ]]; then
+	len_line=$(grep -n 'let len = desc.len' <<<"$process_rx_body" | head -n1 | cut -d: -f1)
+fi
 if [[ -n "$own_line" && -n "$rmb_line" && -n "$len_line" ]] \
    && (( own_line < rmb_line && rmb_line < len_line )); then
 	grn "NAPI RX poll orders descriptor reads behind dma_rmb after OWN clears"

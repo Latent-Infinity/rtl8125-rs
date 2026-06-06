@@ -44,6 +44,9 @@ echo
 echo "== M5 NAPI contract (poll budget, IRQ masking, queue hysteresis) =="
 bash "$CI/check_napi_contract.sh" || rc=1
 echo
+echo "== RX descriptor stride agreement (read/write/publish vs format) =="
+bash "$CI/check_rx_desc_stride.sh" || rc=1
+echo
 echo "== BQL sent/completed accounting contract =="
 bash "$CI/check_bql_accounting.sh" || rc=1
 echo

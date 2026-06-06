@@ -108,7 +108,8 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
     let buf_desc_len = buf_len & regs::DESC_LEN_MASK;
     let buf_len = buf_len as usize;
     while work_done < budget_u {
-        let completion = ub::desc_read_rx(state.rx.desc, rx_tail).completion(state.rx.format);
+        let mut completion = ub::desc_read_rx(state.rx.desc.cast::<u8>(), rx_tail, state.rx.format)
+            .completion(state.rx.format);
         // Hardware sets OWN; if still set, this slot isn't filled yet — stop.
         if completion.opts1 & regs::DESC_OWN != 0 {
             break;
@@ -117,6 +118,8 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
         // descriptor fields or the DMA buffer contents. r8169 uses
         // the same dma_rmb() barrier after DescOwn clears.
         ub::dma_rmb();
+        completion = ub::desc_read_rx(state.rx.desc.cast::<u8>(), rx_tail, state.rx.format)
+            .completion(state.rx.format);
         // Lower 14 bits of opts1 are the RX frame length (incl. CRC; chip
         // typically strips CRC — same convention as r8169). Cap at the
         // buffer size for safety.

@@ -159,7 +159,14 @@ Acceptance:
 
 Execution status:
 
-- **A1**: complete — RX format migration and completion normalization are in place; runtime format still defaults to legacy pending phase-0 verdict.
+- **A1**: complete + validated — RX format migration and completion normalization
+  are in place; runtime format still defaults to legacy pending phase-0 verdict.
+  A 2026-06-06 gateway audit found a descriptor-stride regression (read/write_rx
+  indexed the 32-byte `RxDescriptor` type while the chip + `desc_publish_own`
+  used the 16-byte legacy stride → legacy RX stalled at 18 packets). Fixed by
+  routing all three RX accessors through `format.descriptor_len()`; enforced by
+  `ci/check_rx_desc_stride.sh`; re-validated on the gateway (legacy TCP/UDP RX at
+  line rate, 0% loss, 1.15M packets, 0 dmesg warnings).
 - **A2**: complete — completion `rss_hash` is parsed and marshaled over the C RX bridge
   boundary in `hash_info` metadata; C-side counters/instrumentation now include
   `rx_hash_l3`, `rx_hash_l4`, `rx_hash_missing` and `skb_set_hash(...)` is called for

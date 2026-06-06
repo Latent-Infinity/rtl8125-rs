@@ -1281,7 +1281,12 @@ fn ndo_stop(state: &NetdevState) {
     // Zero the descriptor rings so a subsequent open starts fresh.
     for i in 0..RING_LEN {
         ub::desc_write(state.tx.desc, i, Descriptor::default());
-        ub::desc_write_rx(state.rx.desc, i, RxDescriptor::default());
+        ub::desc_write_rx(
+            state.rx.desc.cast::<u8>(),
+            i,
+            RxDescriptor::default(),
+            state.rx.format,
+        );
     }
 
     // M6 #2 — release every RX slot's page chunk + DMA mapping. The
