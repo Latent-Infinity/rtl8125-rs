@@ -12,6 +12,8 @@
 #   - features.csv: ethtool -k values for VLAN/checksum/TSO/RXHASH features
 #   - traffic.csv: VLAN TCP/UDP tx/rx results with HW VLAN on and, optionally, off
 #   - queues.csv: RX/TX queue count plus ethtool RSS table support state
+#   - rxhash.csv: post-run hash counters (l3/l4/missing/disabled) from ethtool -S
+#   - irq_snapshot.csv: per-mode interrupt vector deltas from /proc/interrupts
 #   - raw/: ethtool, stats, RSS, interrupts, and iperf3 JSON artifacts
 
 set -uo pipefail
@@ -48,6 +50,8 @@ RAW="$OUT_DIR/raw"
 FEATURE_CSV="$OUT_DIR/features.csv"
 TRAFFIC_CSV="$OUT_DIR/traffic.csv"
 QUEUE_CSV="$OUT_DIR/queues.csv"
+RXHASH_CSV="$OUT_DIR/rxhash.csv"
+IRQ_CSV="$OUT_DIR/irq_snapshot.csv"
 README="$OUT_DIR/README.md"
 
 if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
@@ -85,6 +89,47 @@ capture() {
 feature_value() {
 	local feature="$1" file="$2"
 	awk -v key="$feature:" '$1 == key { print $2; found=1 } END { if (!found) print "missing" }' "$file"
+}
+
+capture_rss_state() {
+	local mode="$1"
+
+	capture "ethtool_x_${mode}.txt" run_root ethtool -x "$DUT_IFACE"
+	capture "ethtool_g_${mode}.txt" run_root ethtool -g "$DUT_IFACE"
+	capture "ethtool_l_${mode}.txt" run_root ethtool -l "$DUT_IFACE" || true
+	capture "ethtool_c_${mode}.txt" run_root ethtool -c "$DUT_IFACE"
+}
+
+record_rss_counters() {
+	local mode="$1" stats_file="$RAW/ethtool_S_after_${mode}.txt"
+	local l3 l4 miss disabled
+	l3=$(awk '/rx_hash_l3:/ { print $2; found=1 } END { if (!found) print "missing" }' "$stats_file")
+	l4=$(awk '/rx_hash_l4:/ { print $2; found=1 } END { if (!found) print "missing" }' "$stats_file")
+	miss=$(awk '/rx_hash_missing:/ { print $2; found=1 } END { if (!found) print "missing" }' "$stats_file")
+	disabled=$(awk '/rx_hash_disabled:/ { print $2; found=1 } END { if (!found) print "missing" }' "$stats_file")
+	printf '%s,%s,%s,%s,%s,%s\n' "$LABEL" "$mode" "$l3" "$l4" "$miss" "$disabled" >> "$RXHASH_CSV"
+}
+
+snapshot_interrupts() {
+	local mode="$1"
+
+	awk -v label="$LABEL" -v mode="$mode" '{
+		vector=$1
+		sub(":", "", vector)
+		sum=0
+		desc=""
+		for (i=2; i<=NF; ++i) {
+			if ($i ~ /^[0-9]+$/) {
+				sum += $i
+				continue
+			}
+			desc=desc $i " "
+		}
+		if (sum > 0 && vector !~ /^[:space:]*$/) {
+			gsub(/[[:space:]]+/, "_", desc)
+			printf "%s,%s,%s,%s,%s\n", label, mode, vector, sum, desc
+		}
+	}' "$RAW/interrupts_${mode}.txt" >> "$IRQ_CSV"
 }
 
 json_bps() {
@@ -224,6 +269,7 @@ record_queues() {
 	else
 		rss_state=unsupported
 	fi
+	capture_rss_state "initial"
 
 	printf 'label,rx_queues,tx_queues,ethtool_x\n' > "$QUEUE_CSV"
 	printf '%s,%s,%s,%s\n' "$LABEL" "$rxq" "$txq" "$rss_state" >> "$QUEUE_CSV"
@@ -235,6 +281,7 @@ record_preflight() {
 	capture "ethtool_i.txt" run_root ethtool -i "$DUT_IFACE"
 	capture "ethtool_S_before.txt" run_root ethtool -S "$DUT_IFACE"
 	capture "interrupts_before.txt" grep -E "$DUT_IFACE|r8125|r8169|enp|PCI-MSI" /proc/interrupts
+	snapshot_interrupts "before"
 	record_features
 	record_queues
 }
@@ -243,6 +290,9 @@ record_after_mode() {
 	local mode="$1"
 	capture "ethtool_S_after_${mode}.txt" run_root ethtool -S "$DUT_IFACE"
 	capture "interrupts_after_${mode}.txt" grep -E "$DUT_IFACE|r8125|r8169|enp|PCI-MSI" /proc/interrupts
+	record_rss_counters "$mode"
+	snapshot_interrupts "after_${mode}"
+	capture_rss_state "$mode"
 }
 
 append_tcp_result() {
@@ -319,7 +369,8 @@ Primary artifacts:
 - \`features.csv\`
 - \`traffic.csv\`
 - \`queues.csv\`
-- \`raw/ethtool_x.txt\`
+- \`rxhash.csv\` and per-mode \`raw/ethtool_S_after_*.txt\`
+- \`irq_snapshot.csv\` and raw per-mode interrupt snapshots
 - \`raw/ethtool_S_*.txt\`
 - \`raw/interrupts_*.txt\`
 EOF
@@ -331,6 +382,8 @@ need_cmd iperf3
 need_cmd jq
 
 mkdir -p "$RAW"
+printf 'label,mode,hash_l3,hash_l4,hash_missing,hash_disabled\n' > "$RXHASH_CSV"
+printf 'label,mode,irq_vector,irq_count,desc\n' > "$IRQ_CSV"
 printf 'label,mode,proto,direction,mtu,udp_len,gbps,pps,loss_pct,retransmits,raw_json\n' > "$TRAFFIC_CSV"
 
 setup_peer

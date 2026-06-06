@@ -21,8 +21,10 @@ The script writes comparable CSVs under
 - `features.csv` records checksum, TSO, VLAN, and RXHASH feature state.
 - `traffic.csv` records VLAN TCP/UDP TX/RX throughput, PPS, loss, and retransmits.
 - `queues.csv` records RX/TX queue count and `ethtool -x` support state.
+- `rxhash.csv` records `ethtool -S` hash counters after each mode (`rx_hash_*`).
+- `irq_snapshot.csv` stores per-line totals from `/proc/interrupts` for each mode.
 - `raw/` keeps `ethtool -k`, `ethtool -S`, `ethtool -x`, interrupts, and
-  iperf3 JSON.
+  ethtool topology (`-g`, `-l`, `-c`) and iperf3 JSON.
 
 ## Acceptance Criteria
 
