@@ -219,13 +219,16 @@ void r8125_bridge_rx_free(struct net_device *ndev, void *cpu)
  */
 void r8125_bridge_rx_one_packet(struct net_device *ndev, dma_addr_t dma,
 				const void *buf, size_t len, u32 desc_opts1,
-				u32 desc_opts2, void **new_cpu,
+				u32 desc_opts2, u64 hash_info, void **new_cpu,
 				dma_addr_t *new_dma)
 {
 	struct r8125_bridge *b = netdev_priv(ndev);
 	struct page *newpage;
 	struct sk_buff *skb;
 	struct device *dev = &b->pdev->dev;
+	const bool hash_valid = (hash_info >> 63) & 1ULL;
+	const bool hash_l4 = (hash_info >> 62) & 1ULL;
+	const u32 hash_value = (u32)(hash_info & 0xFFFFFFFFULL);
 
 	newpage = page_pool_dev_alloc_pages(b->page_pool);
 	if (unlikely(!newpage)) {
@@ -250,11 +253,22 @@ void r8125_bridge_rx_one_packet(struct net_device *ndev, dma_addr_t dma,
 		skb_reserve(skb, b->rx_offset);
 		__skb_put(skb, len);
 		skb->protocol = eth_type_trans(skb, ndev);
+		if (hash_valid) {
+			if (hash_l4) {
+				skb_set_hash(skb, hash_value, PKT_HASH_TYPE_L4);
+				this_cpu_inc(*b->rx_hash_l4);
+			} else {
+				skb_set_hash(skb, hash_value, PKT_HASH_TYPE_L3);
+				this_cpu_inc(*b->rx_hash_l3);
+			}
+		} else {
+			this_cpu_inc(*b->rx_hash_missing);
+		}
 		r8125_bridge_skb_rx_csum_set(skb, desc_opts1);
 		if (desc_opts2 & R8125_RX_VLAN_TAG)
 			__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
-						swab16(desc_opts2 &
-						       R8125_RX_VLAN_MASK));
+						  swab16(desc_opts2 &
+							 R8125_RX_VLAN_MASK));
 		this_cpu_inc(*b->rx_handed_to_stack);
 		dev_sw_netstats_rx_add(ndev, len);
 		napi_gro_receive(&b->napi, skb);

@@ -286,6 +286,7 @@ extern "C" {
         len: usize,
         desc_opts1: u32,
         desc_opts2: u32,
+        hash_info: u64,
         new_cpu: *mut *mut c_void,
         new_dma: *mut bindings::dma_addr_t,
     );
@@ -527,6 +528,7 @@ pub(crate) fn bridge_rx_one_packet(
     len: usize,
     desc_opts1: u32,
     desc_opts2: u32,
+    hash_info: u64,
 ) -> (*mut c_void, bindings::dma_addr_t) {
     let mut new_cpu = buf.cast_mut();
     let mut new_dma: bindings::dma_addr_t = dma;
@@ -539,6 +541,7 @@ pub(crate) fn bridge_rx_one_packet(
             len,
             desc_opts1,
             desc_opts2,
+            hash_info,
             core::ptr::from_mut(&mut new_cpu),
             core::ptr::from_mut(&mut new_dma),
         )

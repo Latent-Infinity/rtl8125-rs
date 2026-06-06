@@ -61,6 +61,9 @@ static void bridge_get_drvinfo(struct net_device *ndev,
  *   tx_dropped_error   drop before DMA (CSUM help fail, hdr too far)
  *   rx_handed_to_stack napi_gro_receive successful
  *   rx_dropped_error   RX skb-build or chip-error drops
+ *   rx_hash_l3         hashable L3 packet hash set on RX
+ *   rx_hash_l4         hashable L4 packet hash set on RX
+ *   rx_hash_missing    hashable frame without a valid descriptor hash
  */
 static const char bridge_ethtool_strings[][ETH_GSTRING_LEN] = {
 	"tx_received",
@@ -69,6 +72,9 @@ static const char bridge_ethtool_strings[][ETH_GSTRING_LEN] = {
 	"tx_dropped_error",
 	"rx_handed_to_stack",
 	"rx_dropped_error",
+	"rx_hash_l3",
+	"rx_hash_l4",
+	"rx_hash_missing",
 };
 
 #define BRIDGE_ETHTOOL_NSTATS ARRAY_SIZE(bridge_ethtool_strings)
@@ -98,6 +104,9 @@ static void bridge_get_ethtool_stats(struct net_device *ndev,
 	data[3] = c.tx_dropped_error;
 	data[4] = c.rx_handed_to_stack;
 	data[5] = c.rx_dropped_error;
+	data[6] = c.rx_hash_l3;
+	data[7] = c.rx_hash_l4;
+	data[8] = c.rx_hash_missing;
 }
 
 const struct ethtool_ops r8125_bridge_ethtool_ops = {

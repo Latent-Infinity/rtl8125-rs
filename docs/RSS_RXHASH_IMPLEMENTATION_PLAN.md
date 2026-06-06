@@ -160,7 +160,10 @@ Acceptance:
 Execution status:
 
 - **A1**: complete — RX format migration and completion normalization are in place; runtime format still defaults to legacy pending phase-0 verdict.
-- **A2**: pending — no hash fields reach C shim yet.
+- **A2**: complete — completion `rss_hash` is parsed and marshaled over the C RX bridge
+  boundary in `hash_info` metadata; C-side counters/instrumentation now include
+  `rx_hash_l3`, `rx_hash_l4`, `rx_hash_missing` and `skb_set_hash(...)` is called for
+  valid hashable frames.
 - **A3**: blocked — gate depends on A1/A2 plus bench result from phase 0.
 - **B1–B5**: blocked — all deferred until Track A is validated.
 

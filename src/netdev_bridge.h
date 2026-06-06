@@ -313,6 +313,7 @@ void r8125_bridge_rx_free(struct net_device *ndev, void *cpu);
 void r8125_bridge_rx_one_packet(struct net_device *ndev,
 				dma_addr_t dma, const void *buf,
 				size_t len, u32 desc_opts1, u32 desc_opts2,
+				u64 hash_info,
 				void **new_cpu, dma_addr_t *new_dma);
 
 /*
@@ -452,6 +453,9 @@ struct r8125_bridge_counters {
 	u64 tx_dropped_error;
 	u64 rx_handed_to_stack;
 	u64 rx_dropped_error;
+	u64 rx_hash_l3;
+	u64 rx_hash_l4;
+	u64 rx_hash_missing;
 };
 void r8125_bridge_counters_snapshot(struct net_device *ndev,
 				    struct r8125_bridge_counters *out);

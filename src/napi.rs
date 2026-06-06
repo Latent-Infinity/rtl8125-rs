@@ -38,6 +38,12 @@ use crate::ring::{Descriptor, RING_LEN};
 #[allow(clippy::unsafe_removed_from_name)]
 use crate::unsafe_boundary as ub;
 
+// Internal hash-type encoding used for FFI until Rust/bindings expose
+// Linux's skb hash-type constants in-kernel.
+const RX_HASH_INFO_VALID_BIT: u64 = 1u64 << 63;
+const RX_HASH_INFO_L4_BIT: u64 = 1u64 << 62;
+const RX_HASH_INFO_VALUE_MASK: u64 = 0xFFFF_FFFF;
+
 // Per-descriptor RX length advertised to the chip is now per-MTU (M6 #2
 // v3): the pool's device-writable `buf_len` (already ≤ `DESC_LEN_MASK`,
 // the 14-bit descriptor field). It's read once per poll from
@@ -129,6 +135,15 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
             // failure it drops the frame and returns the old (cpu, dma)
             // unchanged. The cshim handles all §6.3 counter accounting.
             let slot_cpu = state.rx.slot_cpu[rx_tail].load(Ordering::Relaxed);
+            let hash_info = completion.rss_hash.map_or(0, |h| {
+                let is_l4 = match h.kind {
+                    crate::ring::RxHashType::L3 => false,
+                    crate::ring::RxHashType::L4 => true,
+                };
+                RX_HASH_INFO_VALID_BIT
+                    | (u64::from(is_l4) * RX_HASH_INFO_L4_BIT)
+                    | (u64::from(h.value) & RX_HASH_INFO_VALUE_MASK)
+            });
             let (new_cpu, new_dma) = ub::bridge_rx_one_packet(
                 ndev,
                 slot_dma,
@@ -136,6 +151,7 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
                 len,
                 completion.opts1,
                 completion.opts2,
+                hash_info,
             );
             // Publish the refilled buffer into the slot shadow so the next
             // wrap-around reads the live page, not the one now owned by the
