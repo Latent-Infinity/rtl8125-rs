@@ -42,7 +42,9 @@ use crate::unsafe_boundary as ub;
 // Linux's skb hash-type constants in-kernel.
 const RX_HASH_INFO_VALID_BIT: u64 = 1u64 << 63;
 const RX_HASH_INFO_L4_BIT: u64 = 1u64 << 62;
+const RX_HASH_INFO_ENABLED_BIT: u64 = 1u64 << 61;
 const RX_HASH_INFO_VALUE_MASK: u64 = 0xFFFF_FFFF;
+const RXHASH_FEATURE_ACTIVE: bool = false;
 
 // Per-descriptor RX length advertised to the chip is now per-MTU (M6 #2
 // v3): the pool's device-writable `buf_len` (already ≤ `DESC_LEN_MASK`,
@@ -140,10 +142,12 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
                     crate::ring::RxHashType::L3 => false,
                     crate::ring::RxHashType::L4 => true,
                 };
-                RX_HASH_INFO_VALID_BIT
+                RX_HASH_INFO_ENABLED_BIT
+                    | RX_HASH_INFO_VALID_BIT
                     | (u64::from(is_l4) * RX_HASH_INFO_L4_BIT)
                     | (u64::from(h.value) & RX_HASH_INFO_VALUE_MASK)
             });
+            let hash_info = if RXHASH_FEATURE_ACTIVE { hash_info } else { 0 };
             let (new_cpu, new_dma) = ub::bridge_rx_one_packet(
                 ndev,
                 slot_dma,

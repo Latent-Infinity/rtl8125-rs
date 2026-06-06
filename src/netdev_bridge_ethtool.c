@@ -64,6 +64,7 @@ static void bridge_get_drvinfo(struct net_device *ndev,
  *   rx_hash_l3         hashable L3 packet hash set on RX
  *   rx_hash_l4         hashable L4 packet hash set on RX
  *   rx_hash_missing    hashable frame without a valid descriptor hash
+ *   rx_hash_disabled   RXHASH feature disabled while packets were delivered
  */
 static const char bridge_ethtool_strings[][ETH_GSTRING_LEN] = {
 	"tx_received",
@@ -75,6 +76,7 @@ static const char bridge_ethtool_strings[][ETH_GSTRING_LEN] = {
 	"rx_hash_l3",
 	"rx_hash_l4",
 	"rx_hash_missing",
+	"rx_hash_disabled",
 };
 
 #define BRIDGE_ETHTOOL_NSTATS ARRAY_SIZE(bridge_ethtool_strings)
@@ -107,6 +109,7 @@ static void bridge_get_ethtool_stats(struct net_device *ndev,
 	data[6] = c.rx_hash_l3;
 	data[7] = c.rx_hash_l4;
 	data[8] = c.rx_hash_missing;
+	data[9] = c.rx_hash_disabled;
 }
 
 const struct ethtool_ops r8125_bridge_ethtool_ops = {

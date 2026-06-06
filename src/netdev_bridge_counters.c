@@ -42,10 +42,12 @@ int r8125_bridge_counters_alloc(struct r8125_bridge *b)
 	b->rx_hash_l3         = alloc_percpu(u64);
 	b->rx_hash_l4         = alloc_percpu(u64);
 	b->rx_hash_missing    = alloc_percpu(u64);
+	b->rx_hash_disabled   = alloc_percpu(u64);
 	if (!b->tx_received || !b->tx_consumed || !b->tx_busy_exception ||
 	    !b->tx_dropped_error || !b->rx_handed_to_stack ||
 	    !b->rx_dropped_error || !b->rx_hash_l3 ||
-	    !b->rx_hash_l4 || !b->rx_hash_missing) {
+	    !b->rx_hash_l4 || !b->rx_hash_missing ||
+	    !b->rx_hash_disabled) {
 		r8125_bridge_counters_free(b);
 		return -ENOMEM;
 	}
@@ -63,6 +65,7 @@ void r8125_bridge_counters_free(struct r8125_bridge *b)
 	free_percpu(b->rx_hash_l3);
 	free_percpu(b->rx_hash_l4);
 	free_percpu(b->rx_hash_missing);
+	free_percpu(b->rx_hash_disabled);
 	b->tx_received = NULL;
 	b->tx_consumed = NULL;
 	b->tx_busy_exception = NULL;
@@ -72,6 +75,7 @@ void r8125_bridge_counters_free(struct r8125_bridge *b)
 	b->rx_hash_l3 = NULL;
 	b->rx_hash_l4 = NULL;
 	b->rx_hash_missing = NULL;
+	b->rx_hash_disabled = NULL;
 }
 
 /* Sum one per-CPU counter across all possible CPUs.
@@ -109,4 +113,5 @@ void r8125_bridge_counters_snapshot(struct net_device *ndev,
 	out->rx_hash_l3         = bridge_counter_sum(b->rx_hash_l3);
 	out->rx_hash_l4         = bridge_counter_sum(b->rx_hash_l4);
 	out->rx_hash_missing    = bridge_counter_sum(b->rx_hash_missing);
+	out->rx_hash_disabled   = bridge_counter_sum(b->rx_hash_disabled);
 }

@@ -228,6 +228,7 @@ void r8125_bridge_rx_one_packet(struct net_device *ndev, dma_addr_t dma,
 	struct device *dev = &b->pdev->dev;
 	const bool hash_valid = (hash_info >> 63) & 1ULL;
 	const bool hash_l4 = (hash_info >> 62) & 1ULL;
+	const bool hash_enabled = (hash_info >> 61) & 1ULL;
 	const u32 hash_value = (u32)(hash_info & 0xFFFFFFFFULL);
 
 	newpage = page_pool_dev_alloc_pages(b->page_pool);
@@ -253,7 +254,9 @@ void r8125_bridge_rx_one_packet(struct net_device *ndev, dma_addr_t dma,
 		skb_reserve(skb, b->rx_offset);
 		__skb_put(skb, len);
 		skb->protocol = eth_type_trans(skb, ndev);
-		if (hash_valid) {
+		if (!hash_enabled) {
+			this_cpu_inc(*b->rx_hash_disabled);
+		} else if (hash_valid) {
 			if (hash_l4) {
 				skb_set_hash(skb, hash_value, PKT_HASH_TYPE_L4);
 				this_cpu_inc(*b->rx_hash_l4);

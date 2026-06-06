@@ -77,7 +77,7 @@ else
 	red "TX VLAN offload must encode tag-present and swapped TCI in opts2"
 fi
 
-if grep -q 'desc.opts2' "$NAPI" &&
+if grep -q 'completion.opts2' "$NAPI" &&
    grep -q 'desc_opts2' "$UB" &&
    grep -q 'R8125_RX_VLAN_TAG' "$RX_POOL" &&
    grep -q '__vlan_hwaccel_put_tag' "$RX_POOL" &&
@@ -92,10 +92,15 @@ if ! grep -q 'NETIF_F_RXHASH' "$BRIDGE" &&
    grep -q 'set_q_num_ctrl_8125(0)' "$HW" &&
    ! grep -q 'alloc_etherdev_mq' "$BRIDGE" &&
    ! grep -q 'netif_set_real_num_rx_queues' "$BRIDGE" &&
-   ! grep -q 'skb_set_hash' "$ROOT/src/"*.c "$ROOT/src/"*.rs 2>/dev/null; then
-	grn "RSS/RXHASH remains unadvertised until descriptor v3/v4 + multi-ring support lands"
+   grep -q 'RX_HASH_INFO_ENABLED_BIT' "$NAPI" &&
+   grep -q 'rx_hash_l3' "$RX_POOL" &&
+   grep -q 'rx_hash_l4' "$RX_POOL" &&
+   grep -q 'rx_hash_missing' "$RX_POOL" &&
+   grep -q 'rx_hash_disabled' "$RX_POOL" &&
+   grep -q 'skb_set_hash' "$RX_POOL" ; then
+	grn "RXHASH plumbing is present but not advertised (feature remains off until Phase A3)"
 else
-	red "RSS/RXHASH must not be advertised with the current single-ring legacy RX descriptor path"
+	red "RXHASH must remain non-advertised and internally gated until Phase A3 completes"
 fi
 
 exit "$rc"

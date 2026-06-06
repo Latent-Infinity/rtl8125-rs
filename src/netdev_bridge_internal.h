@@ -42,6 +42,7 @@ struct r8125_bridge {
 	u64 __percpu *rx_hash_l3;
 	u64 __percpu *rx_hash_l4;
 	u64 __percpu *rx_hash_missing;
+	u64 __percpu *rx_hash_disabled;
 
 	/* Zero-copy RX (netdev_bridge_rx_pool.c). The pool owns every RX
 	 * buffer; the geometry below is computed once per ndo_open from

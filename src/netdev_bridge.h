@@ -456,6 +456,7 @@ struct r8125_bridge_counters {
 	u64 rx_hash_l3;
 	u64 rx_hash_l4;
 	u64 rx_hash_missing;
+	u64 rx_hash_disabled;
 };
 void r8125_bridge_counters_snapshot(struct net_device *ndev,
 				    struct r8125_bridge_counters *out);
