@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
-//! Curated RTL8125 register map — offsets and bitfield constants (plan §6.1,
-//! §7 M2). M2 scope is intentionally small: just what's needed for chip-version
-//! detection (TxConfig) and the reset sequence (ChipCmd). Per-revision register
-//! quirks land here as later milestones extend the surface.
+//! Curated RTL8125 register map — offsets and bitfield constants for the
+//! validated RTL8125B driver surface. Per-revision register quirks land here
+//! as the supported hardware surface grows.
 //!
 //! Authority: r8169's `drivers/net/ethernet/realtek/r8169_main.c` register
 //! enums and `rtl_chip_infos`. Cross-checked against the published RTL8125B
@@ -67,7 +66,7 @@ pub(crate) const INTR_LINK_CHG: u32 = 0x0020;
 /// + link-change. RX descriptor unavailable / overrun are silently dropped.
 pub(crate) const INTR_M4_BASELINE: u32 = INTR_ROK | INTR_RER | INTR_TOK | INTR_TER | INTR_LINK_CHG;
 
-// ── ISR_V2 / IMR_V2 — per-message-id interrupt layout (M6 #1 Phase A.2) ──
+// ── ISR_V2 / IMR_V2 — per-message-id interrupt layout ───────────────────
 //
 // Activated when `INT_CFG0_ENABLE_8125` is set in `ndo_open`, paired
 // with an MSI/MSI-X vector allocation from probe. Bit N corresponds to
@@ -114,7 +113,7 @@ pub(crate) const INT_CFG0: usize = 0x34;
 /// (`if_re.h:1336 = 0x0001`) agree the bit is BIT(0), not BIT(3) —
 /// a misreading of BIT(3) in an unrelated `if_re.c:1410` codepath
 /// (the timeout/mitigation toggle, not the ISR-version toggle) caused
-/// the Phase A.2 first cut to silently never deliver MSI-X IRQs on
+/// an early MSI-X enablement attempt to silently never deliver IRQs on
 /// Controller-KVM 2026-05-28. When clear, legacy IMR/ISR at 0x38/0x3C
 /// are authoritative. Set by `ndo_open` only when probe allocated an
 /// MSI/MSI-X vector.
@@ -160,7 +159,7 @@ pub(crate) const TX_COALESCE_TIMER_8125B_DEFAULT: u16 = 0x0010;
 // r8169 unlocks the config registers (Config1/Config2/Config5 at 0x52/0x53/
 // 0x56) at the top of `rtl_hw_start` and re-locks at the end. Without the
 // unlock, writes to those registers — including the ASPM disable in
-// Config5 and Config1 PM-bit clear — silently no-op. M4-perf phase 2
+// Config5 and Config1 PM-bit clear — silently no-op. Performance validation
 // found that this missing unlock contributes to TSO segment loss because
 // ASPM stays enabled and the PCIe link enters L1 power-save between
 // super-skb bursts.
@@ -208,18 +207,12 @@ pub(crate) const RSS_INDIRECTION_TBL_8125: usize = 0x4700;
 /// `RxConfig`/RCR bit 24 — emit V3 (32-byte, RSS-capable) RX descriptors
 /// (`EnableRxDescV3`, `r8125.h:1649`).
 pub(crate) const RCR_ENABLE_RX_DESC_V3: u32 = 1 << 24;
-/// Track-A RXHASH `RSS_CTRL_8125` enable bits for TCP/IPv4, TCP/IPv6, UDP/
+/// RXHASH `RSS_CTRL_8125` enable bits for TCP/IPv4, TCP/IPv6, UDP/
 /// IPv4, UDP/IPv6, and raw IPv4/IPv6 hashing (`r8125_rss.c:40-48`).
 /// With `CPU_NUM=0` (single queue) and `MASK=0`, this programs the minimal
 /// one-queue hash engine for hash-only support.
-pub(crate) const RSS_CTRL_PROBE_HASH_BITS: u32 =
+pub(crate) const RSS_CTRL_HASH_BITS: u32 =
     (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 11) | (1 << 12);
-/// 40-byte RSS key seed used by the one-queue Track A hash path.
-pub(crate) const RSS_PROBE_KEY: [u8; RSS_KEY_SIZE] = [
-    0x6d, 0x5a, 0x56, 0xda, 0x25, 0x5b, 0x0e, 0xc2, 0x41, 0x67, 0x25, 0x3d, 0x43, 0xa3, 0x8f, 0xb0,
-    0xd0, 0xca, 0x2b, 0xcb, 0xae, 0x7b, 0x30, 0xb4, 0x77, 0xcb, 0x2d, 0xa3, 0x80, 0x30, 0xf2, 0x0c,
-    0x6a, 0x42, 0xb7, 0x3b, 0xbe, 0xac, 0x01, 0xfa,
-];
 /// Anonymous tuning register at 0x382 (16-bit) — r8169 writes 0x221b at
 /// the top of `rtl_hw_start_8125_common`. Function unclear from the
 /// source comment; included for parity.
@@ -257,7 +250,7 @@ pub(crate) const MISC_RXDV_GATED_EN: u32 = 1 << 19;
 // Subset of rtl_hw_start_8125_common + rtl_hw_start_8125b that's required
 // to get the TX engine accepting our 16-byte legacy descriptors AND the
 // RX engine ungated. Tuning writes (FIFO thresholds, RSS, EEE) are
-// deliberately deferred — M5 will port the rest. See plan §7 M4-traffic.
+// deliberately deferred until they are validated against r8169/vendor behavior.
 //
 // 0xeb58 bit 0: "new tx descriptor format" — if set, the chip expects
 // 40-byte descriptors; we use 16-byte (legacy r8169), so this MUST be 0.

@@ -1,0 +1,7 @@
+driver,mtu,test,obs,p50_us,p99_us,p999_us,max_us
+r8169,1500,sockperf-rtt-idle,235680,48.541,63.158,65.262,0
+r8169,1500,sockperf-rtt-loaded,18184,634.289,681.538,701.295,0
+r8169,1500,icmp-rtt-loaded,6000,678.0,798.0,814.0,872.0
+r8169,9000,sockperf-rtt-idle,46034,48.130,57.868,63.208,0
+r8169,9000,sockperf-rtt-loaded,14885,750.709,1141.864,1146.543,0
+r8169,9000,icmp-rtt-loaded,6000,589.0,791.0,816.0,854.0

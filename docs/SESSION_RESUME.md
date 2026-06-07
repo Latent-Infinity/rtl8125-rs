@@ -7,6 +7,49 @@ paused and what to do next.
 
 ---
 
+## Where we are — 2026-06-07 (latency + UDP-TX fix + VLAN + RXHASH/V3 default)
+
+Driver is feature-complete for the RXHASH RFC scope and certified on the
+Gateway bare-metal rig. Landed and validated in this arc:
+
+- **Loaded-latency parity/win** via a driver-owned `tx_byte_budget` throttle
+  (MSI-safe; bounds TX ring residency so fq_codel protects latency). Default
+  131072. See `docs/perf/byte_budget_20260605/`.
+- **UDP-TX wedge root-caused + fixed**: the V2/MSI-X per-queue surface only
+  delivers the TX-completion message (TOK_Q0 = MSI-X entry 16) with ≥22 vectors;
+  with one vector TX completions were lost (pure unidirectional UDP TX wedged).
+  Fix: use the legacy combined ISR over the single MSI vector (`use_v2=false`),
+  matching r8169. See `docs/perf/byte_budget_20260605/UDP_TX_WEDGE.md`.
+- **Lost-wakeup barrier** (`fence(SeqCst)`) on the TX stop/recheck vs reaper
+  wake; **`xmit_more` doorbell batching**; **legacy-surface INT_MITI
+  coalescing**.
+- **HW VLAN offload** (CTAG TX insert / RX strip), advertised + validated at
+  line rate.
+- **RXHASH complete + validated**: V3 (32-byte) RX
+  descriptors are now the default, single-queue hash engine programmed in
+  `ndo_open` (legacy ISR, no multi-queue/V2), `NETIF_F_RXHASH` advertised,
+  `rx_hash_missing=0`. Random RSS key via `netdev_rss_key_fill`. Hardened RX
+  hot loop (`RxParse`: format resolved once/poll, single descriptor read).
+  Rollback knob `rx_legacy_desc=1` forces the legacy 16-byte path. Full RSS
+  (Track B) deferred. See `docs/RSS_RXHASH_IMPLEMENTATION_PLAN.md`,
+  `docs/perf/DRIVER_GAP_LEDGER.md`.
+- **Final C-vs-Rust matrix on the V3+RXHASH default** (`docs/perf/cvr_20260607_v3rxhash/`):
+  throughput parity incl. VLAN, **loaded latency wins** (e.g. @1500 icmp
+  482/625µs vs C 777/949µs), RXHASH working (0 misses); small-frame PPS
+  parity-or-better (64B RX re-confirmed: rust median 2.20M ≥ C 1.84M — the
+  matrix's −22.7% cell was sampling noise on a CPU-bound metric).
+
+CI: new gates `check_rx_desc_stride.sh` (descriptor stride agreement, after the
+A1 32B/16B stride regression) and the evolved `check_hw_offload_features.sh`
+(RXHASH prerequisites). Unsafe census 71. Bench: C baseline is pinned — future
+matrices run rust-only (`RUN_C=0`, ~2× faster) unless kernel/rig changes.
+
+Open items: commit the staged work (logical groups); upstream-prep checkpatch on
+the new C (VLAN, coalescing, RSS key); optional Track-B (full RSS) only if a
+measured gap justifies it.
+
+---
+
 ## Current TX offload note — 2026-06-06
 
 The current xmit path uses `r8125_bridge_skb_tx_offload_prepare` /

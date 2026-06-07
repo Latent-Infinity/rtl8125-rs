@@ -55,7 +55,7 @@ they need rewriting against that chip's authoritative source.
 | Gate | Chip knowledge encoded |
 |---|---|
 | `check_hw_init.sh` | r8169-parity bring-up sequence; balanced config-unlock/lock around fallible init; PCIe power-state writes |
-| `check_hw_offload_features.sh` | RTL8125 VLAN descriptor/RxConfig contract and guard that RSS/RXHASH stays off until RxDescV3/V4 + multi-ring support exists |
+| `check_hw_offload_features.sh` | RTL8125 VLAN descriptor/RxConfig contract; RXHASH advertisement is paired with V3 hash parsing, `skb_set_hash`, counters, and one-queue RSS programming while full RSS stays deferred |
 | `check_irq_mode_contract.sh` | `IrqMode` enum + `INT_CFG0_ENABLE_8125 = BIT(0)` chip-side V2 activation gated on probe-selected mode |
 | `check_isr_v2_paired.sh` | V2 ISR/IMR mask register pairing (`IMR_V2_CLEAR`/`IMR_V2_SET`/`ISR_V2`); reserved-bit avoidance |
 | `check_msix_static.sh` | RTL-specific MSI-X register surface; `intx_only` rollback module param exists |

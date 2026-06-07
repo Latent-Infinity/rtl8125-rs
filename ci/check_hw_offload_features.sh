@@ -7,10 +7,9 @@
 #   - TX: opts2 carries the tag-valid bit + swapped TCI.
 #   - RX: RTL8125 strips VLAN via RxConfig bits and reports the TCI in opts2.
 #
-# RSS/RXHASH is deliberately not advertised yet. In this branch we intentionally
-# gate `NETIF_F_RXHASH` even though single-queue V3 hash plumbing is present,
-# until the Track A A3 gate is fully closed and gap-free runtime evidence is
-# committed.
+# RXHASH is advertised only for single-queue V3 descriptor hash reporting. Full
+# hardware RSS remains disabled until multi-ring RX and the RTL8125B 22-vector
+# MSI-X model are implemented.
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -32,10 +31,11 @@ UB="$ROOT/src/unsafe_boundary.rs"
 if grep -q 'NETIF_F_HW_VLAN_CTAG_TX' "$BRIDGE" &&
    grep -q 'NETIF_F_HW_VLAN_CTAG_RX' "$BRIDGE" &&
    grep -q 'NETIF_F_RXCSUM' "$BRIDGE" &&
-   grep -q 'NETIF_F_TSO' "$BRIDGE"; then
-	grn "netdev advertises checksum, TSO, and CTAG VLAN hardware features"
+   grep -q 'NETIF_F_TSO' "$BRIDGE" &&
+   grep -q 'NETIF_F_RXHASH' "$BRIDGE"; then
+	grn "netdev advertises checksum, TSO, CTAG VLAN, and RXHASH hardware features"
 else
-	red "netdev must advertise checksum/TSO plus HW VLAN CTAG TX/RX"
+	red "netdev must advertise checksum/TSO, HW VLAN CTAG TX/RX, and RXHASH"
 fi
 
 open_feature_count=$(grep -c 'bridge_feature_flags(ndev->features)' "$BRIDGE" 2>/dev/null || true)
@@ -92,7 +92,8 @@ fi
 
 if grep -q 'R8125_BRIDGE_FEATURE_RXHASH' "$BRIDGE" &&
    grep -q 'BRIDGE_FEATURE_RXHASH' "$NETDEV" &&
-   ! grep -q 'NETIF_F_RXHASH' "$NETDEV" &&
+   grep -q 'const RXHASH_FEATURE_GATE: bool = true' "$NETDEV" &&
+   grep -q 'NETIF_F_RXHASH' "$BRIDGE" &&
    grep -q 'set_rss_ctrl_8125(0)' "$HW" &&
    grep -q 'set_q_num_ctrl_8125(0)' "$HW" &&
    ! grep -q 'alloc_etherdev_mq' "$BRIDGE" &&
@@ -103,9 +104,27 @@ if grep -q 'R8125_BRIDGE_FEATURE_RXHASH' "$BRIDGE" &&
    grep -q 'rx_hash_missing' "$RX_POOL" &&
    grep -q 'rx_hash_disabled' "$RX_POOL" &&
    grep -q 'skb_set_hash' "$RX_POOL" ; then
-	grn "RXHASH plumbing is present but not advertised (feature remains off until Phase A3)"
+	grn "RXHASH is advertised with V3 parser, skb hash reporting, counters, and single-queue RSS programming"
 else
-	red "RXHASH must remain non-advertised and internally gated until Phase A3 completes"
+	red "RXHASH advertisement must stay paired with V3 parser, skb_set_hash, counters, and single-queue RSS programming"
+fi
+
+rxhash_order=$(awk '
+	/fn ndo_open\(state: &NetdevState/ { in_open=1 }
+	in_open && /hw_start_8125b\(&regs\)/ { hw=NR }
+	in_open && /apply_rxhash_programming\(state\)/ { apply=NR }
+	in_open && /enable_chip_engines\(&regs\)/ { enable=NR; in_open=0 }
+	END {
+		if (hw && apply && enable && hw < apply && apply < enable)
+			print "ok";
+		else
+			print "bad";
+	}
+' "$NETDEV")
+if [[ "$rxhash_order" == "ok" ]]; then
+	grn "RXHASH hash-engine programming happens after hw_start and before RX/TX enable"
+else
+	red "RXHASH hash-engine programming must run after hw_start_8125b and before enable_chip_engines"
 fi
 
 exit "$rc"

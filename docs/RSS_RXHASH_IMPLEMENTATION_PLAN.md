@@ -1,6 +1,7 @@
 # RSS / RXHASH Implementation Plan
 
-**Status: execution plan in progress, 2026-06-07.** This plan is deliberately
+**Status: Track A (RXHASH-only) COMPLETE + gateway-validated, 2026-06-07.
+Track B (full hardware RSS) deferred.** This plan is deliberately
 split into two tracks:
 
 - **RXHASH-only**: parse a hardware hash from an RSS-capable RX descriptor and
@@ -180,10 +181,26 @@ Execution status:
   boundary in `hash_info` metadata; C-side counters/instrumentation now include
   `rx_hash_l3`, `rx_hash_l4`, `rx_hash_missing` and `skb_set_hash(...)` is called for
   valid hashable frames.
-- **A3**: complete in-driver — runtime feature plumbing is wired (`NetdevState::rx_hash_enabled`
-  via open/set_features bit-path), and the cshim feature-bit ABI now includes
-  RXHASH. Public enablement remains behind `RXHASH_FEATURE_GATE` pending
-  final validation and gate confirmation.
+- **A3**: complete + validated on the gateway (2026-06-07) — `receive-hashing on`,
+  `rx_hash_l4` increments, `rx_hash_missing=0`, `ethtool -K rxhash on/off` toggles
+  via `set_features`, TCP/UDP RX/TX at line rate, loaded latency unchanged, 0
+  dmesg warnings. NOTE: the first audit run found the gateway was still on the
+  pre-A3 binary; A3 was only substantiated after a sync+build+run — no phase is
+  "complete" until built and run on hardware.
+- **A3 hardening (2026-06-07)**:
+  - **Legacy rollback knob** `rx_legacy_desc=1` forces the proven 16-byte RX
+    descriptor path and disables RXHASH — an escape hatch since the default RX
+    path is now V3 (the legacy path otherwise has no runtime fallback).
+  - **Random RSS key**: the hash key is now `netdev_rss_key_fill` (boot-stable
+    system key) instead of a hardcoded constant.
+  - **RX hot loop**: replaced the per-packet `match RxDescFormat` + double
+    descriptor read with `RxParse` (format → byte offsets resolved once per
+    poll) + a single post-barrier fetch.
+  - **Naming**: `RSS_CTRL_PROBE_HASH_BITS` → `RSS_CTRL_HASH_BITS`; probe key
+    removed.
+  - **UDP RX "regression" was a benchmarking artifact**, not a V3/A3 issue: the
+    ~0.05% loss only appears when the sender is driven *above* the 2.35 Gbps line
+    rate (`-b 2400M`), affects legacy and V3 equally, and is 0% at ≤ line rate.
 - **B1–B5**: blocked — all deferred until Track A is validated.
 
 ### Phase 0 Evidence Protocol

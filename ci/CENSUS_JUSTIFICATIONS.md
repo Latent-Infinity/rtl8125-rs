@@ -349,3 +349,26 @@ V3/V4 parsing support:
 
 Net effect: +10 unsafe `impl` / helpers in `unsafe_boundary.rs`. This is the
 intended cost of Phase A1 and is bounded to the audited boundary.
+
+## 2026-06-07 — RSS key fill wrapper bump 69 → 70
+
+Added one safe wrapper in `src/unsafe_boundary.rs`:
+
+- `rss_key_fill(key: &mut [u8; RSS_KEY_SIZE])` — wraps `r8125_bridge_rss_key_fill`
+  (→ `netdev_rss_key_fill`) to fill the single-queue RXHASH Toeplitz key from the
+  boot-stable system key instead of a hardcoded constant. The `&mut [u8; N]`
+  argument guarantees the pointer is valid for exactly the `N` bytes passed.
+
+## 2026-06-07 — RX reader refactor bump 70 → 71
+
+Replaced `desc_read_rx` (1 unsafe block) with two precomputed-offset readers in
+`src/unsafe_boundary.rs` (net +1):
+
+- `rx_read_opts1(ring, idx, &RxParse)` — single volatile read of the OWN/opts1
+  word for the pre-`dma_rmb()` ownership check.
+- `rx_read_completion(ring, idx, &RxParse)` — one volatile descriptor fetch
+  using the precomputed `RxParse` offsets (no per-packet `match RxDescFormat`).
+
+Both stride by `parse.stride` (= `RxDescFormat::descriptor_len()`, the single
+source enforced by `ci/check_rx_desc_stride.sh`). This removes the per-packet
+double-read + format match from the NAPI RX hot loop.

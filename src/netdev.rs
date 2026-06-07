@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
-//! Rust ↔ C bridge surface — plan §7 M4-full.
+//! Rust ↔ C bridge surface for the RTL8125 netdev implementation.
 //!
-//! ## Scope at M4-full
+//! ## Scope
 //!
 //! `NetdevState` holds everything the ndo callbacks need: a raw pointer
 //! into the mapped BAR (so `ndo_open`/`xmit`/`poll`/IRQ can issue MMIO
@@ -117,12 +117,9 @@ const BRIDGE_FEATURE_RXCSUM: u32 = 0x0000_0001;
 const BRIDGE_FEATURE_RXVLAN: u32 = 0x0000_0002;
 const BRIDGE_FEATURE_RXHASH: u32 = 0x0000_0004;
 
-// RXHASH feature gate for Track A (single-queue hash-only path).
-//
-// Keep false while RXHASH remains intentionally hidden from the advertised
-// feature set. Flip to `true` only after gate-check and controlled
-// validation are complete.
-const RXHASH_FEATURE_GATE: bool = false;
+// RXHASH feature gate for the single-queue hash-reporting path. Hardware RSS
+// remains disabled; this only lets the stack consume descriptor hashes.
+const RXHASH_FEATURE_GATE: bool = true;
 
 /// Stop the TX queue preemptively when fewer than this many descriptor
 /// slots remain free. **Must pair** with [`napi::TX_START_THRS`]
@@ -277,7 +274,7 @@ impl IrqMode {
     }
 }
 
-/// TX-ring slice of the per-device state (task #59 split, 2026-05-29).
+/// TX-ring slice of the per-device state.
 ///
 /// Owned by `xmit` (producer) and the NAPI poll TX reaper (consumer).
 /// `desc` / `dma` are set at probe and read-only afterwards; the
@@ -331,7 +328,7 @@ pub(crate) struct TxRingState {
 }
 
 impl TxRingState {
-    /// Heap-in-place initializer (task #58 stack-overflow fix). Each of
+    /// Heap-in-place initializer. Each of
     /// the 5 × `RING_LEN` shadow arrays is constructed slot-by-slot via
     /// `init_array_from_fn`, never materialised on the stack.
     pub(crate) fn new(
@@ -407,8 +404,7 @@ pub(crate) struct RxRingState {
     /// the RX hot loop's index doesn't ping-pong with TX indices.
     pub(crate) tail: CachePadded<AtomicUsize>,
     /// Active RX descriptor format for this open. Kept fixed for the device
-    /// open/session for now; phase 0 defaults this to legacy layout until
-    /// explicit RSS layout enablement is plumbed.
+    /// open/session so descriptor parsing never switches per packet.
     pub(crate) format: RxDescFormat,
 }
 
@@ -435,8 +431,8 @@ impl RxRingState {
 }
 
 /// IRQ slice — set at probe by the kernel-Rust `pci_alloc_irq_vectors`
-/// dance + mode detection (M6 #1 Phase A.2). Read-only after probe; the
-/// atomic on `mode` is just to satisfy the `&self` access pattern.
+/// allocation and mode detection. Read-only after probe; the atomic on `mode`
+/// is just to satisfy the `&self` access pattern.
 pub(crate) struct IrqState {
     /// IRQ number from `pci_irq_vector(pdev, 0)`. For MSI/MSI-X this is
     /// the kernel-assigned vector number; for legacy INTx fallback it
@@ -499,7 +495,7 @@ impl PhyState {
 /// Per-bound-device state — accessed from probe, ndo callbacks, NAPI
 /// poll, and the IRQ handler. Sub-state lives in `tx` / `rx` / `irq` /
 /// `phy` to make the cross-context ownership story obvious from the
-/// type (task #59 split, 2026-05-29). The top-level fields are
+/// type. The top-level fields are
 /// device-wide invariants: `pdev` holds the ARef, `bar_ptr` is the
 /// stable MMIO mapping, `ndev` is the registered net_device handle.
 pub(crate) struct NetdevState {
@@ -697,7 +693,7 @@ extern "C" fn skel_stop(_cookie: *mut c_void) {}
 #[allow(dead_code)]
 extern "C" fn skel_xmit(_cookie: *mut c_void, skb: *mut bindings::sk_buff) -> c_int {
     // Skeleton path — wrap and immediately dispose so the type
-    // discipline (task #62) is uniform across all xmit callbacks.
+    // discipline is uniform across all xmit callbacks.
     crate::skb::DriverOwnedSkb::from_raw(skb).free_with_error();
     NETDEV_TX_OK
 }
@@ -746,13 +742,12 @@ fn free_rx_slots(state: &NetdevState) {
     ub::rx_pool_destroy(ndev);
 }
 
-// ── ndo_open phase helpers (task #60, 2026-05-29) ─────────────────────────
+// ── ndo_open helpers ──────────────────────────────────────────────────────
 //
-// The phases below split the M4-full bring-up sequence into named,
-// individually documentable steps. The top-level `ndo_open` reads as
-// a sequence of phase calls; each helper is local to this module and
-// either pure or holds the precise invariant needed (e.g. "BAR is
-// alive and the RX pool is populated before pre-posting descriptors").
+// The helpers below split the bring-up sequence into named, individually
+// documentable steps. Each helper is local to this module and either pure or
+// holds the precise invariant needed (e.g. "BAR is alive and the RX pool is
+// populated before pre-posting descriptors").
 // Rollback stays inline at the call site so the unwind order — which
 // is direction-sensitive — is visible where it matters.
 
@@ -781,13 +776,17 @@ fn rxhash_enabled(feature_flags: u32) -> bool {
 
 fn apply_rxhash_programming(state: &NetdevState) {
     let regs = state.regs();
-    // Keep all queue ownership single-queue for Track A.
+    // Keep all queue ownership single-queue.
     regs.set_q_num_ctrl_8125(0);
 
     if state.rx_hash_enabled.load(Ordering::Acquire) {
         regs.clear_rss_indir_8125();
-        regs.set_rss_key_8125(&regs::RSS_PROBE_KEY);
-        regs.set_rss_ctrl_8125(regs::RSS_CTRL_PROBE_HASH_BITS);
+        // Boot-stable system RSS key (not a hardcoded constant) — hashes are
+        // unpredictable across reboots without baking a key into the driver.
+        let mut key = [0u8; regs::RSS_KEY_SIZE];
+        ub::rss_key_fill(&mut key);
+        regs.set_rss_key_8125(&key);
+        regs.set_rss_ctrl_8125(regs::RSS_CTRL_HASH_BITS);
         return;
     }
 
@@ -798,9 +797,11 @@ fn apply_netdev_features(state: &NetdevState, feature_flags: u32) {
     let regs = state.regs();
     regs.set_rcr(rx_feature_rcr(regs.rcr(), feature_flags));
     regs.set_cpluscmd(rx_feature_cpluscmd(feature_flags));
-    state
-        .rx_hash_enabled
-        .store(rxhash_enabled(feature_flags), Ordering::Relaxed);
+    // RXHASH needs the V3 descriptor's hash fields. On the legacy-descriptor
+    // fallback (`rx_legacy_desc=1`) there is no hash field, so force it off
+    // regardless of the advertised feature bit.
+    let enable = rxhash_enabled(feature_flags) && state.rx.format != RxDescFormat::Legacy;
+    state.rx_hash_enabled.store(enable, Ordering::Relaxed);
 }
 
 /// Map TX/RX ring DMA bases + program RxConfig / CPlusCmd. `RxMaxSize`
@@ -812,9 +813,8 @@ fn program_dma_rings(state: &NetdevState, regs: &Regs<'_>, feature_flags: u32) {
     regs.set_tx_ring_base(state.tx.dma);
     regs.set_rx_ring_base(state.rx.dma);
     let mut rcr = rx_feature_rcr(regs::RCR_M4_BASELINE, feature_flags);
-    // Track-A runtime path emits V3 (32-byte) RX descriptors so the chip can
-    // write hash metadata. Set in RCR before pre-post (which lays out V3 slots)
-    // and before engine enable.
+    // V3 (32-byte) RX descriptors let the chip write hash metadata. Set in RCR
+    // before pre-post (which lays out V3 slots) and before engine enable.
     if state.rx.format != RxDescFormat::Legacy {
         rcr |= regs::RCR_ENABLE_RX_DESC_V3;
     }
@@ -967,12 +967,11 @@ fn setup_interrupt_config(regs: &Regs<'_>) {
     regs.ack_isr_v2(0xFFFF_FFFF);
 }
 
-/// M6 #1 Phase A.2 — chip-side activation of the per-message-id
-/// ISR_V2 register layout. Only flip `INT_CFG0_ENABLE_8125` when probe
-/// selected `use_v2`; with one MSI/MSI-X vector we keep V2 disabled so
-/// TX completions use the legacy combined ISR/IMR surface on vector 0.
-/// Must run BEFORE the matching `set_imr_v2_mask` write — `rearm_irq_baseline`
-/// then targets the V2 surface.
+/// Chip-side activation of the per-message-id ISR_V2 register layout. Only flip
+/// `INT_CFG0_ENABLE_8125` when probe selected `use_v2`; with one MSI/MSI-X
+/// vector we keep V2 disabled so TX completions use the legacy combined ISR/IMR
+/// surface on vector 0. Must run BEFORE the matching `set_imr_v2_mask` write —
+/// `rearm_irq_baseline` then targets the V2 surface.
 #[inline]
 fn activate_v2_isr_for_msi(state: &NetdevState, regs: &Regs<'_>) {
     if state.irq_mode() != IrqMode::Intx && state.use_v2_irq_surface() {
@@ -1094,7 +1093,7 @@ fn log_ndo_open_complete(state: &NetdevState, regs: &Regs<'_>) {
     );
 }
 
-// ── ndo_open RAII guards (task #61, 2026-05-29) ───────────────────────────
+// ── ndo_open RAII guards ──────────────────────────────────────────────────
 //
 // The bring-up acquires two things that need to be released on every
 // failure path: the RX page pool (via `allocate_rx_pool` /
@@ -1204,7 +1203,6 @@ fn ndo_open(state: &NetdevState, feature_flags: u32) -> Result<()> {
     ub::pci_set_master(&state.pdev);
 
     program_dma_rings(state, &regs, feature_flags);
-    apply_rxhash_programming(state);
     let rx_pool = RxPoolGuard::allocate(state)?;
     pre_post_rx_descriptors(state);
     zero_tx_descriptors(state);
@@ -1238,6 +1236,10 @@ fn ndo_open(state: &NetdevState, feature_flags: u32) -> Result<()> {
     // enabled below. `buf_len` is the pool's device-writable length, ≤
     // RX_MAX_SIZE_JUMBO (0x3FFF), so it fits the 16-bit register.
     regs.set_rx_max_size(state.rx.buf_len.inner.load(Ordering::Relaxed) as u16);
+
+    // `hw_start_8125b` force-clears RSS_CTRL/Q_NUM as a safe baseline. Program
+    // the hash-only state after that clear and before RX/TX engines run.
+    apply_rxhash_programming(state);
 
     enable_chip_engines(&regs);
     activate_v2_isr_for_msi(state, &regs);
@@ -1344,7 +1346,7 @@ fn ndo_stop(state: &NetdevState) {
     free_rx_slots(state);
 }
 
-// ── ndo_start_xmit phase helpers (tasks #60 + #62) ────────────────────────
+// ── ndo_start_xmit helpers ────────────────────────────────────────────────
 
 /// TSO/CSUM offload bit computation plus post-mutation fragment count. The skb
 /// is BORROWED — caller retains ownership and is responsible for
@@ -1354,7 +1356,7 @@ fn ndo_stop(state: &NetdevState) {
 /// May mutate the skb (`skb_cow_head` + `tcp_v6_gso_csum_prep` for IPv6
 /// TSO; padding plus `skb_checksum_help` for the narrow RTL8125 UDP pad quirk
 /// or unsupported checksum-partial cases). These paths write linear data, so
-/// any subsequent DMA map sees the final bytes — which is why this phase MUST
+/// any subsequent DMA map sees the final bytes — which is why this step MUST
 /// run before `map_skb_linear`.
 fn compute_offload_bits(skb: &crate::skb::DriverOwnedSkb) -> Result<(u32, u32, usize)> {
     let (opts1, opts2, nr_frags) = skb.tx_offload_prepare()?;
@@ -1385,7 +1387,7 @@ fn try_reserve_ring_space(state: &NetdevState, head: usize, n_desc: usize) -> Op
 
 /// DMA-map the LINEAR head of `skb`. Returns `Some((handle, len))` on
 /// success, or `None` on `dma_map_single` failure. The skb is BORROWED;
-/// caller disposes via `free_with_error` on `None` (task #62 — explicit
+/// caller disposes via `free_with_error` on `None` (explicit
 /// ownership transfer).
 #[inline]
 fn map_skb_linear(
@@ -1396,7 +1398,7 @@ fn map_skb_linear(
 }
 
 /// RAII guard for the linear-head + per-fragment DMA mappings of an
-/// in-flight TX skb (task #61, 2026-05-29). Each `record_frag()` call
+/// in-flight TX skb. Each `record_frag()` call
 /// after a successful `skb_frag_dma_map` + shadow publish bumps the
 /// per-Drop unmap count. On error, an early `return Err(())` drops the
 /// guard, which:
@@ -1524,7 +1526,7 @@ fn map_skb_fragments(
     for i in 0..nr_frags {
         let Some(skb) = guard.skb() else {
             // Guard exhausted before the loop finished — shouldn't
-            // happen during the active fragment-map phase, but treat
+            // happen during active fragment mapping, but treat
             // as a soft failure that lets the guard's Drop clean up.
             return Err(());
         };
@@ -1809,7 +1811,7 @@ extern "C" fn raw_irq_handler(_irq: c_int, dev_id: *mut c_void) -> bindings::irq
     let state = state_from(dev_id);
     let regs = state.regs();
     let use_v2 = state.irq_mode() == IrqMode::Msi && state.use_v2_irq_surface();
-    // M6 #1 Phase A.2 — branch on the probe-chosen delivery mode:
+    // Branch on the probe-chosen delivery mode:
     //   Intx or Msi without V2-capability → legacy ISR (0x3C) + IMR
     //   (0x38), W1C ack
     //   Msi with V2-capability → ISR_V2 (0x0D04) + IMR_V2
@@ -1844,7 +1846,7 @@ extern "C" fn raw_irq_handler(_irq: c_int, dev_id: *mut c_void) -> bindings::irq
 
 /// Owns the registered `net_device` + the `Box<NetdevState>` cookie.
 ///
-/// ## Two-phase teardown (task #58 fix, 2026-05-28)
+/// ## Two-step teardown
 ///
 /// The kernel-Rust PCI adapter calls `T::unbind(dev, this)` and then
 /// runs `devres_release_all(dev)` BEFORE dropping `T::DriverData`. That

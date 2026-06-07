@@ -1,0 +1,7 @@
+driver,mtu,test,obs,p50_us,p99_us,p999_us,max_us
+r8125_rust,1500,sockperf-rtt-idle,235625,49.953,62.026,63.088,0
+r8125_rust,1500,sockperf-rtt-loaded,19578,590.508,635.512,645.320,0
+r8125_rust,1500,icmp-rtt-loaded,6000,482.0,625.0,629.0,693.0
+r8125_rust,9000,sockperf-rtt-idle,234987,50.354,59.902,95.849,0
+r8125_rust,9000,sockperf-rtt-loaded,21072,606.135,660.768,834.233,0
+r8125_rust,9000,icmp-rtt-loaded,6000,565.0,754.0,792.0,804.0

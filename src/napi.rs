@@ -107,19 +107,22 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
     let buf_len = state.rx.buf_len.load(Ordering::Relaxed);
     let buf_desc_len = buf_len & regs::DESC_LEN_MASK;
     let buf_len = buf_len as usize;
+    // Resolve the descriptor format ONCE per poll into precomputed byte offsets
+    // so the hot loop has no per-packet `match RxDescFormat` and no double read.
+    let parse = crate::ring::RxParse::new(state.rx.format);
+    let rx_ring = state.rx.desc.cast::<u8>();
     while work_done < budget_u {
-        let mut completion = ub::desc_read_rx(state.rx.desc.cast::<u8>(), rx_tail, state.rx.format)
-            .completion(state.rx.format);
-        // Hardware sets OWN; if still set, this slot isn't filled yet — stop.
-        if completion.opts1 & regs::DESC_OWN != 0 {
+        // Cheap OWN check first (single word read, pre-barrier). If the slot is
+        // still device-owned it isn't filled yet — stop.
+        if ub::rx_read_opts1(rx_ring, rx_tail, &parse) & regs::DESC_OWN != 0 {
             break;
         }
-        // Pair with the device's OWN-clear publish before reading
-        // descriptor fields or the DMA buffer contents. r8169 uses
-        // the same dma_rmb() barrier after DescOwn clears.
+        // Pair with the device's OWN-clear publish before reading the rest of
+        // the descriptor or the DMA buffer. r8169 uses the same dma_rmb() after
+        // DescOwn clears.
         ub::dma_rmb();
-        completion = ub::desc_read_rx(state.rx.desc.cast::<u8>(), rx_tail, state.rx.format)
-            .completion(state.rx.format);
+        // One full descriptor fetch, post-barrier (no per-packet format match).
+        let completion = ub::rx_read_completion(rx_ring, rx_tail, &parse);
         // Lower 14 bits of opts1 are the RX frame length (incl. CRC; chip
         // typically strips CRC — same convention as r8169). Cap at the
         // buffer size for safety.

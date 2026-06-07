@@ -203,5 +203,14 @@ kernel::module_pci_driver! {
             default: 0,
             description: "Enable hot-path debug counters in ndo_stop log (0=off, 1=on)",
         },
+        // Legacy RX descriptor escape hatch. Default 0 uses the V3 (32-byte)
+        // RX descriptor path that carries the RXHASH metadata. Non-zero forces
+        // the legacy 16-byte descriptor layout (the path validated through the
+        // M4–M6 matrices/soaks) and disables RXHASH (legacy descriptors have no
+        // hash field) — a rollback knob if the V3 path regresses on a target.
+        rx_legacy_desc: u8 {
+            default: 0,
+            description: "Force legacy 16-byte RX descriptors + disable RXHASH (rollback; 0=V3 default)",
+        },
     },
 }

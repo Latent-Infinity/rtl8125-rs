@@ -108,3 +108,34 @@ Use this file as the canonical exception log:
 - Every time a regression occurs, add a short entry: symptom, root cause, commit/fix, gate added.
 - If a fix cannot be fully enforced by static checks, create a dedicated harness for it.
 - Re-run the lessons check at each milestone before merging any hot-path work.
+
+## 2026-06-07 — RXHASH/V3, UDP-TX, and process lessons
+
+- **V2/MSI-X needs ≥22 vectors on RTL8125B; otherwise use the legacy combined
+  ISR.** The V2 per-queue surface routes each source to MSI-X entry == its bit
+  position (RX Q0→0, **TX Q0→16**, LINKCHG→21). Enabling V2 with one vector
+  delivered RX but silently dropped TX completions → unidirectional UDP TX
+  wedged at ~94–182 packets. Vendor requires `R8125_MIN_MSIX_VEC_8125B=22`.
+  Fix: legacy ISR over the single MSI vector (`use_v2=false`). Gate evidence:
+  `docs/perf/byte_budget_20260605/UDP_TX_WEDGE.md`.
+- **RX descriptor stride must be a single source of truth.** The A1 V3 work
+  read the ring as a typed `*mut RxDescriptor` (32B) while the chip + repost
+  used the legacy 16B stride → reaper misaligned after slot 0, RX stalled at 18
+  packets. Fix routes all RX descriptor access through one stride
+  (`format.descriptor_len()` / `RxParse`); enforced by `check_rx_desc_stride.sh`.
+- **A phase is not "complete" until built AND run on hardware.** Twice (A1, A3)
+  code was marked complete while the gateway still ran the previous binary; the
+  defects only surfaced when the audit forced a sync+build+run. Make the
+  gateway run part of the definition of done.
+- **Distinguish benchmark artifacts from regressions.** The "UDP RX regression"
+  on the V3 default was over-line-rate spillover (`-b 2400M` > 2.35 Gbps line
+  rate), identical on legacy and V3, 0% at ≤ line rate. The 64B-RX "−22.7%"
+  matrix cell was sampling noise (CPU-bound at ~2M pps, ±25% swing); with 8
+  `-P10` samples rust's median (2.20M) ≥ C (1.84M). Re-sample noisy cells
+  before calling them regressions.
+- **The Controller-KVM can't validate single-flow UDP TX** — iperf3 UDP pacing
+  on `kvm-clock` wedges both drivers; use the Gateway for UDP-TX/latency/IRQ
+  work.
+- **Don't re-measure an unchanged baseline every run.** The C driver is fixed;
+  the bench now pins a C reference and runs rust-only (`RUN_C=0`) unless the
+  kernel/rig changes (~2× faster matrices).

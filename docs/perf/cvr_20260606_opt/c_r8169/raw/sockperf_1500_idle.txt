@@ -1,0 +1,11 @@
+sockperf: [2;35m== version #3.7-no.git == [0m
+sockperf[CLIENT] send on:sockperf: using recvfrom() to block on socket(s)
+
+[ 0] IP = 10.0.0.1        PORT = 11111 # UDP
+sockperf: Warmup stage (sending a few dummy messages)...
+sockperf: Starting test...
+sockperf: Test end (interrupted by timer)
+sockperf: Test ended
+sockperf: [Total Run] RunTime=12.001 sec; Warm up time=400 msec; SentMessages=108; ReceivedMessages=107
+sockperf: ========= Printing statistics for Server No: 0
+sockperf: No valid observations found. Try tune parameters: --time/--mps/--reply-every

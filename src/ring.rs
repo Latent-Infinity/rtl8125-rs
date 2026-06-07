@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-//! TX / RX descriptor rings — plan §7 M3.
+//! TX / RX descriptor rings.
 //!
 //! - 16-byte hardware TX descriptors (legacy `struct TxDesc` / `struct RxDesc`).
 //! - RX descriptors support legacy (16-byte), V3 (32-byte), and V4 (16-byte)
@@ -10,14 +10,13 @@
 //! - **Software-only canaries**: a parallel `[u64; N]` shadow array plus a
 //!   tail-canary descriptor at index `N` of the DMA ring. The shadow catches
 //!   driver-side overwrites of per-descriptor metadata; the tail canary catches
-//!   device-side one-off-the-end DMA writes (M4+ exercise).
+//!   device-side one-off-the-end DMA writes during stress testing.
 //! - **Typed ring indices**: newtype `TxHead`/`TxTail`/`RxHead`/`RxTail`
 //!   wrappers over `usize`; the type system distinguishes them so an `RxTail`
 //!   can't accidentally be passed where a `TxHead` is expected.
 //! - **Compile-time bounds**: `const RING_LEN: usize = 256`; ring sizes
 //!   propagate through `Ring<_, N>` const-generic parameter.
 
-use crate::regs;
 use kernel::device;
 use kernel::dma::{CoherentAllocation, DmaAddress};
 use kernel::error::code::EIO;
@@ -37,8 +36,6 @@ const CANARY_PATTERN: u64 = 0xDEAD_BEEF_CAFE_BABE;
 // republish offsets in this module.
 const RSS_HEADER_INFO_V3_L3_MASK: u16 = (1 << 10) | (1 << 12);
 const RSS_HEADER_INFO_V3_L4_MASK: u16 = (1 << 13) | (1 << 9);
-const RSS_HEADER_INFO_V4_L3_MASK: u32 = (1 << 28) | (1 << 29);
-const RSS_HEADER_INFO_V4_L4_MASK: u32 = (1 << 30) | (1 << 27);
 
 // TX-tail canary for 16-byte descriptor storage.
 const DESC_TAIL_CANARY_OPTS1: u32 = 0xDEAD_BEEF;
@@ -219,106 +216,53 @@ fn rx_hash_type_v3(header_info: u16) -> Option<RxHashType> {
     }
 }
 
+/// Decode a V3 descriptor hash from its raw `RSSResult` + `HeaderInfo` words.
+/// Shared by the NAPI fast path (`unsafe_boundary::rx_read_completion`).
 #[inline]
-fn rx_hash_type_v4(header_info: u32) -> Option<RxHashType> {
-    if header_info & RSS_HEADER_INFO_V4_L3_MASK == 0 {
-        return None;
-    }
-    if header_info & RSS_HEADER_INFO_V4_L4_MASK != 0 {
-        Some(RxHashType::L4)
-    } else {
-        Some(RxHashType::L3)
-    }
+pub(crate) fn rx_hash_from_v3(rss_result: u32, header_info: u16) -> Option<RxHash> {
+    rx_hash_type_v3(header_info).map(|kind| RxHash {
+        value: rss_result,
+        kind,
+    })
 }
 
-impl RxDescLegacy {
-    pub(crate) fn completion(self) -> RxCompletion {
-        RxCompletion {
-            len: (self.opts1 & regs::DESC_LEN_MASK) as usize,
-            opts1: self.opts1,
-            opts2: self.opts2,
-            rss_hash: None,
-        }
-    }
+/// Per-open RX descriptor parse parameters. The format match is resolved ONCE
+/// here (at poll entry) so the NAPI hot loop reads fields by precomputed byte
+/// offsets with NO per-packet `match RxDescFormat`. `stride` MUST come from
+/// `RxDescFormat::descriptor_len()` so it agrees with the chip and the
+/// publish/write paths (`ci/check_rx_desc_stride.sh`).
+#[derive(Copy, Clone)]
+pub(crate) struct RxParse {
+    /// Per-descriptor byte stride (16 legacy, 32 V3).
+    pub(crate) stride: usize,
+    /// Byte offset of `opts1` (carries OWN + length) within the slot.
+    pub(crate) opts1_off: usize,
+    /// Byte offset of `opts2` (csum/VLAN metadata) within the slot.
+    pub(crate) opts2_off: usize,
+    /// `(RSSResult_off, HeaderInfo_off)` for hash-bearing formats; `None`
+    /// for legacy (no hash field). V4 is not wired (validated chip is V3).
+    pub(crate) hash_off: Option<(usize, usize)>,
 }
 
-impl RxDescV3 {
-    #[allow(dead_code)]
-    pub(crate) fn completion(self) -> RxCompletion {
-        let hash = rx_hash_type_v3(self.header_info).map(|kind| RxHash {
-            value: self.rss_result,
-            kind,
-        });
-        RxCompletion {
-            len: (self.opts1 & regs::DESC_LEN_MASK) as usize,
-            opts1: self.opts1,
-            opts2: self.opts2,
-            rss_hash: hash,
-        }
-    }
-}
-
-impl RxDescV4 {
-    #[allow(dead_code)]
-    pub(crate) fn completion(self) -> RxCompletion {
-        let hash = rx_hash_type_v4(self.addr_or_rss_info as u32).map(|kind| RxHash {
-            value: (self.addr_or_rss_info >> 32) as u32,
-            kind,
-        });
-        RxCompletion {
-            len: (self.opts1 & regs::DESC_LEN_MASK) as usize,
-            opts1: self.opts1,
-            opts2: self.opts2,
-            rss_hash: hash,
+impl RxParse {
+    #[inline]
+    pub(crate) fn new(format: RxDescFormat) -> Self {
+        let (_addr_off, opts2_off, opts1_off) = format.publish_offsets();
+        let hash_off = match format {
+            // V3: RSSResult @ +8, HeaderInfo @ +14 (see `struct RxDescV3`).
+            RxDescFormat::V3 => Some((8, 14)),
+            RxDescFormat::Legacy | RxDescFormat::V4 => None,
+        };
+        Self {
+            stride: format.descriptor_len(),
+            opts1_off,
+            opts2_off,
+            hash_off,
         }
     }
 }
 
 impl RxDescriptor {
-    pub(crate) fn completion(self, format: RxDescFormat) -> RxCompletion {
-        match format {
-            RxDescFormat::Legacy => {
-                let first = self.words[0];
-                let second = self.words[1];
-                RxDescLegacy {
-                    opts1: (first & 0xFFFF_FFFF) as u32,
-                    opts2: (first >> 32) as u32,
-                    addr: second,
-                }
-                .completion()
-            }
-            RxDescFormat::V3 => {
-                let word2 = self.words[1];
-                let word3 = self.words[3];
-                let header_info = (word2 >> 48) as u16;
-                let hash = rx_hash_type_v3(header_info).map(|kind| RxHash {
-                    value: (word2 & 0xFFFF_FFFF) as u32,
-                    kind,
-                });
-                RxCompletion {
-                    len: ((word3 >> 32) & u64::from(regs::DESC_LEN_MASK)) as usize,
-                    opts1: (word3 >> 32) as u32,
-                    opts2: (word3 & 0xFFFF_FFFF) as u32,
-                    rss_hash: hash,
-                }
-            }
-            RxDescFormat::V4 => {
-                let word0 = self.words[0];
-                let word1 = self.words[1];
-                let hash = rx_hash_type_v4((word0 & 0xFFFF_FFFF) as u32).map(|kind| RxHash {
-                    value: (word0 >> 32) as u32,
-                    kind,
-                });
-                RxCompletion {
-                    len: ((word1 >> 32) & u64::from(regs::DESC_LEN_MASK)) as usize,
-                    opts1: (word1 >> 32) as u32,
-                    opts2: word1 as u32,
-                    rss_hash: hash,
-                }
-            }
-        }
-    }
-
     /// Byte offsets used by `desc_publish_own` for each format.
     pub(crate) const fn publish_offsets(format: RxDescFormat) -> (usize, usize, usize) {
         format.publish_offsets()
@@ -327,7 +271,7 @@ impl RxDescriptor {
 
 // ── Typed ring indices ───────────────────────────────────────────────────
 // Newtype wrappers; the compiler distinguishes them at the type level so a
-// TX index can't be used where an RX index is expected (plan §7 M3).
+// TX index can't be used where an RX index is expected.
 
 macro_rules! ring_index {
     ($name:ident, $doc:literal) => {

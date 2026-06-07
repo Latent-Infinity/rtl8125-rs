@@ -6,9 +6,9 @@
  * (PCI, MMIO, descriptor rings, hardware programming, NAPI poll body)
  * lives in Rust; this file's only job is the kernel-facing surface that
  * has no stable Rust API today: net_device + net_device_ops + NAPI +
- * sk_buff plumbing (plan §5.2 / §5.3).
+ * sk_buff plumbing.
  *
- * Hard cap: 520 LOC including comments. Candidate G/L/M additions fit
+ * Hard cap: 540 LOC including comments. Candidate G/L/M additions fit
  * under the original 450 cap after the dead RX helpers were removed;
  * raised to 480 for the two ndo_change_mtu accessors the per-MTU
  * zero-copy RX path needs (netif_running + WRITE_ONCE(dev->mtu)).
@@ -229,7 +229,8 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 			    NETIF_F_RXCSUM | NETIF_F_SG |
 			    NETIF_F_TSO | NETIF_F_TSO6 |
 			    NETIF_F_HW_VLAN_CTAG_TX |
-			    NETIF_F_HW_VLAN_CTAG_RX;
+			    NETIF_F_HW_VLAN_CTAG_RX |
+			    NETIF_F_RXHASH;
 	ndev->features = ndev->hw_features;
 	ndev->vlan_features = NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
 			      NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6;
@@ -406,6 +407,17 @@ void r8125_bridge_tx_wake_queue(struct net_device *ndev)
 bool r8125_bridge_netdev_xmit_more(void)
 {
 	return netdev_xmit_more();
+}
+
+/*
+ * Fill `len` bytes of `key` with the system RSS Toeplitz key via
+ * netdev_rss_key_fill (a boot-stable, randomly-seeded key shared across
+ * NICs). Used by the single-queue RXHASH path so the key is not a hardcoded
+ * constant baked into the driver (predictable hashes across all units).
+ */
+void r8125_bridge_rss_key_fill(u8 *key, u32 len)
+{
+	netdev_rss_key_fill(key, len);
 }
 
 void r8125_bridge_napi_schedule(struct net_device *ndev)

@@ -249,6 +249,11 @@ void r8125_bridge_tx_wake_queue(struct net_device *ndev);
  */
 bool r8125_bridge_netdev_xmit_more(void);
 
+/* Fill `key[0..len]` with the boot-stable system RSS hash key
+ * (netdev_rss_key_fill). Used by the single-queue RXHASH path.
+ */
+void r8125_bridge_rss_key_fill(u8 *key, u32 len);
+
 /* Schedule a NAPI poll. Safe to call from atomic (IRQ) context. */
 void r8125_bridge_napi_schedule(struct net_device *ndev);
 

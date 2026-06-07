@@ -51,7 +51,9 @@ use kernel::transmute::{AsBytes, FromBytes};
 use kernel::types::Opaque;
 
 use crate::netdev::{NetdevHandle, NetdevState};
-use crate::ring::{Descriptor, RxDescFormat, RxDescLegacy, RxDescV3, RxDescV4, RxDescriptor};
+use crate::ring::{
+    Descriptor, RxCompletion, RxDescFormat, RxDescLegacy, RxDescV3, RxDescV4, RxDescriptor, RxParse,
+};
 
 /// Configure 64-bit DMA addressing on `pdev` and its coherent allocator.
 /// Wraps the kernel-Rust `unsafe fn dma_set_mask_and_coherent`.
@@ -197,6 +199,7 @@ extern "C" {
     fn r8125_bridge_tx_stop_queue(ndev: *mut bindings::net_device);
     fn r8125_bridge_tx_wake_queue(ndev: *mut bindings::net_device);
     fn r8125_bridge_netdev_xmit_more() -> bool;
+    fn r8125_bridge_rss_key_fill(key: *mut u8, len: u32);
     fn r8125_bridge_tx_disable(ndev: *mut bindings::net_device);
     fn r8125_bridge_carrier_off(ndev: *mut bindings::net_device);
 
@@ -678,32 +681,50 @@ pub(crate) fn desc_publish_own(ring: *mut u8, idx: usize, value: Descriptor, for
 
 // ── RX descriptor helpers (phase 1) ───────────────────────────────────────
 
-/// Read one RX hardware descriptor at `ring + idx * format_stride` (volatile).
+/// Read ONLY the `opts1`/OWN word for the cheap pre-`dma_rmb()` ownership
+/// check, using the precomputed [`RxParse`] offsets (no full descriptor fetch,
+/// no per-packet format match).
 ///
-/// CRITICAL: the stride MUST be `format.descriptor_len()` — the same stride the
-/// chip uses for the active descriptor format (16B legacy, 32B V3) and the same
-/// one [`desc_publish_own`] writes at. Indexing a typed `*mut RxDescriptor`
-/// (always 32B) while the chip writes legacy 16B descriptors silently
-/// misaligns the reaper after slot 0 and wedges RX (validated 2026-06-06: RX
-/// stalled at 18 packets). All three RX accessors route their stride through
-/// `descriptor_len()` so they cannot disagree; `ci/check_rx_desc_stride.sh`
-/// enforces it.
-pub(crate) fn desc_read_rx(ring: *mut u8, idx: usize, format: RxDescFormat) -> RxDescriptor {
-    // SAFETY: caller guarantees idx < N of the ring this pointer indexes, and
-    // the ring storage (RxDescriptor, 32B) is >= the read width for any format.
-    // Volatile to discipline against compiler reordering across OWN-bit handoff.
+/// CRITICAL: the stride is `parse.stride` (= `RxDescFormat::descriptor_len()`,
+/// set once in `RxParse::new`) — the same stride the chip uses and the same one
+/// [`desc_publish_own`] / [`desc_write_rx`] write at. A mismatched stride
+/// silently misaligns the reaper and wedges RX (validated 2026-06-06: RX stalled
+/// at 18 packets). `ci/check_rx_desc_stride.sh` enforces the single source.
+#[inline]
+pub(crate) fn rx_read_opts1(ring: *mut u8, idx: usize, parse: &RxParse) -> u32 {
+    // SAFETY: idx < N of the ring; opts1_off lies within the `stride`-byte slot,
+    // and the RxDescriptor storage (32B) is >= any format's stride.
     unsafe {
-        let stride = format.descriptor_len();
-        let slot = ring.add(idx * stride);
-        let slot_u64 = slot.cast::<u64>();
-        let nwords = stride / 8;
-        let mut out = RxDescriptor::default();
-        let mut w = 0;
-        while w < nwords {
-            out.words[w] = core::ptr::read_volatile(slot_u64.add(w));
-            w += 1;
+        core::ptr::read_volatile(ring.add(idx * parse.stride + parse.opts1_off).cast::<u32>())
+    }
+}
+
+/// Read a full RX completion using the precomputed [`RxParse`] byte offsets:
+/// one descriptor fetch, no per-packet `match RxDescFormat`. Call AFTER
+/// `dma_rmb()` so the device's OWN-clear publish is visible.
+#[inline]
+pub(crate) fn rx_read_completion(ring: *mut u8, idx: usize, parse: &RxParse) -> RxCompletion {
+    // SAFETY: as `rx_read_opts1` — every offset (opts1/opts2 and, for V3, the
+    // RSSResult/HeaderInfo pair in `hash_off`) is within the `stride`-byte slot,
+    // and the 32B RxDescriptor storage covers it for both legacy and V3.
+    unsafe {
+        let slot = ring.add(idx * parse.stride);
+        let opts1 = core::ptr::read_volatile(slot.add(parse.opts1_off).cast::<u32>());
+        let opts2 = core::ptr::read_volatile(slot.add(parse.opts2_off).cast::<u32>());
+        let rss_hash = match parse.hash_off {
+            Some((rss_off, hdr_off)) => {
+                let rss_result = core::ptr::read_volatile(slot.add(rss_off).cast::<u32>());
+                let header_info = core::ptr::read_volatile(slot.add(hdr_off).cast::<u16>());
+                crate::ring::rx_hash_from_v3(rss_result, header_info)
+            }
+            None => None,
+        };
+        RxCompletion {
+            len: (opts1 & crate::regs::DESC_LEN_MASK) as usize,
+            opts1,
+            opts2,
+            rss_hash,
         }
-        out
     }
 }
 
@@ -840,6 +861,18 @@ pub(crate) fn bridge_tx_wake_queue(ndev: *mut bindings::net_device) {
 pub(crate) fn netdev_xmit_more() -> bool {
     // SAFETY: see fn-level contract.
     unsafe { r8125_bridge_netdev_xmit_more() }
+}
+
+/// Fill `key` with the boot-stable system RSS hash key (`netdev_rss_key_fill`),
+/// replacing the previously hardcoded constant key for the single-queue RXHASH
+/// path. The key is generated once per boot by the net core and shared, so
+/// hashes are unpredictable across reboots without being baked into the driver.
+///
+/// # SAFETY: `key` is a `[u8; RSS_KEY_SIZE]`, so the pointer is valid for
+/// `RSS_KEY_SIZE` writable bytes — exactly the length passed to the C helper.
+pub(crate) fn rss_key_fill(key: &mut [u8; crate::regs::RSS_KEY_SIZE]) {
+    // SAFETY: see fn-level contract; netdev_rss_key_fill writes `len` bytes.
+    unsafe { r8125_bridge_rss_key_fill(key.as_mut_ptr(), crate::regs::RSS_KEY_SIZE as u32) };
 }
 
 pub(crate) fn bridge_tx_disable(ndev: *mut bindings::net_device) {

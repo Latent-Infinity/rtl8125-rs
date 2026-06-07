@@ -1,0 +1,7 @@
+NIC statistics:
+     tx_received: 99157995
+     tx_consumed: 99157995
+     tx_busy_exception: 0
+     tx_dropped_error: 0
+     rx_handed_to_stack: 98000841
+     rx_dropped_error: 0

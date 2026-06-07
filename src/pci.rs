@@ -12,7 +12,7 @@
 //!    XID not in `hw::KNOWN` — **no silent fallback**.
 //! 5. Reset the chip (r8169-style `CmdReset` + 10 ms poll). The
 //!    `inject_reset_timeout` module parameter forces a timeout to
-//!    exercise the failure path required by plan §7 M2.
+//!    exercise the probe-error recovery path.
 //! 6. Log the PCIe ASPM capabilities (read-only at probe; actual
 //!    ASPM enable/disable lives in `hw::hw_start_8125b`, gated by
 //!    the `force_aspm` module param).
@@ -36,8 +36,8 @@
 //! fields when normal `unbind` did not run.
 //!
 //! Devres + `ARef` handle the rest. Probe-error paths run through
-//! Drop, never bypass it — that's how "failed reset is recoverable"
-//! (plan §7 M2) is enforced (other drivers rebind cleanly).
+//! Drop, never bypass it — that's how "failed reset is recoverable" is
+//! enforced (other drivers rebind cleanly).
 
 use kernel::{
     device::Core, devres::Devres, error::code::ENODEV, pci, prelude::*, sync::aref::ARef,
@@ -183,7 +183,7 @@ impl pci::Driver for R8125Driver {
                         let xid = hw::xid_from_tx_config(regs.tx_config());
                         dev_err!(
                             pdev,
-                            "unknown RTL8125 sub-revision: XID=0x{:03x} — refusing to bind (no silent fallback, plan §7 M2)\n",
+                            "unknown RTL8125 sub-revision: XID=0x{:03x} — refusing to bind (no silent fallback)\n",
                             xid
                         );
                         ENODEV
@@ -232,17 +232,12 @@ impl pci::Driver for R8125Driver {
                     let mac = regs.mac_address();
                     let bar_ptr = bar as *const pci::Bar<{ mmio::R8125_MMIO_LEN }>;
 
-                    // M6 #1 Phase A.2 — allocate one IRQ vector.
-                    //
                     // Default flag set prefers MSI-X → MSI → INTx (kernel's
                     // built-in order in `pci_alloc_irq_vectors`). The
                     // `intx_only` module param short-circuits to legacy
                     // INTx for regression testing. We detect which type the
                     // kernel actually gave us by retrying with INTx-only on
-                    // any MSI/MSI-X allocation failure (the empirical fact
-                    // we discovered in Phase A.1: enabling V2 register mode
-                    // without an MSI/MSI-X vector silently breaks IRQ
-                    // delivery — see hw.rs Phase A.1 comment).
+                    // any MSI/MSI-X allocation failure.
                     let intx_only =
                         *crate::module_parameters::intx_only.value() != 0;
                     let (irq_mode, use_v2) = if intx_only {
@@ -396,11 +391,16 @@ impl pci::Driver for R8125Driver {
                             rx <- crate::netdev::RxRingState::new(
                                 rx_ring.desc_ptr_mut(),
                                 rx_ring.dma_handle(),
-                                // Track-A RXHASH requires the 32-byte V3
-                                // descriptor layout to expose RSSResult.
-                                // Keep this fixed at probe/open selection
-                                // boundaries (no per-packet switching).
-                                crate::ring::RxDescFormat::V3,
+                                // RXHASH requires the 32-byte V3 descriptor
+                                // layout to expose RSSResult. Fixed
+                                // at probe (no per-packet switching). The
+                                // `rx_legacy_desc=1` rollback knob forces the
+                                // legacy 16-byte path (and disables RXHASH).
+                                if *crate::module_parameters::rx_legacy_desc.value() != 0 {
+                                    crate::ring::RxDescFormat::Legacy
+                                } else {
+                                    crate::ring::RxDescFormat::V3
+                                },
                             ),
                             irq <- crate::netdev::IrqState::new(
                                 irq_num,
