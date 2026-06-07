@@ -49,6 +49,8 @@ static unsigned int bridge_feature_flags(netdev_features_t features)
 		flags |= R8125_BRIDGE_FEATURE_RXCSUM;
 	if (features & NETIF_F_HW_VLAN_CTAG_RX)
 		flags |= R8125_BRIDGE_FEATURE_RXVLAN;
+	if (features & NETIF_F_RXHASH)
+		flags |= R8125_BRIDGE_FEATURE_RXHASH;
 
 	return flags;
 }

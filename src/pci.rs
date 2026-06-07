@@ -388,6 +388,7 @@ impl pci::Driver for R8125Driver {
                             ndev: AtomicPtr::new(core::ptr::null_mut()),
                             debug_counters: AtomicBool::new(false),
                             bql_enabled: AtomicBool::new(false),
+                            rx_hash_enabled: AtomicBool::new(false),
                             tx <- crate::netdev::TxRingState::new(
                                 tx_ring.desc_ptr_mut(),
                                 tx_ring.dma_handle(),

@@ -156,6 +156,7 @@ struct r8125_bridge_ops {
 
 #define R8125_BRIDGE_FEATURE_RXCSUM	0x00000001U
 #define R8125_BRIDGE_FEATURE_RXVLAN	0x00000002U
+#define R8125_BRIDGE_FEATURE_RXHASH	0x00000004U
 
 /* ──────────────────────────────────────────────────────────────────────
  *  Lifecycle: alloc → register → … → unregister_and_free.

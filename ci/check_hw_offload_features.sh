@@ -48,12 +48,14 @@ fi
 
 if grep -q 'R8125_BRIDGE_FEATURE_RXCSUM' "$HEADER" &&
    grep -q 'R8125_BRIDGE_FEATURE_RXVLAN' "$HEADER" &&
+   grep -q 'R8125_BRIDGE_FEATURE_RXHASH' "$HEADER" &&
    grep -q 'BRIDGE_FEATURE_RXCSUM' "$NETDEV" &&
    grep -q 'BRIDGE_FEATURE_RXVLAN' "$NETDEV" &&
+   grep -q 'BRIDGE_FEATURE_RXHASH' "$NETDEV" &&
    grep -q 'set_features: rust_set_features' "$NETDEV"; then
-	grn "C/Rust feature-flag ABI mirrors RX checksum and RX VLAN bits"
+	grn "C/Rust feature-flag ABI mirrors RX checksum, RX VLAN, and RXHASH bits"
 else
-	red "C/Rust feature-flag ABI must expose RX checksum and RX VLAN bits"
+	red "C/Rust feature-flag ABI must expose RX checksum, RX VLAN, and RXHASH bits"
 fi
 
 if grep -q 'RX_VLAN_INNER_8125' "$REGS" &&
@@ -87,7 +89,9 @@ else
 	red "RX VLAN offload must pass desc opts2 TCI through __vlan_hwaccel_put_tag"
 fi
 
-if ! grep -q 'NETIF_F_RXHASH' "$BRIDGE" &&
+if grep -q 'R8125_BRIDGE_FEATURE_RXHASH' "$BRIDGE" &&
+   grep -q 'BRIDGE_FEATURE_RXHASH' "$NETDEV" &&
+   ! grep -q 'NETIF_F_RXHASH' "$NETDEV" &&
    grep -q 'set_rss_ctrl_8125(0)' "$HW" &&
    grep -q 'set_q_num_ctrl_8125(0)' "$HW" &&
    ! grep -q 'alloc_etherdev_mq' "$BRIDGE" &&

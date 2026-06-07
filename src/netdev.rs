@@ -115,6 +115,7 @@ const NETDEV_TX_OK: c_int = 0;
 const NETDEV_TX_BUSY: c_int = 0x10;
 const BRIDGE_FEATURE_RXCSUM: u32 = 0x0000_0001;
 const BRIDGE_FEATURE_RXVLAN: u32 = 0x0000_0002;
+const BRIDGE_FEATURE_RXHASH: u32 = 0x0000_0004;
 
 /// Stop the TX queue preemptively when fewer than this many descriptor
 /// slots remain free. **Must pair** with [`napi::TX_START_THRS`]
@@ -525,6 +526,13 @@ pub(crate) struct NetdevState {
     // It is not independently mutated at packet rate.
     pub(crate) bql_enabled: AtomicBool,
 
+    /// Runtime gate for `skb_set_hash()` delivery on RX.
+    /// Set from `ndo_open` and `set_features` via
+    /// `apply_netdev_features`. False keeps hash parsing wired but does
+    /// not expose a valid `skb->hash` to the stack.
+    // NOT-PADDED: written at open/set_features only; read from NAPI poll.
+    pub(crate) rx_hash_enabled: AtomicBool,
+
     /// TX descriptor ring + producer/consumer indices + shadow.
     pub(crate) tx: TxRingState,
     /// RX descriptor ring + per-slot streaming-DMA pages + consumer index.
@@ -762,6 +770,9 @@ fn apply_netdev_features(state: &NetdevState, feature_flags: u32) {
     let regs = state.regs();
     regs.set_rcr(rx_feature_rcr(regs.rcr(), feature_flags));
     regs.set_cpluscmd(rx_feature_cpluscmd(feature_flags));
+    state
+        .rx_hash_enabled
+        .store(feature_flags & BRIDGE_FEATURE_RXHASH != 0, Ordering::Relaxed);
 }
 
 /// Map TX/RX ring DMA bases + program RxConfig / CPlusCmd. `RxMaxSize`
@@ -1146,6 +1157,7 @@ fn ndo_open(state: &NetdevState, feature_flags: u32) -> Result<()> {
         .store(debug_counters, Ordering::Relaxed);
     reset_debug_counts();
     state.bql_enabled.store(false, Ordering::Release);
+    apply_netdev_features(state, feature_flags);
     state.reset_indices();
     state.tx.byte_budget.inner.store(
         *crate::module_parameters::tx_byte_budget.value(),

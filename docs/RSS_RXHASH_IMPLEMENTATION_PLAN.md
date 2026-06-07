@@ -171,7 +171,10 @@ Execution status:
   boundary in `hash_info` metadata; C-side counters/instrumentation now include
   `rx_hash_l3`, `rx_hash_l4`, `rx_hash_missing` and `skb_set_hash(...)` is called for
   valid hashable frames.
-- **A3**: blocked — gate depends on A1/A2 plus bench result from phase 0.
+- **A3**: in progress — runtime feature plumbing is wired (`NetdevState::rx_hash_enabled`
+  via open/set_features bit-path), and the cshim feature-bit ABI now includes
+  RXHASH, but public enablement remains gated by phase-0 evidence + benchmark
+  deltas.
 - **B1–B5**: blocked — all deferred until Track A is validated.
 
 ### Phase 0 Evidence Protocol
