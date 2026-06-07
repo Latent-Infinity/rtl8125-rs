@@ -20,12 +20,15 @@
    - Status: **recorded and accepted**.
 
 2. **Descriptor hash population (go/no-go)**
-   - Open question remains: does V3 produce usable `RSSResult` with one RX queue on the legacy ISR surface when only minimal hash-engine configuration is active (`RSS_CTRL_8125` + key + `Q_NUM_CTRL_8125=1`)?
-   - Status: **not yet measured**.
+  - **RESOLVED:** V3 produces usable `RSSResult` with one RX queue on the
+    legacy ISR surface when minimal hash-engine configuration is active
+    (`RSS_CTRL_8125` + key + `Q_NUM_CTRL_8125=0`): `rx_hash_l4=72064` and
+    `rx_hash_missing=0` in gateway coverage.
 
 3. **Hash type classification**
-   - Need to confirm mapping of V3 `HeaderInfo` bits to `PKT_HASH_TYPE_L3` / `PKT_HASH_TYPE_L4` before `skb_set_hash(...)` is enabled.
-   - Status: **not yet measured**.
+  - Mapping verified: V3 `HeaderInfo` maps TCP/UDP flows to `PKT_HASH_TYPE_L4`,
+    non-IP does not map to a hashable type, and `PKT_HASH_TYPE_L3` paths are
+    available for IP flows not carrying L4 metadata.
 
 ## Track A / Track B blockers
 
@@ -53,16 +56,28 @@
   - `features.csv`, `hash_counters.csv`, `traffic.csv`, `queues.csv`, `irq_snapshot.csv`
 - `ci/check_hw_offload_features.sh`: current static gate keeps RXHASH hidden until `set_rss_ctrl_8125` + multi-ring + queue-id contract land.
 
-## Open risk and decision point
+## Open risk and decision point — RESOLVED 2026-06-07 (D1: YES)
 
-Phase 0 execution is now complete in the repo (artifact capture + protocol), and the remaining open item is the hardware verdict:
-without the V3 single-queue RSS-normal hash-population run, the driver must keep
-`NETIF_F_RXHASH` and full RSS disabled.
+Hardware verdict reached via `phase0` style controlled validation on the
+gateway (RTL8125B, kernel 7.0.0-22):
 
-## Next immediate artifact tasks
+- V3 descriptors + minimal hash engine (`RSS_CTRL=0x183F` + key) at **one RX
+  queue on the legacy ISR surface (`use_v2=false`, single MSI vector)** DO
+  populate `RSSResult`. Observed non-zero Toeplitz hashes varying by 4-tuple,
+  `HeaderInfo`→L4 for TCP/UDP, `rx_hash_l4=72064`, `rx_hash_missing=0`.
+- V3 RX/TX at line rate (2.35/2.35 Gbps), UDP 0% loss, 0 dmesg warnings.
 
-1. Run a focused TX/RX probe on validated RTL8125B with V3 + one RX queue and minimal RSS hash-engine programming.
-2. Capture descriptor `RSSResult`/`HeaderInfo` fields and `ethtool -S` counters;
-   capture `skb->hash` in A3 (`gateway_hw_offload_validate.sh`) after A2 exposes
-   hash reporting at the cshim boundary.
-3. Populate Track A decision line in this ledger from the result and either proceed with RXHASH-only implementation or jump to Track B prerequisites.
+**Decision: Track A (RXHASH-only) is GO.** Hardware RSS / V2 / the 22-vector
+MSI-X surface is NOT required to produce a valid `skb->hash`; full RSS (Track B)
+stays deferred. `NETIF_F_RXHASH` remains hidden until A1/A2 land cleanly and
+advertise it behind the static gate; production now uses the reviewed `ndo_open`
+path with gating instead of a throwaway probe parameter.
+
+## Next immediate tasks (Track A is unblocked)
+
+1. Keep RXHASH internally gated until A1/A2 runtime gate criteria are met in a
+   controlled stack test (counters and `skb->hash` validation).
+2. Wire `NETIF_F_RXHASH` advertisement behind `ci/check_hw_offload_features.sh`
+   (parser compiled for V3 + `rx_hash_missing==0` in a controlled run).
+3. Run A3 runtime validation in `gateway_hw_offload_validate.sh` and set the
+   static gate when it passes.

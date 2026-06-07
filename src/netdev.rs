@@ -117,6 +117,13 @@ const BRIDGE_FEATURE_RXCSUM: u32 = 0x0000_0001;
 const BRIDGE_FEATURE_RXVLAN: u32 = 0x0000_0002;
 const BRIDGE_FEATURE_RXHASH: u32 = 0x0000_0004;
 
+// RXHASH feature gate for Track A (single-queue hash-only path).
+//
+// Keep false while RXHASH remains intentionally hidden from the advertised
+// feature set. Flip to `true` only after gate-check and controlled
+// validation are complete.
+const RXHASH_FEATURE_GATE: bool = false;
+
 /// Stop the TX queue preemptively when fewer than this many descriptor
 /// slots remain free. **Must pair** with [`napi::TX_START_THRS`]
 /// (= 64) so the reaper only wakes us after enough slots have
@@ -665,6 +672,7 @@ extern "C" fn rust_change_mtu(cookie: *mut c_void, new_mtu: c_int) -> c_int {
 extern "C" fn rust_set_features(cookie: *mut c_void, feature_flags: u32) -> c_int {
     let state = state_from(cookie);
     apply_netdev_features(state, feature_flags);
+    apply_rxhash_programming(state);
     0
 }
 
@@ -766,13 +774,33 @@ fn rx_feature_cpluscmd(feature_flags: u32) -> u16 {
     }
 }
 
+#[inline]
+fn rxhash_enabled(feature_flags: u32) -> bool {
+    RXHASH_FEATURE_GATE && (feature_flags & BRIDGE_FEATURE_RXHASH != 0)
+}
+
+fn apply_rxhash_programming(state: &NetdevState) {
+    let regs = state.regs();
+    // Keep all queue ownership single-queue for Track A.
+    regs.set_q_num_ctrl_8125(0);
+
+    if state.rx_hash_enabled.load(Ordering::Acquire) {
+        regs.clear_rss_indir_8125();
+        regs.set_rss_key_8125(&regs::RSS_PROBE_KEY);
+        regs.set_rss_ctrl_8125(regs::RSS_CTRL_PROBE_HASH_BITS);
+        return;
+    }
+
+    regs.set_rss_ctrl_8125(0);
+}
+
 fn apply_netdev_features(state: &NetdevState, feature_flags: u32) {
     let regs = state.regs();
     regs.set_rcr(rx_feature_rcr(regs.rcr(), feature_flags));
     regs.set_cpluscmd(rx_feature_cpluscmd(feature_flags));
     state
         .rx_hash_enabled
-        .store(feature_flags & BRIDGE_FEATURE_RXHASH != 0, Ordering::Relaxed);
+        .store(rxhash_enabled(feature_flags), Ordering::Relaxed);
 }
 
 /// Map TX/RX ring DMA bases + program RxConfig / CPlusCmd. `RxMaxSize`
@@ -783,7 +811,14 @@ fn apply_netdev_features(state: &NetdevState, feature_flags: u32) {
 fn program_dma_rings(state: &NetdevState, regs: &Regs<'_>, feature_flags: u32) {
     regs.set_tx_ring_base(state.tx.dma);
     regs.set_rx_ring_base(state.rx.dma);
-    regs.set_rcr(rx_feature_rcr(regs::RCR_M4_BASELINE, feature_flags));
+    let mut rcr = rx_feature_rcr(regs::RCR_M4_BASELINE, feature_flags);
+    // Track-A runtime path emits V3 (32-byte) RX descriptors so the chip can
+    // write hash metadata. Set in RCR before pre-post (which lays out V3 slots)
+    // and before engine enable.
+    if state.rx.format != RxDescFormat::Legacy {
+        rcr |= regs::RCR_ENABLE_RX_DESC_V3;
+    }
+    regs.set_rcr(rcr);
     regs.set_cpluscmd(rx_feature_cpluscmd(feature_flags));
 }
 
@@ -1169,6 +1204,7 @@ fn ndo_open(state: &NetdevState, feature_flags: u32) -> Result<()> {
     ub::pci_set_master(&state.pdev);
 
     program_dma_rings(state, &regs, feature_flags);
+    apply_rxhash_programming(state);
     let rx_pool = RxPoolGuard::allocate(state)?;
     pre_post_rx_descriptors(state);
     zero_tx_descriptors(state);

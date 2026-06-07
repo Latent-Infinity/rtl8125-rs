@@ -7,9 +7,10 @@
 #   - TX: opts2 carries the tag-valid bit + swapped TCI.
 #   - RX: RTL8125 strips VLAN via RxConfig bits and reports the TCI in opts2.
 #
-# RSS/RXHASH is deliberately not advertised yet. Realtek's RSS result lives in
-# RxDescV3/V4 fields that are not present in the current legacy 16-byte RX
-# descriptor, and full RSS also needs multiple RX rings/vectors.
+# RSS/RXHASH is deliberately not advertised yet. In this branch we intentionally
+# gate `NETIF_F_RXHASH` even though single-queue V3 hash plumbing is present,
+# until the Track A A3 gate is fully closed and gap-free runtime evidence is
+# committed.
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

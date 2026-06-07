@@ -131,9 +131,10 @@ fn hw_start_8125b_unlocked(regs: &Regs<'_>) -> Result<()> {
 
     // r8169 disables multi-queue RSS for 8125B — our descriptor ring
     // only programs TNPDS for queue 0, so other queues would have
-    // garbage state. Disable to keep traffic on queue 0.
-    regs.set_rss_ctrl_8125(0);
+    // garbage state. Force one-queue setup here; Rust programs the
+    // hash-engine state in `ndo_open` when RXHASH is enabled.
     regs.set_q_num_ctrl_8125(0);
+    regs.set_rss_ctrl_8125(0);
 
     // Config1 (8-bit at 0x52): clear bit 4 — "PM enable" override per r8169.
     let cfg1 = regs.config1();

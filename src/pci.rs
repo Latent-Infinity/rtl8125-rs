@@ -396,7 +396,11 @@ impl pci::Driver for R8125Driver {
                             rx <- crate::netdev::RxRingState::new(
                                 rx_ring.desc_ptr_mut(),
                                 rx_ring.dma_handle(),
-                                crate::ring::RxDescFormat::Legacy,
+                                // Track-A RXHASH requires the 32-byte V3
+                                // descriptor layout to expose RSSResult.
+                                // Keep this fixed at probe/open selection
+                                // boundaries (no per-packet switching).
+                                crate::ring::RxDescFormat::V3,
                             ),
                             irq <- crate::netdev::IrqState::new(
                                 irq_num,

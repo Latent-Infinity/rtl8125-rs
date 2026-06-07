@@ -197,6 +197,29 @@ pub(crate) const RSS_CTRL_8125: usize = 0x4500;
 /// writes 0 (single queue). Without this, the chip may try to use
 /// multiple TX queues despite us only programming queue 0's TNPDS.
 pub(crate) const Q_NUM_CTRL_8125: usize = 0x4800;
+/// `RSS_KEY_8125` (0x4600) — 40-byte Toeplitz hash key, 10 dwords
+/// (`r8125.h:1520`, `RTL8125_RSS_KEY_SIZE = 40`).
+pub(crate) const RSS_KEY_8125: usize = 0x4600;
+/// RSS hash key size in bytes (`r8125_rss.h:41`).
+pub(crate) const RSS_KEY_SIZE: usize = 40;
+/// `RSS_INDIRECTION_TBL_8125_V2` (0x4700) — hash-bucket → queue map
+/// (`r8125.h:1521`). Zeroed for the probe so every bucket lands on queue 0.
+pub(crate) const RSS_INDIRECTION_TBL_8125: usize = 0x4700;
+/// `RxConfig`/RCR bit 24 — emit V3 (32-byte, RSS-capable) RX descriptors
+/// (`EnableRxDescV3`, `r8125.h:1649`).
+pub(crate) const RCR_ENABLE_RX_DESC_V3: u32 = 1 << 24;
+/// Track-A RXHASH `RSS_CTRL_8125` enable bits for TCP/IPv4, TCP/IPv6, UDP/
+/// IPv4, UDP/IPv6, and raw IPv4/IPv6 hashing (`r8125_rss.c:40-48`).
+/// With `CPU_NUM=0` (single queue) and `MASK=0`, this programs the minimal
+/// one-queue hash engine for hash-only support.
+pub(crate) const RSS_CTRL_PROBE_HASH_BITS: u32 =
+    (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 11) | (1 << 12);
+/// 40-byte RSS key seed used by the one-queue Track A hash path.
+pub(crate) const RSS_PROBE_KEY: [u8; RSS_KEY_SIZE] = [
+    0x6d, 0x5a, 0x56, 0xda, 0x25, 0x5b, 0x0e, 0xc2, 0x41, 0x67, 0x25, 0x3d, 0x43, 0xa3, 0x8f, 0xb0,
+    0xd0, 0xca, 0x2b, 0xcb, 0xae, 0x7b, 0x30, 0xb4, 0x77, 0xcb, 0x2d, 0xa3, 0x80, 0x30, 0xf2, 0x0c,
+    0x6a, 0x42, 0xb7, 0x3b, 0xbe, 0xac, 0x01, 0xfa,
+];
 /// Anonymous tuning register at 0x382 (16-bit) — r8169 writes 0x221b at
 /// the top of `rtl_hw_start_8125_common`. Function unclear from the
 /// source comment; included for parity.

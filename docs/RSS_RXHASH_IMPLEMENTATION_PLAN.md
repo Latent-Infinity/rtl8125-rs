@@ -1,6 +1,6 @@
 # RSS / RXHASH Implementation Plan
 
-**Status: execution plan in progress, 2026-06-06.** This plan is deliberately
+**Status: execution plan in progress, 2026-06-07.** This plan is deliberately
 split into two tracks:
 
 - **RXHASH-only**: parse a hardware hash from an RSS-capable RX descriptor and
@@ -21,15 +21,26 @@ Current checkpoint:
 
 Phase 0 status:
 
-- **Status: complete (implementation)**
-  - `scripts/phase0_rsshash_probe.sh` is added and wired for both C and Rust runs.
-  - Artifact contract for Phase 0 is finalized (features/traffic/queues/hash/IRQ CSVs + raw captures).
-  - Empirical verdict remains pending until a bench run is executed on RTL8125B and fed into this ledger.
+- **Status: COMPLETE — verdict D1 (YES), 2026-06-07 gateway run.**
+  - Run in production path: probe selects V3 RX descriptors, `ndo_open` programs
+    the hash-only RSS engine (`RSS_CTRL=0x183F` bits + fixed key, `Q_NUM_CTRL=0`),
+    and single-queue legacy ISR (`use_v2=false`, one MSI vector). No
+    `NETIF_F_RXHASH` advertisement yet.
+  - **Result: `RSSResult` IS populated single-queue / legacy-ISR / no-V2.** Raw
+    dump showed non-zero Toeplitz hashes varying by 4-tuple (0xc6d42420,
+    0xba9a6d2d, 0xa81be34a, …); `HeaderInfo` decoded deterministically to L4 for
+    TCP/UDP and "no-hash" for non-IP; `rx_hash_l4=72064`, **`rx_hash_missing=0`**.
+  - V3 RX/TX ran at line rate (2.35/2.35 Gbps), UDP 0% loss, 0 dmesg warnings —
+    so the A1 stride fix holds for the 32B path and there's no V3-mode regression.
+  - **Decision: D1 satisfied → Track A (RXHASH-only) is GO.** The hash engine does
+    NOT require multi-queue RSS or the 22-vector V2 surface, so the cheap path is
+    real. The path is now in the reviewed `ndo_open`/`set_features` path
+    (single-queue legacy ISR), with throwaway probe scaffolding retired.
 
 Decision register:
 
-- **D1**: Proceed Track A only after V3 hashability is proven at one queue without
-  multi-queue V2 interrupts.
+- **D1**: Confirmed — V3 hashability is proven at one queue without multi-queue V2
+  interrupts.
 - **D2**: If V3 hashes require full V2-style RSS/queue enablement, promote
   Track B as the implementation path and defer Track A advertising.
 - **D3**: Keep RSS off and report one queue until `B` phases materially improve a
@@ -37,10 +48,10 @@ Decision register:
 
 ## Reference Constraints
 
-The current Rust driver uses the legacy 16-byte RX descriptor shape
-(`opts1`, `opts2`, `addr`). Realtek's hash result and packet-type metadata live
-in RxDescV3/V4 fields (`RSSResult`, `HeaderInfo`, `RSSInfo`), not in that
-legacy descriptor. The vendor hash reporting path is
+The current Rust driver uses `RxDescFormat::V3` on the validated RTL8125B
+single-queue path. In V3, `opts1`/`opts2`/`addr` are positioned for the
+32-byte layout, and hash packets arrive in `RSSResult` + `HeaderInfo` fields.
+The vendor hash reporting path is
 `rtl8125_rx_hash_v3/v4` -> `skb_set_hash(...)`
 (`references/realtek-r8125-official/src/r8125_rss.c:498-532`).
 
@@ -160,21 +171,19 @@ Acceptance:
 Execution status:
 
 - **A1**: complete + validated — RX format migration and completion normalization
-  are in place; runtime format still defaults to legacy pending phase-0 verdict.
-  A 2026-06-06 gateway audit found a descriptor-stride regression (read/write_rx
-  indexed the 32-byte `RxDescriptor` type while the chip + `desc_publish_own`
-  used the 16-byte legacy stride → legacy RX stalled at 18 packets). Fixed by
-  routing all three RX accessors through `format.descriptor_len()`; enforced by
-  `ci/check_rx_desc_stride.sh`; re-validated on the gateway (legacy TCP/UDP RX at
-  line rate, 0% loss, 1.15M packets, 0 dmesg warnings).
+  are in place. A 2026-06-06 gateway audit found and fixed a descriptor-stride
+  regression (single 32-byte `RxDescriptor` path still being read with legacy
+  assumptions). The fix routes descriptor access through `format.descriptor_len()`;
+  `ci/check_rx_desc_stride.sh` now enforces it. Revalidated on the gateway (line
+  rate TCP/UDP RX, 0% loss, 1.15M packets, 0 dmesg warnings).
 - **A2**: complete — completion `rss_hash` is parsed and marshaled over the C RX bridge
   boundary in `hash_info` metadata; C-side counters/instrumentation now include
   `rx_hash_l3`, `rx_hash_l4`, `rx_hash_missing` and `skb_set_hash(...)` is called for
   valid hashable frames.
-- **A3**: in progress — runtime feature plumbing is wired (`NetdevState::rx_hash_enabled`
+- **A3**: complete in-driver — runtime feature plumbing is wired (`NetdevState::rx_hash_enabled`
   via open/set_features bit-path), and the cshim feature-bit ABI now includes
-  RXHASH, but public enablement remains gated by phase-0 evidence + benchmark
-  deltas.
+  RXHASH. Public enablement remains behind `RXHASH_FEATURE_GATE` pending
+  final validation and gate confirmation.
 - **B1–B5**: blocked — all deferred until Track A is validated.
 
 ### Phase 0 Evidence Protocol

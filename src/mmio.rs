@@ -267,6 +267,27 @@ impl<'a> Regs<'a> {
         self.bar.write16(value, regs::Q_NUM_CTRL_8125);
     }
 
+    /// Write the 40-byte RSS hash key (10 dwords at 0x4600).
+    /// Matches vendor `rtl8125_store_rss_key` (dword writes, low byte first).
+    pub(crate) fn set_rss_key_8125(&self, key: &[u8; regs::RSS_KEY_SIZE]) {
+        let mut i = 0;
+        while i < regs::RSS_KEY_SIZE {
+            let w = u32::from_le_bytes([key[i], key[i + 1], key[i + 2], key[i + 3]]);
+            self.bar.write32(w, regs::RSS_KEY_8125 + i);
+            i += 4;
+        }
+    }
+
+    /// Zero the RSS indirection table (128 buckets, 4-per-dword = 32 dwords) so
+    /// every hash bucket maps to queue 0.
+    pub(crate) fn clear_rss_indir_8125(&self) {
+        let mut off = 0;
+        while off < 128 {
+            self.bar.write32(0, regs::RSS_INDIRECTION_TBL_8125 + off);
+            off += 4;
+        }
+    }
+
     // ── Generic small-region accessors used by hw_start_8125b ───────────
 
     /// Read a 16-bit register at an arbitrary BAR offset. Used by the
