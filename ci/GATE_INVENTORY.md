@@ -63,6 +63,7 @@ they need rewriting against that chip's authoritative source.
 | `check_rx_pool_pages.sh` | `alloc_pages(order=2)` (16 KiB per slot specific to 8125B's jumbo cap) + matching unmap discipline + ndo_open rollback releases jumbo slots |
 | `check_rss_queue_contract.sh` | RTL8125B full-RSS prerequisite: queue-id-aware C/Rust bridge plus vendor RDSAR_Q1 queue-base layout while runtime stays N=1 |
 | `check_rss_hw_programming.sh` | RTL8125B RSS register programming is off-by-default, bounded by owned queues/V2 interrupt ownership, and uses Linux's default indirection helper |
+| `check_rust_unit_tests.sh` | Runnable host unit tests: compiles the kernel-free `crate::layout` math with `rustc --test` and EXECUTES the assertions (descriptor stride/offset, V3 hash classification, RSS register packing). The only gate that verifies behavior by value, not by shape. Skips cleanly if rustc is absent |
 | `check_packet_mutation.sh` * | (Also netdev-pattern — RTL-side enforcement of TSO MSS 11-bit cap workaround) |
 | `check_flr_cycle.sh` | Function-Level Reset cycle behavior specific to this chip's reset state machine |
 | `check_active_soak.sh` | Active-traffic soak harness — references `enp5s0`/10.0.0.0/24 wiring (re-parameterized in Tier 4b) |

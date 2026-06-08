@@ -285,7 +285,8 @@ impl<'a> Regs<'a> {
     pub(crate) fn set_rss_key_8125(&self, key: &[u8; regs::RSS_KEY_SIZE]) {
         let mut i = 0;
         while i < regs::RSS_KEY_SIZE {
-            let w = u32::from_le_bytes([key[i], key[i + 1], key[i + 2], key[i + 3]]);
+            // Pure little-endian packing lives in `crate::layout` (host-tested).
+            let w = crate::layout::key_word([key[i], key[i + 1], key[i + 2], key[i + 3]]);
             self.bar.write32(w, regs::RSS_KEY_8125 + i);
             i += 4;
         }
@@ -295,33 +296,35 @@ impl<'a> Regs<'a> {
     /// every hash bucket maps to queue 0.
     pub(crate) fn clear_rss_indir_8125(&self) {
         let mut off = 0;
-        while off < 128 {
+        while off < crate::layout::RSS_INDIR_TBL_ENTRIES {
             self.bar.write32(0, regs::RSS_INDIRECTION_TBL_8125 + off);
             off += 4;
         }
     }
 
     /// Program the RSS indirection table using Linux's default bucket mapping.
-    /// RTL8125 stores four one-byte queue entries per dword.
+    /// RTL8125 stores four one-byte queue entries per dword; the lane packing is
+    /// the host-tested `crate::layout::indir_word`.
     pub(crate) fn set_rss_indir_default_8125(&self, queue_count: u8) {
         if queue_count == 0 {
             self.clear_rss_indir_8125();
             return;
         }
 
+        let entries_total = crate::layout::RSS_INDIR_TBL_ENTRIES as u32;
+        let qc = u32::from(queue_count);
         let mut bucket = 0u32;
-        while bucket < 128 {
-            let mut word = 0u32;
-            let mut lane = 0u32;
-            while lane < 4 {
-                let entry =
-                    unsafe_boundary::rxfh_indir_default(bucket + lane, u32::from(queue_count))
-                        & 0xff;
-                word |= entry << (lane * 8);
-                lane += 1;
-            }
-            self.bar
-                .write32(word, regs::RSS_INDIRECTION_TBL_8125 + bucket as usize);
+        while bucket < entries_total {
+            let entries = [
+                unsafe_boundary::rxfh_indir_default(bucket, qc) as u8,
+                unsafe_boundary::rxfh_indir_default(bucket + 1, qc) as u8,
+                unsafe_boundary::rxfh_indir_default(bucket + 2, qc) as u8,
+                unsafe_boundary::rxfh_indir_default(bucket + 3, qc) as u8,
+            ];
+            self.bar.write32(
+                crate::layout::indir_word(entries),
+                regs::RSS_INDIRECTION_TBL_8125 + bucket as usize,
+            );
             bucket += 4;
         }
     }

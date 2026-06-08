@@ -15,7 +15,22 @@ grn() { printf '\033[1;32mPASS\033[0m %s\n' "$*"; }
 
 patterns='unwrap[[:space:]]*\(|expect[[:space:]]*\(|panic!|unreachable!|todo!|debug_assert!'
 
-hits=$(grep -RInE "$patterns" "$ROOT/src" --include='*.rs' 2>/dev/null || true)
+# Emit "file:line:content" for every source line EXCEPT those inside a
+# `#[cfg(test)]` module. Host unit tests legitimately use unwrap/assert and are
+# compiled out of the kernel build (cfg(test) is never set there), so they must
+# not trip the runtime-panic discipline. The test module is a top-level item, so
+# its closing brace sits at column 0 - skip from `#[cfg(test)]` to that `^}`.
+src_lines="$(
+	find "$ROOT/src" -name '*.rs' -print0 2>/dev/null | while IFS= read -r -d '' f; do
+		awk '
+			/#\[cfg\(test\)\]/ { skip = 1 }
+			{ if (!skip) printf "%s:%d:%s\n", FILENAME, FNR, $0 }
+			skip && /^}/ { skip = 0 }
+		' "$f"
+	done
+)"
+
+hits=$(printf '%s\n' "$src_lines" | grep -E "$patterns" 2>/dev/null || true)
 if [[ -n "$hits" ]]; then
 	red "panic-style Rust exits found in driver source"
 	printf '%s\n' "$hits"
@@ -24,7 +39,8 @@ else
 fi
 
 assert_hits=$(
-	grep -RInE '(^|[^[:alnum:]_])assert![[:space:]]*\(' "$ROOT/src" --include='*.rs' 2>/dev/null \
+	printf '%s\n' "$src_lines" \
+		| grep -E '(^|[^[:alnum:]_])assert![[:space:]]*\(' 2>/dev/null \
 		| grep -vE '^[^:]+:[0-9]+:[[:space:]]*const _:[[:space:]]*\(\)[[:space:]]*=[[:space:]]*assert!' \
 		|| true
 )

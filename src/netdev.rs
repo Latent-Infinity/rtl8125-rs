@@ -149,29 +149,19 @@ const TX_BUDGET_DESC_WINDOW: usize = RING_LEN - TX_STOP_THRS;
 /// both, so the queue can never strand because one condition cleared while
 /// the other was still being evaluated against a stale index.
 pub(crate) fn tx_should_wake(state: &NetdevState, free: usize) -> bool {
-    if free <= crate::napi::TX_START_THRS {
-        return false;
-    }
-    let budget = state.tx.byte_budget.inner.load(Ordering::Relaxed) as usize;
-    if budget == 0 {
-        return true;
-    }
-    let low_water = (budget / 2).max(1);
-    state.tx.inflight_bytes.inner.load(Ordering::Acquire) < low_water
+    // The hysteresis decision is the host-tested pure core
+    // `crate::layout::tx_should_wake_decision`; this wrapper only snapshots the
+    // atomics. `inflight_bytes` is loaded with Acquire to order against the
+    // reaper's release store (the byte half is ignored when the budget is off).
+    let byte_budget = state.tx.byte_budget.inner.load(Ordering::Relaxed) as usize;
+    let inflight = state.tx.inflight_bytes.inner.load(Ordering::Acquire);
+    crate::layout::tx_should_wake_decision(free, crate::napi::TX_START_THRS, byte_budget, inflight)
 }
 
 #[inline]
 fn tx_budget_tracked_bytes(byte_budget: usize, wire_len: usize) -> usize {
-    if byte_budget == 0 || wire_len.saturating_mul(TX_BUDGET_DESC_WINDOW) < byte_budget {
-        0
-    } else {
-        wire_len
-    }
-}
-
-#[inline]
-fn tx_budget_shadow_len(bytes: usize) -> u32 {
-    core::cmp::min(bytes, u32::MAX as usize) as u32
+    // Pure math (host-tested) bound to this driver's descriptor window.
+    crate::layout::tx_budget_tracked_bytes(byte_budget, wire_len, TX_BUDGET_DESC_WINDOW)
 }
 
 /// Stop the TX queue, then recheck the producer/consumer indices to cover
@@ -834,10 +824,8 @@ fn requested_rss_queues() -> u8 {
     *crate::module_parameters::rss_queues.value()
 }
 
-#[inline]
-fn rss_q_num_ctrl(queue_count: u8) -> u16 {
-    u16::from(queue_count.saturating_sub(1))
-}
+// Pure register/threshold math lives in `crate::layout` (host-unit-tested).
+use crate::layout::{rss_q_num_ctrl, tx_budget_shadow_len};
 
 fn validate_rss_queue_request(state: &NetdevState) -> Result<()> {
     let requested = requested_rss_queues();

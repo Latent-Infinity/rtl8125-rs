@@ -40,6 +40,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NAPI="$ROOT/src/napi.rs"
 NETDEV="$ROOT/src/netdev.rs"
+LAYOUT="$ROOT/src/layout.rs"
 rc=0
 
 red()  { printf '\033[1;31mFAIL\033[0m %s\n' "$*"; rc=1; }
@@ -130,16 +131,23 @@ fi
 if echo "$poll_body" | grep -qE 'if free > TX_START_THRS'; then
 	grn "poll: tx_wake_queue is guarded by 'free > TX_START_THRS' (hysteresis)"
 elif echo "$poll_body" | grep -qE 'tx_should_wake\(state, free\)'; then
+	# The hysteresis decision now lives in the host-tested pure core
+	# crate::layout::tx_should_wake_decision (covered by
+	# ci/check_rust_unit_tests.sh); the netdev tx_should_wake wrapper only
+	# snapshots the atomics and delegates. Verify both: the wrapper delegates,
+	# and the pure core still carries the floor + nonzero low-water.
 	tsw_body=$(awk '/fn tx_should_wake\(/,/^}/' "$NETDEV")
-	if echo "$tsw_body" | grep -qE 'free <= .*TX_START_THRS'; then
-		grn "poll: tx_wake_queue guarded via tx_should_wake (TX_START_THRS floor + byte budget)"
+	dec_body=$(awk '/fn tx_should_wake_decision\(/,/^}/' "$LAYOUT")
+	if echo "$tsw_body" | grep -qE 'tx_should_wake_decision' &&
+		echo "$dec_body" | grep -qE 'free <= start_thrs'; then
+		grn "poll: tx_wake_queue guarded via tx_should_wake -> tested decision (TX_START_THRS floor)"
 	else
-		red "poll: tx_should_wake is missing the TX_START_THRS hysteresis floor"
+		red "poll: tx_should_wake must delegate to tx_should_wake_decision with the start-threshold floor"
 	fi
-	if echo "$tsw_body" | grep -qE '\(budget / 2\)\.max\(1\)'; then
-		grn "poll: tx_should_wake keeps byte-budget low-water nonzero"
+	if echo "$dec_body" | grep -qE '/ 2\)\.max\(1\)'; then
+		grn "poll: tx_should_wake_decision keeps byte-budget low-water nonzero"
 	else
-		red "poll: tx_should_wake must keep byte-budget low-water nonzero"
+		red "poll: tx_should_wake_decision must keep byte-budget low-water nonzero"
 	fi
 else
 	red "poll: tx_wake_queue not guarded by 'free > TX_START_THRS' or tx_should_wake"

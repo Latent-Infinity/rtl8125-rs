@@ -8,7 +8,7 @@
 # descriptor stride depends on the active format (16B legacy, 32B V3) and is
 # the same stride `desc_publish_own` writes at via `format.descriptor_len()`.
 # A typed `*mut RxDescriptor` indexed by `.add(idx)` strides 32B unconditionally
-# — so on the legacy default the reaper read at idx*32 while the chip wrote at
+# - so on the legacy default the reaper read at idx*32 while the chip wrote at
 # idx*16, silently misaligning RX after slot 0 (RX stalled at 18 packets, TX
 # fine, no oops). The three RX descriptor accessors MUST all derive their stride
 # from `format.descriptor_len()` so they can never disagree with each other or
@@ -39,16 +39,19 @@ for fn in desc_write_rx desc_publish_own; do
 		grn "$fn: strides by format.descriptor_len()"
 	fi
 	if grep -qE "ring:\s*\*mut RxDescriptor" <<<"$body"; then
-		red "$fn: takes 'ring: *mut RxDescriptor' — typed 32B stride; use *mut u8 + format"
+		red "$fn: takes 'ring: *mut RxDescriptor' - typed 32B stride; use *mut u8 + format"
 	else
 		grn "$fn: ring pointer is byte-addressed (*mut u8)"
 	fi
 done
 
 # Readers stride by the precomputed RxParse, whose stride MUST be set from
-# RxDescFormat::descriptor_len() in RxParse::new — the single source of truth.
-RING="$ROOT/src/ring.rs"
-parse_new=$(awk '/pub\(crate\) fn new\(format: RxDescFormat\)/,/^    }/' "$RING")
+# RxDescFormat::descriptor_len() in RxParse::new - the single source of truth.
+# RxParse + the format math now live in the host-tested src/layout.rs (re-exported
+# by src/ring.rs); the stride invariant is also covered by a runtime unit test
+# (ci/check_rust_unit_tests.sh: rxparse_stride_matches_descriptor_len).
+LAYOUT="$ROOT/src/layout.rs"
+parse_new=$(awk '/pub\(crate\) fn new\(format: RxDescFormat\)/,/^    }/' "$LAYOUT")
 if grep -q "stride: format.descriptor_len()" <<<"$parse_new"; then
 	grn "RxParse::new: stride derived from format.descriptor_len()"
 else
@@ -66,7 +69,7 @@ for fn in rx_read_opts1 rx_read_completion; do
 		red "$fn: must index by parse.stride, not a hardcoded/typed stride"
 	fi
 	if grep -qE "ring:\s*\*mut RxDescriptor" <<<"$body"; then
-		red "$fn: takes 'ring: *mut RxDescriptor' — typed 32B stride; use *mut u8 + RxParse"
+		red "$fn: takes 'ring: *mut RxDescriptor' - typed 32B stride; use *mut u8 + RxParse"
 	else
 		grn "$fn: ring pointer is byte-addressed (*mut u8)"
 	fi

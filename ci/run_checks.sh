@@ -53,6 +53,9 @@ echo
 echo "== RX descriptor stride agreement (read/write/publish vs format) =="
 bash "$CI/check_rx_desc_stride.sh" || rc=1
 echo
+echo "== host unit tests (pure layout/RSS math - rustc --test) =="
+bash "$CI/check_rust_unit_tests.sh" || rc=1
+echo
 echo "== BQL sent/completed accounting contract =="
 bash "$CI/check_bql_accounting.sh" || rc=1
 echo

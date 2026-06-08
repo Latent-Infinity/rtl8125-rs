@@ -65,6 +65,7 @@
 
 mod dma;
 mod hw;
+mod layout;
 mod mmio;
 mod napi;
 mod netdev;

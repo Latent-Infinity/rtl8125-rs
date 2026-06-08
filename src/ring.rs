@@ -32,11 +32,6 @@ pub(crate) const RING_LEN: usize = 256;
 /// obvious in a hex dump and unlikely to occur naturally.
 const CANARY_PATTERN: u64 = 0xDEAD_BEEF_CAFE_BABE;
 
-// TX/RX descriptor format constants used to validate per-format parsing and
-// republish offsets in this module.
-const RSS_HEADER_INFO_V3_L3_MASK: u16 = (1 << 10) | (1 << 12);
-const RSS_HEADER_INFO_V3_L4_MASK: u16 = (1 << 13) | (1 << 9);
-
 // TX-tail canary for 16-byte descriptor storage.
 const DESC_TAIL_CANARY_OPTS1: u32 = 0xDEAD_BEEF;
 const DESC_TAIL_CANARY_OPTS2: u32 = 0xCAFE_BABE;
@@ -105,66 +100,10 @@ pub(crate) struct RxDescriptor {
     pub(crate) words: [u64; 4],
 }
 
-/// Marker for RX descriptor format selection.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) enum RxDescFormat {
-    /// Legacy 16-byte V1/V2-style layout.
-    #[default]
-    Legacy,
-    #[allow(dead_code)]
-    /// RTL8125B-capable RSS-capable layout.
-    V3,
-    #[allow(dead_code)]
-    /// RTL8125BP-capable RSS-capable layout.
-    V4,
-}
-
-impl RxDescFormat {
-    /// TX/RX descriptor byte stride for this format.
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) const fn descriptor_len(self) -> usize {
-        match self {
-            RxDescFormat::Legacy | RxDescFormat::V4 => 16,
-            RxDescFormat::V3 => 32,
-        }
-    }
-
-    #[inline]
-    const fn publish_offsets(self) -> (usize, usize, usize) {
-        match self {
-            // Legacy RX: opts2/opts1 at qword0, addr at qword1.
-            RxDescFormat::Legacy => (8, 4, 0),
-            // V3: addr at +16, opts2/opts1 at +24/+28.
-            RxDescFormat::V3 => (16, 24, 28),
-            // V4: addr at +0, opts2/opts1 at +8/+12.
-            RxDescFormat::V4 => (0, 8, 12),
-        }
-    }
-}
-
-/// RSS hash payload extracted from V3/V4 descriptor fields.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum RxHashType {
-    L3,
-    L4,
-}
-
-/// Parsed hardware hash payload.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RxHash {
-    pub(crate) value: u32,
-    pub(crate) kind: RxHashType,
-}
-
-/// Normalized RX completion fields consumed by the Rust hot path.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RxCompletion {
-    pub(crate) len: usize,
-    pub(crate) opts1: u32,
-    pub(crate) opts2: u32,
-    pub(crate) rss_hash: Option<RxHash>,
-}
+// RX descriptor format, hash payload, and completion types are pure layout math
+// - defined and host-unit-tested in `crate::layout`, re-exported here so the
+// kernel-coupled callers keep using `crate::ring::*`.
+pub(crate) use crate::layout::{rx_hash_from_v3, RxCompletion, RxDescFormat, RxHashType, RxParse};
 
 const _: () = assert!(core::mem::size_of::<Descriptor>() == 16);
 const _: () = assert!(core::mem::align_of::<Descriptor>() == 8);
@@ -200,64 +139,6 @@ impl RingCanary for RxDescriptor {
     fn tail_canary() -> Self {
         RxDescriptor {
             words: [RX_TAIL_CANARY_DW0, RX_TAIL_CANARY_DW1, 0, 0],
-        }
-    }
-}
-
-#[inline]
-fn rx_hash_type_v3(header_info: u16) -> Option<RxHashType> {
-    if header_info & RSS_HEADER_INFO_V3_L3_MASK == 0 {
-        return None;
-    }
-    if header_info & RSS_HEADER_INFO_V3_L4_MASK != 0 {
-        Some(RxHashType::L4)
-    } else {
-        Some(RxHashType::L3)
-    }
-}
-
-/// Decode a V3 descriptor hash from its raw `RSSResult` + `HeaderInfo` words.
-/// Shared by the NAPI fast path (`unsafe_boundary::rx_read_completion`).
-#[inline]
-pub(crate) fn rx_hash_from_v3(rss_result: u32, header_info: u16) -> Option<RxHash> {
-    rx_hash_type_v3(header_info).map(|kind| RxHash {
-        value: rss_result,
-        kind,
-    })
-}
-
-/// Per-open RX descriptor parse parameters. The format match is resolved ONCE
-/// here (at poll entry) so the NAPI hot loop reads fields by precomputed byte
-/// offsets with NO per-packet `match RxDescFormat`. `stride` MUST come from
-/// `RxDescFormat::descriptor_len()` so it agrees with the chip and the
-/// publish/write paths (`ci/check_rx_desc_stride.sh`).
-#[derive(Copy, Clone)]
-pub(crate) struct RxParse {
-    /// Per-descriptor byte stride (16 legacy, 32 V3).
-    pub(crate) stride: usize,
-    /// Byte offset of `opts1` (carries OWN + length) within the slot.
-    pub(crate) opts1_off: usize,
-    /// Byte offset of `opts2` (csum/VLAN metadata) within the slot.
-    pub(crate) opts2_off: usize,
-    /// `(RSSResult_off, HeaderInfo_off)` for hash-bearing formats; `None`
-    /// for legacy (no hash field). V4 is not wired (validated chip is V3).
-    pub(crate) hash_off: Option<(usize, usize)>,
-}
-
-impl RxParse {
-    #[inline]
-    pub(crate) fn new(format: RxDescFormat) -> Self {
-        let (_addr_off, opts2_off, opts1_off) = format.publish_offsets();
-        let hash_off = match format {
-            // V3: RSSResult @ +8, HeaderInfo @ +14 (see `struct RxDescV3`).
-            RxDescFormat::V3 => Some((8, 14)),
-            RxDescFormat::Legacy | RxDescFormat::V4 => None,
-        };
-        Self {
-            stride: format.descriptor_len(),
-            opts1_off,
-            opts2_off,
-            hash_off,
         }
     }
 }

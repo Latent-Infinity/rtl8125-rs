@@ -23,6 +23,7 @@ modules.builtin*
 rust-project.json
 target/
 *.rs.bk
+.claude/
 
 # Logs and captured serial output
 *.log
