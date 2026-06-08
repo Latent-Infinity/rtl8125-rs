@@ -112,7 +112,7 @@ fi
 rxhash_order=$(awk '
 	/fn ndo_open\(state: &NetdevState/ { in_open=1 }
 	in_open && /hw_start_8125b\(&regs\)/ { hw=NR }
-	in_open && /apply_rxhash_programming\(state\)/ { apply=NR }
+	in_open && /apply_rss_programming\(state\)/ { apply=NR }
 	in_open && /enable_chip_engines\(&regs\)/ { enable=NR; in_open=0 }
 	END {
 		if (hw && apply && enable && hw < apply && apply < enable)

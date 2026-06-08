@@ -256,6 +256,11 @@ bool r8125_bridge_netdev_xmit_more(void);
  */
 void r8125_bridge_rss_key_fill(u8 *key, u32 len);
 
+/* Return Linux's default RSS indirection entry for `index` and `n_rx_rings`.
+ * Used by Rust when programming the RTL8125 indirection table.
+ */
+u32 r8125_bridge_rxfh_indir_default(u32 index, u32 n_rx_rings);
+
 /* Schedule a NAPI poll. Safe to call from atomic (IRQ) context. */
 void r8125_bridge_napi_schedule(struct net_device *ndev, unsigned int queue_id);
 

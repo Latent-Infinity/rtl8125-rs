@@ -1,0 +1,10 @@
+# rss_queues=2 negative gate
+
+Command: sudo insmod src/r8125_rust.ko rss_queues=2; sudo ip link set enp3s0 up
+
+ip link result:
+RTNETLINK answers: Invalid argument
+
+Relevant dmesg:
+[216155.316476] r8125_rust: r8125_rust: rss_queues=2 requested but only 1 RX queue(s) are owned
+[216155.318495] r8125_rust: r8125_rust: rss_queues=2 requested but only 1 RX queue(s) are owned

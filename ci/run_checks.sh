@@ -26,6 +26,9 @@ echo
 echo "== full-RSS queue-aware bridge contract =="
 bash "$CI/check_rss_queue_contract.sh" || rc=1
 echo
+echo "== RTL8125B RSS hardware programming contract =="
+bash "$CI/check_rss_hw_programming.sh" || rc=1
+echo
 echo "== build wrapper / BTF path =="
 bash "$CI/check_build_makefile.sh" || rc=1
 echo

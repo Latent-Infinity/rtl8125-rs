@@ -112,6 +112,11 @@ static void bridge_get_ethtool_stats(struct net_device *ndev,
 	data[9] = c.rx_hash_disabled;
 }
 
+u32 r8125_bridge_rxfh_indir_default(u32 index, u32 n_rx_rings)
+{
+	return ethtool_rxfh_indir_default(index, n_rx_rings);
+}
+
 const struct ethtool_ops r8125_bridge_ethtool_ops = {
 	.get_drvinfo		= bridge_get_drvinfo,
 	.get_sset_count		= bridge_get_sset_count,

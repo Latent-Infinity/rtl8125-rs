@@ -16,7 +16,7 @@ use kernel::io::Io;
 use kernel::pci;
 use kernel::time::{delay::udelay, Delta};
 
-use crate::regs;
+use crate::{regs, unsafe_boundary};
 
 /// Size of BAR2 on the RTL8125 (the MAC-register window). Authoritative for
 /// the BAR type generic the driver carries around; pinned here so a future
@@ -298,6 +298,31 @@ impl<'a> Regs<'a> {
         while off < 128 {
             self.bar.write32(0, regs::RSS_INDIRECTION_TBL_8125 + off);
             off += 4;
+        }
+    }
+
+    /// Program the RSS indirection table using Linux's default bucket mapping.
+    /// RTL8125 stores four one-byte queue entries per dword.
+    pub(crate) fn set_rss_indir_default_8125(&self, queue_count: u8) {
+        if queue_count == 0 {
+            self.clear_rss_indir_8125();
+            return;
+        }
+
+        let mut bucket = 0u32;
+        while bucket < 128 {
+            let mut word = 0u32;
+            let mut lane = 0u32;
+            while lane < 4 {
+                let entry =
+                    unsafe_boundary::rxfh_indir_default(bucket + lane, u32::from(queue_count))
+                        & 0xff;
+                word |= entry << (lane * 8);
+                lane += 1;
+            }
+            self.bar
+                .write32(word, regs::RSS_INDIRECTION_TBL_8125 + bucket as usize);
+            bucket += 4;
         }
     }
 

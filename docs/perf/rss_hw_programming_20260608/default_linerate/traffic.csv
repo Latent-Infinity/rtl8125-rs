@@ -1,0 +1,7 @@
+label,mode,proto,direction,mtu,udp_len,gbps,pps,loss_pct,retransmits,raw_json
+rust_rss_default_linerate,hw_vlan_on,tcp,tx,1500,,2.347,,,0,raw/hw_vlan_on_1500_tcp_tx.json
+rust_rss_default_linerate,hw_vlan_on,tcp,rx,1500,,2.345,,,0,raw/hw_vlan_on_1500_tcp_rx.json
+rust_rss_default_linerate,hw_vlan_on,udp,tx,1500,64,0.239,466588,0,,raw/hw_vlan_on_1500_udp64_tx.json
+rust_rss_default_linerate,hw_vlan_on,udp,rx,1500,64,0.309,603075,0.0067311531028957884,,raw/hw_vlan_on_1500_udp64_rx.json
+rust_rss_default_linerate,hw_vlan_on,udp,tx,1500,1448,2.350,202845,0,,raw/hw_vlan_on_1500_udp1448_tx.json
+rust_rss_default_linerate,hw_vlan_on,udp,rx,1500,1448,2.350,202876,0,,raw/hw_vlan_on_1500_udp1448_rx.json

@@ -714,7 +714,7 @@ extern "C" fn rust_change_mtu(cookie: *mut c_void, new_mtu: c_int) -> c_int {
 extern "C" fn rust_set_features(cookie: *mut c_void, feature_flags: u32) -> c_int {
     let state = state_from(cookie);
     apply_netdev_features(state, feature_flags);
-    apply_rxhash_programming(state);
+    apply_rss_programming(state);
     0
 }
 
@@ -829,22 +829,66 @@ fn rxhash_enabled(feature_flags: u32) -> bool {
     RXHASH_FEATURE_GATE && (feature_flags & BRIDGE_FEATURE_RXHASH != 0)
 }
 
-fn apply_rxhash_programming(state: &NetdevState) {
-    let regs = state.regs();
-    // Keep all queue ownership single-queue.
-    regs.set_q_num_ctrl_8125(0);
+#[inline]
+fn requested_rss_queues() -> u8 {
+    *crate::module_parameters::rss_queues.value()
+}
 
-    if state.rx_hash_enabled.load(Ordering::Acquire) {
-        regs.clear_rss_indir_8125();
-        // Boot-stable system RSS key (not a hardcoded constant) — hashes are
-        // unpredictable across reboots without baking a key into the driver.
-        let mut key = [0u8; regs::RSS_KEY_SIZE];
-        ub::rss_key_fill(&mut key);
-        regs.set_rss_key_8125(&key);
+#[inline]
+fn rss_q_num_ctrl(queue_count: u8) -> u16 {
+    u16::from(queue_count.saturating_sub(1))
+}
+
+fn validate_rss_queue_request(state: &NetdevState) -> Result<()> {
+    let requested = requested_rss_queues();
+    if requested == 0 {
+        return Ok(());
+    }
+
+    if state.rx_queue0().format == RxDescFormat::Legacy {
+        pr_warn!("r8125_rust: rss_queues requires V3 RX descriptors; disable rx_legacy_desc\n");
+        return Err(EINVAL);
+    }
+
+    if requested > RX_QUEUE_COUNT as u8 {
+        pr_warn!(
+            "r8125_rust: rss_queues={} requested but only {} RX queue(s) are owned\n",
+            requested,
+            RX_QUEUE_COUNT
+        );
+        return Err(EINVAL);
+    }
+
+    if requested > 1 && !state.use_v2_irq_surface() {
+        pr_warn!("r8125_rust: multi-queue RSS requires the RTL8125B V2 MSI-X surface\n");
+        return Err(EINVAL);
+    }
+
+    Ok(())
+}
+
+fn program_rss_key_and_indir(regs: &Regs<'_>, queue_count: u8) {
+    regs.set_rss_indir_default_8125(queue_count);
+    // Boot-stable system RSS key (not a hardcoded constant) — hashes are
+    // unpredictable across reboots without baking a key into the driver.
+    let mut key = [0u8; regs::RSS_KEY_SIZE];
+    ub::rss_key_fill(&mut key);
+    regs.set_rss_key_8125(&key);
+}
+
+fn apply_rss_programming(state: &NetdevState) {
+    let regs = state.regs();
+    let requested = requested_rss_queues();
+    let queue_count = requested.max(1);
+
+    if state.rx_hash_enabled.load(Ordering::Acquire) || requested != 0 {
+        regs.set_q_num_ctrl_8125(rss_q_num_ctrl(queue_count));
+        program_rss_key_and_indir(&regs, queue_count);
         regs.set_rss_ctrl_8125(regs::RSS_CTRL_HASH_BITS);
         return;
     }
 
+    regs.set_q_num_ctrl_8125(0);
     regs.set_rss_ctrl_8125(0);
 }
 
@@ -1296,6 +1340,7 @@ fn ndo_open(state: &NetdevState, feature_flags: u32) -> Result<()> {
         *crate::module_parameters::tx_byte_budget.value(),
         Ordering::Relaxed,
     );
+    validate_rss_queue_request(state)?;
     let regs = state.regs();
 
     // Bus-mastering on. (DMA mask was set at probe.)
@@ -1337,8 +1382,8 @@ fn ndo_open(state: &NetdevState, feature_flags: u32) -> Result<()> {
     regs.set_rx_max_size(state.rx_queue0().buf_len.inner.load(Ordering::Relaxed) as u16);
 
     // `hw_start_8125b` force-clears RSS_CTRL/Q_NUM as a safe baseline. Program
-    // the hash-only state after that clear and before RX/TX engines run.
-    apply_rxhash_programming(state);
+    // the requested hash/RSS state after that clear and before RX/TX engines run.
+    apply_rss_programming(state);
 
     enable_chip_engines(&regs);
     activate_v2_isr_for_msi(state, &regs);

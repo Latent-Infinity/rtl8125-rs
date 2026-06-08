@@ -230,5 +230,15 @@ kernel::module_pci_driver! {
             default: 0,
             description: "Force legacy 16-byte RX descriptors + disable RXHASH (rollback; 0=V3 default)",
         },
+        // Hardware RSS queue-count request. Default 0 leaves hardware queue
+        // distribution off and preserves the reviewed single-queue RXHASH
+        // path. Value 1 is a register-programming validation mode that still
+        // maps every bucket to queue 0. Values above the number of RX queues
+        // owned by the C/Rust bridge fail ndo_open instead of silently routing
+        // packets to unallocated rings.
+        rss_queues: u8 {
+            default: 0,
+            description: "Hardware RSS queue request: 0=off (default), 1=single-queue validation, >1 requires multi-ring support",
+        },
     },
 }

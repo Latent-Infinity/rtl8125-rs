@@ -204,6 +204,7 @@ extern "C" {
     fn r8125_bridge_tx_wake_queue(ndev: *mut bindings::net_device);
     fn r8125_bridge_netdev_xmit_more() -> bool;
     fn r8125_bridge_rss_key_fill(key: *mut u8, len: u32);
+    fn r8125_bridge_rxfh_indir_default(index: u32, n_rx_rings: u32) -> u32;
     fn r8125_bridge_tx_disable(ndev: *mut bindings::net_device);
     fn r8125_bridge_carrier_off(ndev: *mut bindings::net_device);
 
@@ -913,6 +914,16 @@ pub(crate) fn netdev_xmit_more() -> bool {
 pub(crate) fn rss_key_fill(key: &mut [u8; crate::regs::RSS_KEY_SIZE]) {
     // SAFETY: see fn-level contract; netdev_rss_key_fill writes `len` bytes.
     unsafe { r8125_bridge_rss_key_fill(key.as_mut_ptr(), crate::regs::RSS_KEY_SIZE as u32) };
+}
+
+/// Return Linux's default RX flow-hash indirection entry. This keeps Rust's
+/// hardware table programming aligned with ethtool's default mapping.
+///
+/// # SAFETY: pure helper; the C side just forwards to
+/// `ethtool_rxfh_indir_default(index, n_rx_rings)`.
+pub(crate) fn rxfh_indir_default(index: u32, n_rx_rings: u32) -> u32 {
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_rxfh_indir_default(index, n_rx_rings) }
 }
 
 pub(crate) fn bridge_tx_disable(ndev: *mut bindings::net_device) {

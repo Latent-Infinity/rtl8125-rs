@@ -1,0 +1,9 @@
+label,feature,value
+rust_rss_default_linerate,rx-checksumming,on
+rust_rss_default_linerate,tx-checksumming,on
+rust_rss_default_linerate,scatter-gather,on
+rust_rss_default_linerate,tcp-segmentation-offload,on
+rust_rss_default_linerate,tx-vlan-offload,on
+rust_rss_default_linerate,rx-vlan-offload,on
+rust_rss_default_linerate,receive-hashing,on
+rust_rss_default_linerate,rx-hashing,missing

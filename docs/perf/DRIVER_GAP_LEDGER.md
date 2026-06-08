@@ -48,7 +48,11 @@ RFC path; full hardware RSS is now started for Realtek vendor-driver parity.
 - Complete: 22-vector MSI-X ownership policy and interrupt routing for V2
   (RX0 entry 0, TX Q0 entry 16, LINKCHG entry 21), with single-vector fallback
   kept on the legacy combined ISR/IMR surface.
-- Deferred: hardware RSS register/key/indirection stack and ethtool controls
+- Complete + Gateway-smoked: RSS register/key/indirection programming is behind
+  the off/default `rss_queues` gate. `rss_queues=1` programs a queue-0 default
+  indirection table for validation; `rss_queues>1` fails until more RX queues
+  are actually owned. Evidence: `docs/perf/rss_hw_programming_20260608/`.
+- Deferred: ethtool RSS controls/readback and full N>1 activation.
 
 **Track B value verdict (2026-06-07): defer activating N>1 — payoff does not
 materialize at 2.5GbE.** Measured Rust (Track A: 1 queue + RXHASH→RPS) vs vendor
@@ -107,14 +111,12 @@ enable the V2 multi-queue interrupt surface.
 
 ## Next immediate tasks
 
-1. Add hardware RSS register programming behind an explicit off/default gate
-   after the interrupt ownership model is in place.
-2. Add ethtool RSS key/indirection/channel control after fixed-queue RSS
+1. Add ethtool RSS key/indirection/channel control after fixed-queue RSS
    programming is stable.
-3. If Rust+RPS collapse reappears, rerun `scripts/rps_collapse_diagnose.sh` and
+2. If Rust+RPS collapse reappears, rerun `scripts/rps_collapse_diagnose.sh` and
    classify it from captured `rps_cpus`, IRQ affinity, `rx_hash_*`, and softnet
    deltas before changing driver code.
-4. Use Realtek vendor `r8125`, not mainline `r8169`, for future RSS feature and
+3. Use Realtek vendor `r8125`, not mainline `r8169`, for future RSS feature and
    performance comparisons.
 
 ## B3 V2 MSI-X Smoke

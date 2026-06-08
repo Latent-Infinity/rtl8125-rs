@@ -46,7 +46,7 @@ underlying classification rationale.
 | `check_selftest_smoke.sh` | Upstream-style net selftest exists, emits TAP, skips cleanly, and covers load/netdev/unload shape |
 | `check_soak_harness.sh` | Long-running soak harnesses parse, report traffic-generator failures, and fail without observed packet progress |
 
-## RTL8125-specific — replace per chip (13 gates)
+## RTL8125-specific — replace per chip (14 gates)
 
 These encode chip knowledge: register names, masks, ASPM behavior,
 init sequence parity with `r8169_main.c`. For a different chip
@@ -62,6 +62,7 @@ they need rewriting against that chip's authoritative source.
 | `check_jumbo_mtu_chip.sh` | `RxMaxSize` set to `RX_MAX_SIZE_JUMBO` + `ChipInfo.max_mtu` field present |
 | `check_rx_pool_pages.sh` | `alloc_pages(order=2)` (16 KiB per slot specific to 8125B's jumbo cap) + matching unmap discipline + ndo_open rollback releases jumbo slots |
 | `check_rss_queue_contract.sh` | RTL8125B full-RSS prerequisite: queue-id-aware C/Rust bridge plus vendor RDSAR_Q1 queue-base layout while runtime stays N=1 |
+| `check_rss_hw_programming.sh` | RTL8125B RSS register programming is off-by-default, bounded by owned queues/V2 interrupt ownership, and uses Linux's default indirection helper |
 | `check_packet_mutation.sh` * | (Also netdev-pattern — RTL-side enforcement of TSO MSS 11-bit cap workaround) |
 | `check_flr_cycle.sh` | Function-Level Reset cycle behavior specific to this chip's reset state machine |
 | `check_active_soak.sh` | Active-traffic soak harness — references `enp5s0`/10.0.0.0/24 wiring (re-parameterized in Tier 4b) |
@@ -78,8 +79,8 @@ netdev-pattern, partly RTL-specific.
 |---|---:|---|
 | `[generic]` | 11 | minutes (copy + adjust paths) |
 | `[netdev]` | 12 | ~1 h (copy + adjust symbol names) |
-| `[rtl8125]` | 13 | full rewrite per chip (~half a day each) |
-| **Total** | **36** | |
+| `[rtl8125]` | 14 | full rewrite per chip (~half a day each) |
+| **Total** | **37** | |
 
 The 11 `[generic]` + 12 `[netdev]` gates are the **starter pack** the
 next Rust NIC driver project should clone first. Together they

@@ -1,0 +1,2 @@
+label,rx_queues,tx_queues,ethtool_x
+rust_rss_default_linerate,1,1,unsupported

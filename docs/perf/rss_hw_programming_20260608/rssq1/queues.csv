@@ -1,0 +1,2 @@
+label,rx_queues,tx_queues,ethtool_x
+rust_rssq1,1,1,unsupported

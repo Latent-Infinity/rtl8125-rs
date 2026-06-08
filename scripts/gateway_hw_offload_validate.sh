@@ -125,7 +125,7 @@ snapshot_interrupts() {
 			}
 			desc=desc $i " "
 		}
-		if (sum > 0 && vector !~ /^[:space:]*$/) {
+		if (sum > 0 && vector !~ /^[[:space:]]*$/) {
 			gsub(/[[:space:]]+/, "_", desc)
 			printf "%s,%s,%s,%s,%s\n", label, mode, vector, sum, desc
 		}
@@ -361,8 +361,8 @@ write_readme() {
 Expected Rust-vs-C comparison:
 
 - VLAN: \`tx-vlan-offload\` and \`rx-vlan-offload\` should be on when supported, and VLAN TCP/UDP traffic should stay loss-free or match the C driver's loss profile.
-- RSS/RXHASH: Rust should keep \`receive-hashing\`/RXHASH off until RxDescV3/V4 parsing, multi-RX-ring state, and queue/vector programming land.
-- Queues: Rust is expected to report one RX queue for now; r8169/vendor output is the baseline for a future RSS implementation.
+- RSS/RXHASH: Rust should advertise validated single-queue RXHASH, keep \`rx_hash_missing=0\` for hashable traffic, and keep full N>1 hardware RSS off until queue/vector programming and ethtool controls are validated.
+- Queues: Rust is expected to report one RX queue for now; vendor \`r8125\` output is the baseline for future full-RSS feature comparisons.
 
 Primary artifacts:
 

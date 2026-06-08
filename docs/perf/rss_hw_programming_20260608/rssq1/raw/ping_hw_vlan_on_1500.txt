@@ -1,0 +1,10 @@
+PING 10.125.0.1 (10.125.0.1) from 10.125.0.2 enp3s0.125: 56(84) bytes of data.
+64 bytes from 10.125.0.1: icmp_seq=1 ttl=64 time=0.301 ms
+64 bytes from 10.125.0.1: icmp_seq=2 ttl=64 time=0.386 ms
+64 bytes from 10.125.0.1: icmp_seq=3 ttl=64 time=0.347 ms
+64 bytes from 10.125.0.1: icmp_seq=4 ttl=64 time=0.351 ms
+64 bytes from 10.125.0.1: icmp_seq=5 ttl=64 time=0.457 ms
+
+--- 10.125.0.1 ping statistics ---
+5 packets transmitted, 5 received, 0% packet loss, time 4137ms
+rtt min/avg/max/mdev = 0.301/0.368/0.457/0.051 ms

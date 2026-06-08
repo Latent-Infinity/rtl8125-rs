@@ -1,0 +1,9 @@
+label,feature,value
+rust_rssq1,rx-checksumming,on
+rust_rssq1,tx-checksumming,on
+rust_rssq1,scatter-gather,on
+rust_rssq1,tcp-segmentation-offload,on
+rust_rssq1,tx-vlan-offload,on
+rust_rssq1,rx-vlan-offload,on
+rust_rssq1,receive-hashing,on
+rust_rssq1,rx-hashing,missing

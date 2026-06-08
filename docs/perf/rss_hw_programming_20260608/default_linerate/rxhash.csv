@@ -1,0 +1,2 @@
+label,mode,hash_l3,hash_l4,hash_missing,hash_disabled
+rust_rss_default_linerate,hw_vlan_on,6,5084319,0,3

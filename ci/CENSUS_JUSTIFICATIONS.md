@@ -372,3 +372,17 @@ Replaced `desc_read_rx` (1 unsafe block) with two precomputed-offset readers in
 Both stride by `parse.stride` (= `RxDescFormat::descriptor_len()`, the single
 source enforced by `ci/check_rx_desc_stride.sh`). This removes the per-packet
 double-read + format match from the NAPI RX hot loop.
+
+## 2026-06-08 — RSS indirection default wrapper bump 71 → 72
+
+Added one safe wrapper in `src/unsafe_boundary.rs`:
+
+- `rxfh_indir_default(index, n_rx_rings) -> u32` — wraps
+  `r8125_bridge_rxfh_indir_default`, which forwards to the kernel
+  `ethtool_rxfh_indir_default` helper. Rust uses it only while programming
+  the RTL8125 RSS indirection table at open time, keeping the default bucket
+  mapping aligned with Linux ethtool semantics instead of duplicating modulo
+  logic in Rust.
+
+This is a pure mechanical FFI wrapper: no pointers, ownership transfer, MMIO,
+or skb lifetime are involved.

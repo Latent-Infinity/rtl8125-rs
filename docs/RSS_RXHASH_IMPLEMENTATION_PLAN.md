@@ -223,8 +223,14 @@ Execution status:
   the fixed entries 0/16/21, and keeps the single-vector fallback on the legacy
   combined ISR/IMR surface. Smoke artifacts are in
   `docs/perf/b3_v2_msix_smoke_20260607/`.
-- **B4–B5**: pending — hardware RSS queue programming and ethtool RSS controls
-  are next. Hardware RSS remains disabled until those gates pass.
+- **B4**: complete + Gateway-smoked — RSS register/key/indirection programming
+  now sits behind the off-by-default `rss_queues` gate. Default behavior remains
+  the reviewed single-queue RXHASH path; `rss_queues=1` programs the same
+  queue-0 table for validation; `rss_queues>1` fails `ndo_open` until the
+  driver owns more RX queues. Smoke artifacts are in
+  `docs/perf/rss_hw_programming_20260608/`.
+- **B5**: pending — ethtool RSS controls/readback are next. Full N>1 hardware
+  RSS remains disabled until B5 plus multi-ring activation gates pass.
 
 ### Phase 0 Evidence Protocol
 
@@ -552,9 +558,22 @@ Initialize:
 Acceptance:
 
 - `RSS_CTRL_8125` and `Q_NUM_CTRL_8125` match queue count.
-- Key and indirection table readback through ethtool matches driver state.
+- Key and indirection table are programmed through the shared RSS helper; ethtool
+  readback/control lands in B5.
 - RSS disabled path clears RSS control and preserves current single-queue
   performance.
+
+Implementation checkpoint:
+
+- `rss_queues` is default-off. Value 1 is a single-queue register-programming
+  validation mode; values above `RX_QUEUE_COUNT` or above one without the V2
+  interrupt surface return `-EINVAL`.
+- RSS key programming uses `netdev_rss_key_fill`.
+- RSS indirection programming uses the kernel `ethtool_rxfh_indir_default`
+  helper via the cshim.
+- `ci/check_rss_hw_programming.sh` enforces the register-programming gate.
+- Gateway validation covers `rss_queues=0`, `rss_queues=1`, and the
+  `rss_queues=2` negative gate under `docs/perf/rss_hw_programming_20260608/`.
 
 ### Phase B5 - Ethtool Control Plane
 
@@ -654,7 +673,7 @@ Acceptance:
 8. Queue-aware C bridge, still one queue. Done.
 9. Multi-ring Rust state, still RSS-disabled. Done.
 10. 22-vector MSI-X/V2 interrupt ownership. Done.
-11. RSS register programming behind a module parameter.
+11. RSS register programming behind a module parameter. Done.
 12. Ethtool RSS ops.
 13. Advertise/enable full hardware RSS only after validation passes.
 
