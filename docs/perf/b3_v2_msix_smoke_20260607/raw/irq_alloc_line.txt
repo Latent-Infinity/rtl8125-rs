@@ -1,0 +1,1 @@
+[181351.079061] r8125_rust 0000:03:00.0: RTL8125 IRQ allocated: rx0 IRQ 68 tx0 IRQ 197 link IRQ 202 (mode=Msi, use_v2=true)

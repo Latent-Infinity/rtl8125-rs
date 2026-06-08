@@ -23,6 +23,9 @@ echo
 echo "== RX skb-build hot path =="
 bash "$CI/check_rx_skb_build.sh" || rc=1
 echo
+echo "== full-RSS queue-aware bridge contract =="
+bash "$CI/check_rss_queue_contract.sh" || rc=1
+echo
 echo "== build wrapper / BTF path =="
 bash "$CI/check_build_makefile.sh" || rc=1
 echo
@@ -90,7 +93,7 @@ echo
 echo "== upstream-style selftest shape =="
 bash "$CI/check_selftest_smoke.sh" || rc=1
 echo
-echo "== M6 design gates (skip vacuously until impl lands) =="
+echo "== M6 / RSS design gates =="
 bash "$CI/check_msix_static.sh" || rc=1
 bash "$CI/check_isr_v2_paired.sh" || rc=1
 bash "$CI/check_irq_mode_contract.sh" || rc=1

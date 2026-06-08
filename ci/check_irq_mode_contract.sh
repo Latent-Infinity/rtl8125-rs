@@ -42,35 +42,57 @@ if (grep -qE 'AtomicU8::new\(irq_mode[[:space:]]+as[[:space:]]+u8\)' "$PCI" \
    grep -qE 'IrqType::MsiX' "$PCI" &&
    grep -qE 'IrqType::Msi' "$PCI" &&
    grep -qE 'IrqType::Intx' "$PCI" &&
-   grep -qE 'pci_irq_vector\(pdev,[[:space:]]*0\)' "$PCI"; then
+   (grep -qE 'pci_irq_vector\([[:space:]]*pdev,[[:space:]]*0\)' "$PCI" ||
+    tr '\n' ' ' < "$PCI" | grep -qE 'pci_irq_vector\([[:space:]]*pdev,[[:space:]]*regs::V2_RX_Q0_VECTOR'); then
 	grn "probe allocates MSI/MSI-X with INTx fallback and stores IrqMode"
 else
 	red "probe does not allocate/store IRQ mode with MSI/MSI-X plus INTx fallback"
 fi
 
-# We allocate exactly one MSI/MSI-X vector. RTL8125's V2 per-queue interrupt
-# surface routes TX Q0 to MSI-X table entry 16, so enabling V2 with one vector
-# loses TX-only completions. MSI/MSI-X delivery is fine, but it must use the
-# legacy combined ISR/IMR surface until the driver allocates the vendor-required
-# vector count for V2.
+# RTL8125B's V2 per-queue interrupt surface routes TX Q0 to MSI-X table entry
+# 16 and link-change to entry 21. A B3-capable probe may enable V2 only after an
+# exact 22-vector MSI-X allocation; every single-vector fallback must keep
+# use_v2=false.
 probe_irq_block=$(awk '/let \(irq_mode, use_v2\) = if intx_only/,/pr_info!/' "$PCI")
-if echo "$probe_irq_block" | grep -qE 'IrqType::MsiX' &&
+probe_irq_flat=$(printf '%s\n' "$probe_irq_block" | tr '\n' ' ')
+if grep -qE 'V2_MIN_MSIX_VECTORS_8125B' "$PCI" &&
+   echo "$probe_irq_flat" | grep -qE 'alloc_irq_vectors\([^)]*V2_MIN_MSIX_VECTORS_8125B[^)]*V2_MIN_MSIX_VECTORS_8125B' &&
+   tr '\n' ' ' < "$PCI" | grep -qE 'pci_irq_vector\([[:space:]]*pdev,[[:space:]]*regs::V2_TX_Q0_VECTOR\)' &&
+   tr '\n' ' ' < "$PCI" | grep -qE 'pci_irq_vector\([[:space:]]*pdev,[[:space:]]*regs::V2_LINK_VECTOR\)' &&
+   echo "$probe_irq_block" | grep -qE 'IrqType::MsiX' &&
    echo "$probe_irq_block" | grep -qE 'IrqType::Msi' &&
+   echo "$probe_irq_block" | grep -qE '\(IrqMode::Msi,[[:space:]]*true\)' &&
    echo "$probe_irq_block" | grep -qE '\(IrqMode::Msi,[[:space:]]*false\)' &&
-   ! echo "$probe_irq_block" | grep -qE '\(IrqMode::Msi,[[:space:]]*true\)'; then
-	grn "single-vector MSI/MSI-X uses legacy ISR/IMR surface (use_v2=false)"
+   echo "$probe_irq_block" | grep -qE '\(IrqMode::Intx,[[:space:]]*false\)'; then
+	grn "probe enables V2 only after exact 22-vector MSI-X and keeps single-vector fallback legacy"
 else
-	red "single-vector MSI/MSI-X must not enable the V2 ISR surface"
+	red "probe must require 22 MSI-X vectors for V2 and keep single-vector fallback use_v2=false"
+fi
+
+# irq_v2 escape hatch: the operator can disable the wedge-prone V2 surface
+# without dropping all the way to INTx (`intx_only`). off (0) must skip the V2
+# allocation and use the proven single-vector legacy surface; on (2) must
+# hard-fail probe rather than silently downgrade.
+MAIN="$ROOT/src/r8125_rust_main.rs"
+if grep -qE 'irq_v2:[[:space:]]*u8' "$MAIN" &&
+   grep -qE 'let irq_v2 = \*crate::module_parameters::irq_v2\.value\(\)' "$PCI" &&
+   echo "$probe_irq_flat" | grep -qE 'want_v2[[:space:]]*&&' &&
+   echo "$probe_irq_flat" | grep -qE 'irq_v2 == 2'; then
+	grn "irq_v2 escape hatch gates the V2 surface (0=off legacy, 2=on require)"
+else
+	red "irq_v2 module param / probe gating for the V2 surface is missing"
 fi
 
 if grep -qE 'request_irq\([^,]+,[^,]+,[^,]+,[[:space:]]*irq_flags\)' "$NETDEV" &&
+   grep -qE 'regs::V2_TX_Q0_VECTOR' "$NETDEV" &&
+   grep -qE 'regs::V2_LINK_VECTOR' "$NETDEV" &&
    awk '/let irq_flags = match state\.irq_mode\(\)/,/};/' "$NETDEV" | \
 		grep -qE 'IrqMode::Intx[[:space:]]*=>[[:space:]]*ub::IRQF_SHARED' &&
    awk '/let irq_flags = match state\.irq_mode\(\)/,/};/' "$NETDEV" | \
 		grep -qE 'IrqMode::Msi[[:space:]]*=>[[:space:]]*0'; then
-	grn "request_irq flags are mode-specific (INTx shared, MSI unshared)"
+	grn "request_irq flags are mode-specific and V2 active entries are named"
 else
-	red "request_irq flags are not derived from IrqMode"
+	red "request_irq flags or fixed V2 active-vector ownership are missing"
 fi
 
 if awk '/if state\.irq_mode\(\) != IrqMode::Intx/,/^    }/' "$NETDEV" | \

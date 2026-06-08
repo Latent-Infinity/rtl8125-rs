@@ -87,7 +87,7 @@ fi
 # ── RX open path: initial OWN-set pre-post also uses ordered publish ───
 prepost_body=$(
 	awk '
-		/^fn pre_post_rx_descriptors\(/ { in_fn=1 }
+		/^fn pre_post_rx_queue_descriptors\(/ { in_fn=1 }
 		in_fn { print }
 		in_fn && /^}/ { exit }
 	' "$NETDEV_RS"

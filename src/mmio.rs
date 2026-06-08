@@ -92,6 +92,19 @@ impl<'a> Regs<'a> {
         self.bar.write32((addr >> 32) as u32, regs::RDSAR_HIGH);
     }
 
+    /// Program an RX ring base address by queue id. Queue 0 uses the legacy
+    /// RDSAR pair; queue 1+ use the vendor RTL8125 queue table at 0x4000.
+    #[allow(dead_code)]
+    pub(crate) fn set_rx_ring_base_queue(&self, queue_id: usize, addr: u64) {
+        if queue_id == 0 {
+            self.set_rx_ring_base(addr);
+            return;
+        }
+        let low = regs::RDSAR_Q1_LOW_8125 + (queue_id - 1) * 8;
+        self.bar.write32(addr as u32, low);
+        self.bar.write32((addr >> 32) as u32, low + 4);
+    }
+
     /// Set the maximum RX frame size the chip accepts.
     pub(crate) fn set_rx_max_size(&self, sz: u16) {
         self.bar.write16(sz, regs::RX_MAX_SIZE);
@@ -405,17 +418,30 @@ impl<'a> Regs<'a> {
         }
     }
 
+    /// Program one RTL8125B INT_MITI vector's moderation timers. Vendor names
+    /// the registers `INT_MITI_V2_*`, but the timer table applies to the 8125
+    /// interrupt block before the driver selects either the legacy or V2
+    /// ISR/IMR surface.
+    #[inline]
+    pub(crate) fn set_coalesce_8125b_vector(
+        &self,
+        vector: u32,
+        rx_timer: u16,
+        tx_timer: u16,
+    ) -> (u16, u16) {
+        let base = regs::INT_MITI_V2_0_RX + (vector as usize * 8);
+        let tx_offset = regs::INT_MITI_V2_0_TX - regs::INT_MITI_V2_0_RX;
+        self.bar.write16(rx_timer, base);
+        self.bar.write16(tx_timer, base + tx_offset);
+        (self.bar.read16(base), self.bar.read16(base + tx_offset))
+    }
+
     /// Program RTL8125B INT_MITI vector 0 moderation. Vendor names the registers
     /// `INT_MITI_V2_*`, but the timer table applies to the 8125 interrupt block
     /// before the driver selects either the legacy or V2 ISR/IMR surface.
     /// Returns immediate RX/TX timer readbacks for diagnostics.
     pub(crate) fn set_coalesce_8125b(&self, rx_timer: u16, tx_timer: u16) -> (u16, u16) {
         self.zero_coalesce_table_8125b();
-        self.bar.write16(rx_timer, regs::INT_MITI_V2_0_RX);
-        self.bar.write16(tx_timer, regs::INT_MITI_V2_0_TX);
-        (
-            self.bar.read16(regs::INT_MITI_V2_0_RX),
-            self.bar.read16(regs::INT_MITI_V2_0_TX),
-        )
+        self.set_coalesce_8125b_vector(regs::V2_RX_Q0_VECTOR, rx_timer, tx_timer)
     }
 }

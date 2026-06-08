@@ -113,11 +113,13 @@ struct r8125_bridge_ops {
 	int /* netdev_tx_t */ (*xmit)(void *priv, struct sk_buff *skb);
 
 	/*
-	 * poll(priv, budget) — NAPI poll callback
+	 * poll(priv, queue_id, budget) — NAPI poll callback
 	 * ─────────────────
 	 * Pre   : NAPI is scheduled (either from IRQ or from a manual
-	 *         napi_schedule call). `budget` is the maximum number of RX
-	 *         frames the driver may pass to the stack in this call.
+	 *         napi_schedule call). `queue_id` identifies the RX queue
+	 *         whose NAPI instance is polling. `budget` is the maximum
+	 *         number of RX frames the driver may pass to the stack in this
+	 *         call.
 	 * Post  : returns `work_done` in `[0, budget]`. If `work_done < budget`
 	 *         the driver MUST call `r8125_bridge_napi_complete_done()`
 	 *         before returning so the kernel re-enables IRQs.
@@ -128,7 +130,7 @@ struct r8125_bridge_ops {
 	 *         processed `tx_consumed++` (and `tx_received - tx_consumed
 	 *         - tx_busy_exception - tx_dropped_error` is the queue depth).
 	 */
-	int (*poll)(void *priv, int budget);
+	int (*poll)(void *priv, unsigned int queue_id, int budget);
 
 	/*
 	 * change_mtu(priv, new_mtu) — MTU sysfs / ip link mtu N
@@ -255,13 +257,14 @@ bool r8125_bridge_netdev_xmit_more(void);
 void r8125_bridge_rss_key_fill(u8 *key, u32 len);
 
 /* Schedule a NAPI poll. Safe to call from atomic (IRQ) context. */
-void r8125_bridge_napi_schedule(struct net_device *ndev);
+void r8125_bridge_napi_schedule(struct net_device *ndev, unsigned int queue_id);
 
 /* Tell NAPI we processed `work_done` frames this round and are done. The
  * driver MUST call this from inside the poll callback before returning
  * `work_done` when `work_done < budget`.
  */
-void r8125_bridge_napi_complete_done(struct net_device *ndev, int work_done);
+void r8125_bridge_napi_complete_done(struct net_device *ndev,
+				     unsigned int queue_id, int work_done);
 
 /* Link-state helpers — Rust calls these after detecting carrier change. */
 void r8125_bridge_carrier_on(struct net_device *ndev);
@@ -301,12 +304,13 @@ void r8125_bridge_skb_dma_unmap_frag_tx(struct device *dev,
  *  below owns the streaming-DMA sync + the alloc-before-consume refill.
  * ──────────────────────────────────────────────────────────────────────
  */
-int  r8125_bridge_rx_pool_create(struct net_device *ndev, unsigned int ring_len,
-				 u32 *out_buf_len);
-void r8125_bridge_rx_pool_destroy(struct net_device *ndev);
-int  r8125_bridge_rx_alloc(struct net_device *ndev, void **out_cpu,
-			   dma_addr_t *out_dma);
-void r8125_bridge_rx_free(struct net_device *ndev, void *cpu);
+int  r8125_bridge_rx_pool_create(struct net_device *ndev, unsigned int queue_id,
+				 unsigned int ring_len, u32 *out_buf_len);
+void r8125_bridge_rx_pool_destroy(struct net_device *ndev, unsigned int queue_id);
+int  r8125_bridge_rx_alloc(struct net_device *ndev, unsigned int queue_id,
+			   void **out_cpu, dma_addr_t *out_dma);
+void r8125_bridge_rx_free(struct net_device *ndev, unsigned int queue_id,
+			  void *cpu);
 
 /*
  * `r8125_bridge_rx_one_packet` — zero-copy RX super-call (Candidate B +
@@ -317,7 +321,7 @@ void r8125_bridge_rx_free(struct net_device *ndev, void *cpu);
  * Bumps `rx_dropped_error` internally on failure. NAPI-poll context only.
  */
 void r8125_bridge_rx_one_packet(struct net_device *ndev,
-				dma_addr_t dma, const void *buf,
+				unsigned int queue_id, dma_addr_t dma, const void *buf,
 				size_t len, u32 desc_opts1, u32 desc_opts2,
 				u64 hash_info,
 				void **new_cpu, dma_addr_t *new_dma);

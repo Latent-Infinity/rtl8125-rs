@@ -46,7 +46,7 @@ underlying classification rationale.
 | `check_selftest_smoke.sh` | Upstream-style net selftest exists, emits TAP, skips cleanly, and covers load/netdev/unload shape |
 | `check_soak_harness.sh` | Long-running soak harnesses parse, report traffic-generator failures, and fail without observed packet progress |
 
-## RTL8125-specific — replace per chip (12 gates)
+## RTL8125-specific — replace per chip (13 gates)
 
 These encode chip knowledge: register names, masks, ASPM behavior,
 init sequence parity with `r8169_main.c`. For a different chip
@@ -55,12 +55,13 @@ they need rewriting against that chip's authoritative source.
 | Gate | Chip knowledge encoded |
 |---|---|
 | `check_hw_init.sh` | r8169-parity bring-up sequence; balanced config-unlock/lock around fallible init; PCIe power-state writes |
-| `check_hw_offload_features.sh` | RTL8125 VLAN descriptor/RxConfig contract; RXHASH advertisement is paired with V3 hash parsing, `skb_set_hash`, counters, and one-queue RSS programming while full RSS stays deferred |
+| `check_hw_offload_features.sh` | RTL8125 VLAN descriptor/RxConfig contract; RXHASH advertisement is paired with V3 hash parsing, `skb_set_hash`, counters, and one-queue RSS programming while hardware RSS remains separately gated |
 | `check_irq_mode_contract.sh` | `IrqMode` enum + `INT_CFG0_ENABLE_8125 = BIT(0)` chip-side V2 activation gated on probe-selected mode |
 | `check_isr_v2_paired.sh` | V2 ISR/IMR mask register pairing (`IMR_V2_CLEAR`/`IMR_V2_SET`/`ISR_V2`); reserved-bit avoidance |
 | `check_msix_static.sh` | RTL-specific MSI-X register surface; `intx_only` rollback module param exists |
 | `check_jumbo_mtu_chip.sh` | `RxMaxSize` set to `RX_MAX_SIZE_JUMBO` + `ChipInfo.max_mtu` field present |
 | `check_rx_pool_pages.sh` | `alloc_pages(order=2)` (16 KiB per slot specific to 8125B's jumbo cap) + matching unmap discipline + ndo_open rollback releases jumbo slots |
+| `check_rss_queue_contract.sh` | RTL8125B full-RSS prerequisite: queue-id-aware C/Rust bridge plus vendor RDSAR_Q1 queue-base layout while runtime stays N=1 |
 | `check_packet_mutation.sh` * | (Also netdev-pattern — RTL-side enforcement of TSO MSS 11-bit cap workaround) |
 | `check_flr_cycle.sh` | Function-Level Reset cycle behavior specific to this chip's reset state machine |
 | `check_active_soak.sh` | Active-traffic soak harness — references `enp5s0`/10.0.0.0/24 wiring (re-parameterized in Tier 4b) |
@@ -77,8 +78,8 @@ netdev-pattern, partly RTL-specific.
 |---|---:|---|
 | `[generic]` | 11 | minutes (copy + adjust paths) |
 | `[netdev]` | 12 | ~1 h (copy + adjust symbol names) |
-| `[rtl8125]` | 12 | full rewrite per chip (~half a day each) |
-| **Total** | **35** | |
+| `[rtl8125]` | 13 | full rewrite per chip (~half a day each) |
+| **Total** | **36** | |
 
 The 11 `[generic]` + 12 `[netdev]` gates are the **starter pack** the
 next Rust NIC driver project should clone first. Together they

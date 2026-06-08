@@ -31,7 +31,8 @@ Gateway bare-metal rig. Landed and validated in this arc:
   `rx_hash_missing=0`. Random RSS key via `netdev_rss_key_fill`. Hardened RX
   hot loop (`RxParse`: format resolved once/poll, single descriptor read).
   Rollback knob `rx_legacy_desc=1` forces the legacy 16-byte path. Full RSS
-  (Track B) deferred. See `docs/RSS_RXHASH_IMPLEMENTATION_PLAN.md`,
+  is now proceeding for Realtek vendor-driver parity. See
+  `docs/RSS_RXHASH_IMPLEMENTATION_PLAN.md`,
   `docs/perf/DRIVER_GAP_LEDGER.md`.
 - **Final C-vs-Rust matrix on the V3+RXHASH default** (`docs/perf/cvr_20260607_v3rxhash/`):
   throughput parity incl. VLAN, **loaded latency wins** (e.g. @1500 icmp
@@ -44,9 +45,20 @@ A1 32B/16B stride regression) and the evolved `check_hw_offload_features.sh`
 (RXHASH prerequisites). Unsafe census 71. Bench: C baseline is pinned — future
 matrices run rust-only (`RUN_C=0`, ~2× faster) unless kernel/rig changes.
 
-Open items: commit the staged work (logical groups); upstream-prep checkpatch on
-the new C (VLAN, coalescing, RSS key); optional Track-B (full RSS) only if a
-measured gap justifies it.
+Open items: full hardware RSS is now the vendor-parity target. Use the Realtek
+vendor `r8125` driver, not mainline `r8169`, for future RSS feature and
+performance comparisons. The current implementation checkpoint has queue-aware
+C/Rust NAPI, page-pool, and RX delivery contracts plus a one-queue Rust
+`RxQueueState`; this `N=1` checkpoint is hardware-smoked on the Gateway in
+`docs/perf/queue_bridge_smoke_20260607/`. B2 then made Rust RX state
+array-backed and queue-indexed while still reporting one queue; that checkpoint
+is hardware-smoked in `docs/perf/b2_rx_state_array_smoke_20260607/`. Runtime
+behavior is still exactly one RX queue with hardware RSS off. B3 implemented
+and Gateway-smoked the RTL8125B 22-vector V2 interrupt ownership model: exact
+22-vector MSI-X selects `use_v2=true`, RX0/TX0/LINK are owned on fixed entries
+0/16/21, UDP TX does not wedge, and the single-vector fallback remains on the
+legacy combined ISR/IMR surface. The next implementation step is hardware RSS
+register programming behind an off/default gate.
 
 ---
 

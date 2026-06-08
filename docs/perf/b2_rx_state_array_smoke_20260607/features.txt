@@ -1,0 +1,6 @@
+rx-checksumming: on
+tx-checksumming: on
+tcp-segmentation-offload: on
+rx-vlan-offload: on
+tx-vlan-offload: on
+receive-hashing: on

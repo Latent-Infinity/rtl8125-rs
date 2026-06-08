@@ -1,0 +1,1 @@
+[181351.206938] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=true IRQ=68 tx_irq=197 link_irq=202 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x00000000 ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x01 PHYStatus=0x88 tx_dma=0x00000000b0512000 rx_dma=0x00000000aef50000

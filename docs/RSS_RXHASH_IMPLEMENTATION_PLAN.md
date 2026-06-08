@@ -1,7 +1,7 @@
 # RSS / RXHASH Implementation Plan
 
-**Status: Track A (RXHASH-only) COMPLETE + gateway-validated, 2026-06-07.
-Track B (full hardware RSS) deferred.** This plan is deliberately
+**Status: Track A (RXHASH-only) CLOSED + gateway-validated, 2026-06-07.
+Track B (full hardware RSS) STARTED for Realtek vendor-driver parity.** This plan is deliberately
 split into two tracks:
 
 - **RXHASH-only**: parse a hardware hash from an RSS-capable RX descriptor and
@@ -16,9 +16,10 @@ track's gates below are satisfied.
 Current checkpoint:
 
 - `docs/perf/DRIVER_GAP_LEDGER.md` is the implementation ledger.
-- Track A is the low-risk first step and has no dependency on multi-queue bridge
-  changes.
-- Track B remains explicit follow-up only.
+- Track A is implemented, advertised, validated, and closed for the RFC path.
+- Track B is now the feature-parity target because the Realtek vendor `r8125`
+  driver implements full RSS; use that vendor driver, not mainline `r8169`, for
+  future RSS feature and performance comparisons.
 
 Phase 0 status:
 
@@ -65,8 +66,9 @@ For the validated chip:
   `EnableRxDescV4_*`.
 
 Mainline `r8169` does not implement an RTL8125 RSS/RXHASH code path; it keeps
-one RX queue. Full hardware RSS is therefore beyond the upstream reference
-driver. For an initial RFC, this is not a default-path requirement.
+one RX queue. The Realtek vendor `r8125` driver does implement full RSS, so
+Track B uses the vendor driver as the reference for feature behavior, register
+programming, ethtool state, and performance.
 
 RTL8125B V2 interrupts are not remappable in the low-vector way a generic RSS
 plan would assume. The V2 bit position maps to the MSI-X table entry:
@@ -201,7 +203,28 @@ Execution status:
   - **UDP RX "regression" was a benchmarking artifact**, not a V3/A3 issue: the
     ~0.05% loss only appears when the sender is driven *above* the 2.35 Gbps line
     rate (`-b 2400M`), affects legacy and V3 equally, and is 0% at ≤ line rate.
-- **B1–B5**: blocked — all deferred until Track A is validated.
+- **A4**: complete — Track A is closed in the plan and gap ledger. The
+  V3+RXHASH default matrix is captured under
+  `docs/perf/cvr_20260607_v3rxhash/`; full RSS is now proceeding for Realtek
+  vendor-driver parity, not because a current 2.5G throughput gap requires it.
+- **B1**: complete + Gateway-smoked — the C bridge and Rust vtable are queue-id
+  aware while retaining the current `N=1` runtime behavior. `napi_struct`,
+  page-pool geometry, and RX delivery now live behind a queue object in the C
+  bridge. Smoke artifacts are in
+  `docs/perf/queue_bridge_smoke_20260607/`.
+- **B2**: complete + Gateway-smoked — Rust RX state is array-backed
+  (`rx_queues: [RxQueueState; RX_QUEUE_COUNT]`), open/stop/pre-post/teardown
+  are queue-indexed, and the RX hot path resolves `queue_id` into that array.
+  Runtime still reports and schedules exactly one RX queue; hardware RSS remains
+  disabled. Smoke artifacts are in
+  `docs/perf/b2_rx_state_array_smoke_20260607/`.
+- **B3**: complete + Gateway-smoked — RTL8125B now uses the V2 interrupt
+  surface only after an exact 22-vector MSI-X allocation, owns RX0/TX0/LINK on
+  the fixed entries 0/16/21, and keeps the single-vector fallback on the legacy
+  combined ISR/IMR surface. Smoke artifacts are in
+  `docs/perf/b3_v2_msix_smoke_20260607/`.
+- **B4–B5**: pending — hardware RSS queue programming and ethtool RSS controls
+  are next. Hardware RSS remains disabled until those gates pass.
 
 ### Phase 0 Evidence Protocol
 
@@ -344,8 +367,8 @@ interrupt surface.
 
 ### Phase A4 - Documentation & Gate Closure
 
-No code change in this phase. It records the implementation outcome and
-unblocks Track B decision:
+No code change in this phase. It records the implementation outcome and holds
+Track B behind an explicit decision:
 
 - If phase-0 empirics and A1/A2 are positive:
   - update this plan status to `A1` / `A2` / `A3` complete,
@@ -357,10 +380,22 @@ unblocks Track B decision:
   - mark Track A as intentionally blocked by `Track B` prerequisites,
   - proceed to Phase B only if required by the broader roadmap.
 
+Closure result, 2026-06-07:
+
+- Track A is positive and closed: A1/A2/A3 are complete, RXHASH is advertised,
+  and the gateway matrix on the V3+RXHASH default is captured in
+  `docs/perf/cvr_20260607_v3rxhash/`.
+- The `RXHASH` gate is satisfied in `docs/perf/DRIVER_GAP_LEDGER.md` and
+  statically guarded by `ci/check_hw_offload_features.sh`.
+- Track B is now started for vendor-driver parity. B1 must preserve the
+  single-queue runtime while making every C/Rust RX ownership boundary
+  queue-aware.
+
 ## Track B - Full Hardware RSS
 
-Full RSS is a separate, larger effort. It should remain deferred unless Track A
-is insufficient and benchmark data shows a real need.
+Full RSS is a separate, larger effort. Its reference is the Realtek vendor
+`r8125` driver, because mainline `r8169` does not expose the RTL8125 RSS
+surface.
 
 ### Phase B1 - Queue-Aware C Bridge
 
@@ -400,6 +435,19 @@ Acceptance:
   reset/recovery remain idempotent.
 - Static gates cover queue-id propagation through C and Rust.
 
+Implementation status:
+
+- Complete: `struct r8125_bridge` now owns queue state through
+  `r8125_bridge_rx_queue`.
+- Complete: C/Rust vtable polling uses `poll(priv, queue_id, budget)`.
+- Complete: RX page-pool lifecycle and RX delivery APIs accept
+  `queue_id`.
+- Hardware-smoked on Gateway `7.0.0-22-generic` with `N=1`: default TCP/UDP,
+  open/stop, MTU 9000 reopen, RXHASH toggle, VLAN traffic, rmmod while up, and
+  post-reload traffic all passed. Final counters kept `rx_hash_missing=0`.
+- Still `N=1`: all runtime call sites use queue 0; no hardware RSS or
+  multi-ring allocation is enabled yet.
+
 ### Phase B2 - Multi-Ring RX State
 
 Introduce `RxQueueState` in Rust:
@@ -418,7 +466,12 @@ Program ring bases:
 
 Acceptance:
 
-- Multi-ring allocation/open/close works with RSS still disabled.
+- Gateway smoke of the one-queue queue-aware bridge is green before increasing
+  queue count. Complete:
+  `docs/perf/queue_bridge_smoke_20260607/`.
+- Rust RX state is array-backed and open/close/pre-post/teardown are
+  queue-indexed while `RX_QUEUE_COUNT=1`. Complete:
+  `docs/perf/b2_rx_state_array_smoke_20260607/`.
 - FLR/reset/open failure paths unwind every queue.
 - Fallback to one queue is clean.
 
@@ -458,6 +511,26 @@ Acceptance:
 - TX completions are reaped once.
 - Link change is handled once.
 - Fallback returns to today's single-vector legacy surface.
+
+Implementation status:
+
+- Complete: probe attempts an exact 22-vector MSI-X allocation before enabling
+  V2. If that allocation fails, the driver falls back to one MSI-X/MSI/INTx
+  vector with `use_v2=false`.
+- Complete: V2 requests only active Linux IRQs for RX0, TX0, and LINKCHG while
+  leaving unused MSI-X entries allocated but masked.
+- Complete: interrupt moderation programs the RX timer on entry 0 and the TX
+  timer on entry 16 when V2 is active.
+- Complete: `irq_pin_cpu` applies to each active V2 IRQ.
+- Gateway-smoked on `7.0.0-22-generic`:
+  - exact V2 allocation selected `rx0 IRQ 68`, `tx0 IRQ 197`, `link IRQ 202`
+    with `use_v2=true`;
+  - `/proc/interrupts` showed entry 0 and entry 16 deltas under traffic;
+  - TCP TX/RX reached 2.353/2.353 Gbps;
+  - UDP TX/RX at 1448B completed at 2.200/2.200 Gbps with no UDP-TX wedge;
+  - `rx_hash_l4=2006515`, `rx_hash_missing=0`, `tx_dropped_error=0`,
+    `rx_dropped_error=0`;
+  - narrowed dmesg fault scan was clean, and `rmmod` while up completed.
 
 ### Phase B4 - RSS Hardware Programming
 
@@ -571,16 +644,16 @@ Acceptance:
 
 ## Recommended Patch Order
 
-1. Descriptor go/no-go doc and benchmark/gap-ledger extensions.
-2. Descriptor type refactor, preserving legacy behavior.
-3. V3 parser tests and static layout gates for RTL8125B.
-4. RXHASH-only `skb_set_hash` path and counters, still feature-hidden.
-5. RXHASH-only Gateway validation.
-6. Advertise `NETIF_F_RXHASH` only if Track A passes.
-7. Defer full RSS unless a measured gap justifies it.
-8. If justified: queue-aware C bridge, still one queue.
-9. Multi-ring Rust state, still RSS-disabled.
-10. 22-vector MSI-X/V2 interrupt ownership.
+1. Descriptor go/no-go doc and benchmark/gap-ledger extensions. Done.
+2. Descriptor type refactor, preserving legacy behavior. Done.
+3. V3 parser tests and static layout gates for RTL8125B. Done.
+4. RXHASH-only `skb_set_hash` path and counters, still feature-hidden. Done.
+5. RXHASH-only Gateway validation. Done.
+6. Advertise `NETIF_F_RXHASH` only if Track A passes. Done.
+7. Full RSS is now proceeding for Realtek vendor-driver parity.
+8. Queue-aware C bridge, still one queue. Done.
+9. Multi-ring Rust state, still RSS-disabled. Done.
+10. 22-vector MSI-X/V2 interrupt ownership. Done.
 11. RSS register programming behind a module parameter.
 12. Ethtool RSS ops.
 13. Advertise/enable full hardware RSS only after validation passes.
@@ -618,6 +691,7 @@ Track A validation evidence:
   - vector ownership and affinity are statically asserted in code comments and
     runtime checks.
   - `proc/interrupts` deltas show TX completion on vector 16 for RTL8125B.
+  - Gateway smoke proves UDP TX does not reproduce the single-vector V2 wedge.
 - B4/B5:
   - key/indir programming and RSS topology are reflected through `ethtool -x/-X`
     and read back matches.

@@ -85,12 +85,15 @@ if grep -q 'free_rx_slots(state)' <<<"$stop_body"; then
 else
 	red "ndo_stop does NOT call free_rx_slots — leak on rmmod"
 fi
-# free_rx_slots itself must destroy the pool after the slot loop.
+# free_rx_slots iterates queues; the per-queue helper must destroy its pool
+# after returning every slot.
 frs_body=$(awk '/fn[[:space:]]+free_rx_slots\(/,/^}/' "$ROOT/src/netdev.rs" 2>/dev/null)
-if grep -q 'rx_pool_destroy(' <<<"$frs_body"; then
-	grn "free_rx_slots destroys the page_pool after returning every slot"
+frq_body=$(awk '/fn[[:space:]]+free_rx_queue_slots\(/,/^}/' "$ROOT/src/netdev.rs" 2>/dev/null)
+if grep -q 'for queue_id in 0..RX_QUEUE_COUNT' <<<"$frs_body" &&
+   grep -q 'rx_pool_destroy(' <<<"$frq_body"; then
+	grn "free_rx_slots destroys every queue page_pool after returning slots"
 else
-	red "free_rx_slots must rx_pool_destroy() after freeing all slots"
+	red "free_rx_slots must destroy each queue page_pool after freeing its slots"
 fi
 
 # 7. ndo_open post-allocation failure paths release the pool. The RxPoolGuard

@@ -54,7 +54,7 @@ impl<T> core::ops::Deref for CachePadded<T> {
 }
 
 use kernel::bindings;
-use kernel::error::Result;
+use kernel::error::{code::EINVAL, Result};
 use kernel::pci;
 use kernel::prelude::*;
 use kernel::sync::aref::ARef;
@@ -116,6 +116,8 @@ const NETDEV_TX_BUSY: c_int = 0x10;
 const BRIDGE_FEATURE_RXCSUM: u32 = 0x0000_0001;
 const BRIDGE_FEATURE_RXVLAN: u32 = 0x0000_0002;
 const BRIDGE_FEATURE_RXHASH: u32 = 0x0000_0004;
+pub(crate) const RX_QUEUE0: u32 = 0;
+pub(crate) const RX_QUEUE_COUNT: usize = 1;
 
 // RXHASH feature gate for the single-queue hash-reporting path. Hardware RSS
 // remains disabled; this only lets the stack consume descriptor hashes.
@@ -205,12 +207,12 @@ fn stop_tx_queue_with_recheck(state: &NetdevState, head: usize) {
 // RX buffer geometry is no longer a fixed compile-time size. With per-MTU
 // zero-copy buffers (M6 #2 v3) the page_pool sizes each buffer from
 // dev->mtu at ndo_open and returns the device-writable length, cached in
-// `RxRingState::buf_len`. See `src/netdev_bridge_rx_pool.c`.
+// `RxQueueState::buf_len`. See `src/netdev_bridge_rx_pool.c`.
 
 /// Per-slot streaming-DMA RX buffer view. One pair per ring descriptor:
 /// the chip's RX completion deposits bytes via DMA into `dma`; the NAPI
 /// poll reads them through `cpu`. Stored as a pair of per-slot atomics
-/// (`RxRingState::slot_cpu` + `RxRingState::slot_dma`) so probe → ndo_open
+/// (`RxQueueState::slot_cpu` + `RxQueueState::slot_dma`) so probe → ndo_open
 /// allocation, the NAPI hot path, and ndo_stop free can all access the
 /// pool through `&NetdevState` without unsafe interior mutability. The
 /// atomics provide interior mutability; their hot-path accesses are relaxed
@@ -370,14 +372,18 @@ impl TxRingState {
     }
 }
 
-/// RX-ring slice — populated by `ndo_open` (per-slot streaming-DMA pages),
-/// drained by `ndo_stop`, hot-path read by NAPI poll.
-pub(crate) struct RxRingState {
+/// RX queue slice — populated by `ndo_open` (per-slot streaming-DMA pages),
+/// drained by `ndo_stop`, hot-path read by that queue's NAPI poll.
+///
+/// Full-RSS scaffolding starts with one queue but keeps the state shaped as a
+/// queue object so future multi-ring work can grow this into an array without
+/// changing the NAPI/RX ownership contract again.
+pub(crate) struct RxQueueState {
     pub(crate) desc: *mut RxDescriptor,
     pub(crate) dma: u64,
 
     /// Per-slot streaming-DMA RX buffers (M6 #2 v3). Geometry comes from
-    /// `RxRingState::buf_len` at `ndo_open`, so each MTU class gets the
+    /// `RxQueueState::buf_len` at `ndo_open`, so each MTU class gets the
     /// smallest page geometry that safely holds a full frame for that MTU.
     /// `ndo_open` populates every slot via `ub::rx_alloc`, and `ndo_stop`
     /// frees the lot via `ub::rx_free`. The `cpu`/`dma` pair is stored as
@@ -408,7 +414,7 @@ pub(crate) struct RxRingState {
     pub(crate) format: RxDescFormat,
 }
 
-impl RxRingState {
+impl RxQueueState {
     pub(crate) fn new(
         desc: *mut RxDescriptor,
         dma: u64,
@@ -428,16 +434,47 @@ impl RxRingState {
             format,
         }? kernel::error::Error)
     }
+
+    /// Snapshot RX slot `i`'s (cpu, dma) pair. Both atomics are read with
+    /// `Relaxed`: open/stop and MTU rebuild run with NAPI disabled, so there is
+    /// no concurrent writer while the RX hot path is active.
+    #[inline]
+    pub(crate) fn slot(&self, i: usize) -> RxSlot {
+        RxSlot {
+            cpu: self.slot_cpu[i].load(Ordering::Relaxed),
+            dma: self.slot_dma[i].load(Ordering::Relaxed),
+        }
+    }
+
+    /// Publish a slot's (cpu, dma) pair. Paired with `slot` — stores are
+    /// `Relaxed` because the NAPI lifecycle, not the atomics, serializes
+    /// open/stop against the RX hot path. The empty sentinel (`RxSlot::EMPTY`)
+    /// signals "freed" to the rmmod / failure-rollback paths.
+    #[inline]
+    pub(crate) fn set_slot(&self, i: usize, slot: RxSlot) {
+        self.slot_cpu[i].store(slot.cpu, Ordering::Relaxed);
+        self.slot_dma[i].store(slot.dma, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn reset_index(&self) {
+        self.tail.inner.store(0, Ordering::Relaxed);
+    }
 }
 
 /// IRQ slice — set at probe by the kernel-Rust `pci_alloc_irq_vectors`
 /// allocation and mode detection. Read-only after probe; the atomic on `mode`
 /// is just to satisfy the `&self` access pattern.
 pub(crate) struct IrqState {
-    /// IRQ number from `pci_irq_vector(pdev, 0)`. For MSI/MSI-X this is
-    /// the kernel-assigned vector number; for legacy INTx fallback it
-    /// equals `pdev->irq`.
+    /// IRQ number for RX Q0 / legacy combined interrupt ownership. For
+    /// single-vector MSI/MSI-X and INTx fallback this is the only requested
+    /// IRQ. For V2 it is MSI-X entry 0.
     pub(crate) num: u32,
+    /// IRQ number for V2 TX Q0 (MSI-X entry 16). Zero when V2 is not active.
+    pub(crate) tx_num: u32,
+    /// IRQ number for V2 link-change (MSI-X entry 21). Zero when V2 is not
+    /// active.
+    pub(crate) link_num: u32,
     /// Encoded [`IrqMode`] chosen at probe. Read by `raw_irq_handler`
     /// (selects ISR window + ack/mask sequence) and by
     /// `napi::rearm_irq_baseline` (selects V2 vs legacy IMR write).
@@ -455,19 +492,31 @@ pub(crate) struct IrqState {
     /// an IRQ that is no longer (or was never) registered, tripping the
     /// kernel's "trying to free already-free IRQ" WARN at `manage.c`.
     pub(crate) requested: CachePadded<AtomicBool>,
+    /// V2 TX Q0 IRQ registration flag. Separate from `requested` because entry
+    /// 16 is a distinct Linux IRQ and must be freed exactly once.
+    pub(crate) tx_requested: CachePadded<AtomicBool>,
+    /// V2 link-change IRQ registration flag. Separate from `requested` because
+    /// entry 21 is a distinct Linux IRQ and must be freed exactly once.
+    pub(crate) link_requested: CachePadded<AtomicBool>,
 }
 
 impl IrqState {
     pub(crate) fn new(
         num: u32,
+        tx_num: u32,
+        link_num: u32,
         mode: IrqMode,
         use_v2: bool,
     ) -> impl pin_init::Init<Self, kernel::error::Error> {
         kernel::try_init!(Self {
             num,
+            tx_num,
+            link_num,
             mode: AtomicU8::new(mode as u8),
             use_v2: AtomicBool::new(use_v2),
             requested: CachePadded::new(AtomicBool::new(false)),
+            tx_requested: CachePadded::new(AtomicBool::new(false)),
+            link_requested: CachePadded::new(AtomicBool::new(false)),
         }? kernel::error::Error)
     }
 }
@@ -538,8 +587,11 @@ pub(crate) struct NetdevState {
 
     /// TX descriptor ring + producer/consumer indices + shadow.
     pub(crate) tx: TxRingState,
-    /// RX descriptor ring + per-slot streaming-DMA pages + consumer index.
-    pub(crate) rx: RxRingState,
+    /// RX descriptor rings + per-slot streaming-DMA pages + consumer indices.
+    /// Runtime still reports one queue; shaping this as an array keeps the
+    /// Rust-side state ready for future multi-ring RSS without changing the
+    /// NAPI/RX ownership contract again.
+    pub(crate) rx_queues: [RxQueueState; RX_QUEUE_COUNT],
     /// IRQ number + delivery mode (set at probe, read on every fire).
     pub(crate) irq: IrqState,
     /// PHY OCP page selector.
@@ -569,25 +621,17 @@ impl NetdevState {
         self.irq.use_v2.load(Ordering::Relaxed)
     }
 
-    /// Snapshot RX slot `i`'s (cpu, dma) pair. Both atomics are read
-    /// with `Relaxed`: open/stop and MTU rebuild run with NAPI disabled, so
-    /// there is no concurrent writer while the RX hot path is active.
+    /// Resolve a C-bridge queue id into Rust RX queue state. Today only queue 0
+    /// exists; later multi-ring RSS work grows this method without changing the
+    /// NAPI call signature.
     #[inline]
-    pub(crate) fn rx_slot(&self, i: usize) -> RxSlot {
-        RxSlot {
-            cpu: self.rx.slot_cpu[i].load(Ordering::Relaxed),
-            dma: self.rx.slot_dma[i].load(Ordering::Relaxed),
-        }
+    pub(crate) fn rx_queue(&self, queue_id: u32) -> Option<&RxQueueState> {
+        self.rx_queues.get(queue_id as usize)
     }
 
-    /// Publish a slot's (cpu, dma) pair. Paired with `rx_slot` — stores are
-    /// `Relaxed` because the NAPI lifecycle, not the atomics, serializes
-    /// open/stop against the RX hot path. The empty sentinel (`RxSlot::EMPTY`)
-    /// signals "freed" to the rmmod / failure-rollback paths.
     #[inline]
-    pub(crate) fn set_rx_slot(&self, i: usize, slot: RxSlot) {
-        self.rx.slot_cpu[i].store(slot.cpu, Ordering::Relaxed);
-        self.rx.slot_dma[i].store(slot.dma, Ordering::Relaxed);
+    pub(crate) fn rx_queue0(&self) -> &RxQueueState {
+        &self.rx_queues[RX_QUEUE0 as usize]
     }
 
     /// Reset all atomic indices and clear stale TX shadow metadata.
@@ -596,7 +640,9 @@ impl NetdevState {
     pub(crate) fn reset_indices(&self) {
         self.tx.head.inner.store(0, Ordering::Relaxed);
         self.tx.tail.inner.store(0, Ordering::Relaxed);
-        self.rx.tail.inner.store(0, Ordering::Relaxed);
+        for rx in &self.rx_queues {
+            rx.reset_index();
+        }
         self.tx.inflight_bytes.inner.store(0, Ordering::Relaxed);
         self.tx.byte_budget.inner.store(0, Ordering::Relaxed);
         for i in 0..RING_LEN {
@@ -635,9 +681,9 @@ extern "C" fn rust_xmit(cookie: *mut c_void, skb: *mut bindings::sk_buff) -> c_i
     ndo_start_xmit(state, skb)
 }
 
-extern "C" fn rust_poll(cookie: *mut c_void, budget: c_int) -> c_int {
+extern "C" fn rust_poll(cookie: *mut c_void, queue_id: u32, budget: c_int) -> c_int {
     let state = state_from(cookie);
-    crate::napi::poll(state, budget)
+    crate::napi::poll(state, queue_id, budget)
 }
 
 extern "C" fn rust_change_mtu(cookie: *mut c_void, new_mtu: c_int) -> c_int {
@@ -698,7 +744,7 @@ extern "C" fn skel_xmit(_cookie: *mut c_void, skb: *mut bindings::sk_buff) -> c_
     NETDEV_TX_OK
 }
 #[allow(dead_code)]
-extern "C" fn skel_poll(_cookie: *mut c_void, _budget: c_int) -> c_int {
+extern "C" fn skel_poll(_cookie: *mut c_void, _queue_id: u32, _budget: c_int) -> c_int {
     0
 }
 #[allow(dead_code)]
@@ -728,18 +774,27 @@ pub(crate) const ACTIVE_OPS: BridgeOps = M4_FULL_OPS;
 /// Release all RX slots and leave the pool in the empty-sentinel
 /// state. Used by `ndo_stop` and by every `ndo_open` rollback path after
 /// the M6 #2 RX-pool allocation point.
-fn free_rx_slots(state: &NetdevState) {
+fn free_rx_queue_slots(state: &NetdevState, queue_id: u32) {
+    let Some(rx) = state.rx_queue(queue_id) else {
+        return;
+    };
     let ndev = state.ndev.load(Ordering::Acquire);
     for i in 0..RING_LEN {
-        let slot = state.rx_slot(i);
-        state.set_rx_slot(i, RxSlot::EMPTY);
-        ub::rx_free(ndev, slot.cpu);
+        let slot = rx.slot(i);
+        rx.set_slot(i, RxSlot::EMPTY);
+        ub::rx_free(ndev, queue_id, slot.cpu);
     }
     // page_pool_destroy requires every page returned first — only safe
     // after the slot loop above. Idempotent against a NULL pool, so the
     // ndo_open rollback path (failed mid-alloc, or before create) is fine.
-    state.rx.buf_len.inner.store(0, Ordering::Relaxed);
-    ub::rx_pool_destroy(ndev);
+    rx.buf_len.inner.store(0, Ordering::Relaxed);
+    ub::rx_pool_destroy(ndev, queue_id);
+}
+
+fn free_rx_slots(state: &NetdevState) {
+    for queue_id in 0..RX_QUEUE_COUNT {
+        free_rx_queue_slots(state, queue_id as u32);
+    }
 }
 
 // ── ndo_open helpers ──────────────────────────────────────────────────────
@@ -800,7 +855,7 @@ fn apply_netdev_features(state: &NetdevState, feature_flags: u32) {
     // RXHASH needs the V3 descriptor's hash fields. On the legacy-descriptor
     // fallback (`rx_legacy_desc=1`) there is no hash field, so force it off
     // regardless of the advertised feature bit.
-    let enable = rxhash_enabled(feature_flags) && state.rx.format != RxDescFormat::Legacy;
+    let enable = rxhash_enabled(feature_flags) && state.rx_queue0().format != RxDescFormat::Legacy;
     state.rx_hash_enabled.store(enable, Ordering::Relaxed);
 }
 
@@ -811,11 +866,13 @@ fn apply_netdev_features(state: &NetdevState, feature_flags: u32) {
 #[inline]
 fn program_dma_rings(state: &NetdevState, regs: &Regs<'_>, feature_flags: u32) {
     regs.set_tx_ring_base(state.tx.dma);
-    regs.set_rx_ring_base(state.rx.dma);
+    for (queue_id, rx) in state.rx_queues.iter().enumerate() {
+        regs.set_rx_ring_base_queue(queue_id, rx.dma);
+    }
     let mut rcr = rx_feature_rcr(regs::RCR_M4_BASELINE, feature_flags);
     // V3 (32-byte) RX descriptors let the chip write hash metadata. Set in RCR
     // before pre-post (which lays out V3 slots) and before engine enable.
-    if state.rx.format != RxDescFormat::Legacy {
+    if state.rx_queue0().format != RxDescFormat::Legacy {
         rcr |= regs::RCR_ENABLE_RX_DESC_V3;
     }
     regs.set_rcr(rcr);
@@ -827,22 +884,32 @@ fn program_dma_rings(state: &NetdevState, regs: &Regs<'_>, feature_flags: u32) {
 /// returning so the next `ndo_open` retry sees a fresh state. Pre-posting
 /// the descriptor only happens AFTER alloc succeeds so the chip never
 /// sees a half-initialised slot.
-fn allocate_rx_pool(state: &NetdevState) -> Result<()> {
+fn allocate_rx_queue_pool(state: &NetdevState, queue_id: u32) -> Result<()> {
+    let Some(rx) = state.rx_queue(queue_id) else {
+        return Err(EINVAL);
+    };
     let ndev = state.ndev.load(Ordering::Acquire);
     // Create the page_pool sized for the current MTU first; it returns the
     // per-buffer device-writable length that drives the descriptor LEN and
     // the chip RxMaxSize register. On any failure below, `free_rx_slots`
     // frees whatever was allocated and destroys the pool (both idempotent).
-    let buf_len = ub::rx_pool_create(ndev, RING_LEN)?;
-    state.rx.buf_len.inner.store(buf_len, Ordering::Relaxed);
+    let buf_len = ub::rx_pool_create(ndev, queue_id, RING_LEN)?;
+    rx.buf_len.inner.store(buf_len, Ordering::Relaxed);
     for i in 0..RING_LEN {
-        match ub::rx_alloc(ndev) {
-            Ok((cpu, dma)) => state.set_rx_slot(i, RxSlot { cpu, dma }),
+        match ub::rx_alloc(ndev, queue_id) {
+            Ok((cpu, dma)) => rx.set_slot(i, RxSlot { cpu, dma }),
             Err(e) => {
                 free_rx_slots(state);
                 return Err(e);
             }
         }
+    }
+    Ok(())
+}
+
+fn allocate_rx_pool(state: &NetdevState) -> Result<()> {
+    for queue_id in 0..RX_QUEUE_COUNT {
+        allocate_rx_queue_pool(state, queue_id as u32)?;
     }
     Ok(())
 }
@@ -854,10 +921,10 @@ fn allocate_rx_pool(state: &NetdevState) -> Result<()> {
 /// (M6 #2 v3) that's the pool's device-writable `buf_len`, NOT the 16 KiB
 /// jumbo max, so a 4 KiB MTU-1500 buffer can never be overrun by a giant
 /// frame. `buf_len` is already ≤ `DESC_LEN_MASK` (the cshim caps it).
-fn pre_post_rx_descriptors(state: &NetdevState) {
-    let buf_len = state.rx.buf_len.inner.load(Ordering::Relaxed) & regs::DESC_LEN_MASK;
+fn pre_post_rx_queue_descriptors(rx: &RxQueueState) {
+    let buf_len = rx.buf_len.inner.load(Ordering::Relaxed) & regs::DESC_LEN_MASK;
     for i in 0..RING_LEN {
-        let dma = state.rx_slot(i).dma;
+        let dma = rx.slot(i).dma;
         let mut opts1 = regs::DESC_OWN | buf_len;
         if i == RING_LEN - 1 {
             opts1 |= regs::DESC_EOR;
@@ -865,15 +932,21 @@ fn pre_post_rx_descriptors(state: &NetdevState) {
         // Initial RX ownership handoff follows the same ordering as NAPI
         // reposts: addr/opts2 first, then dma_wmb(), then OWN in opts1.
         ub::desc_publish_own(
-            state.rx.desc.cast::<u8>(),
+            rx.desc.cast::<u8>(),
             i,
             Descriptor {
                 opts1,
                 opts2: 0,
                 addr: dma,
             },
-            state.rx.format,
+            rx.format,
         );
+    }
+}
+
+fn pre_post_rx_descriptors(state: &NetdevState) {
+    for rx in &state.rx_queues {
+        pre_post_rx_queue_descriptors(rx);
     }
 }
 
@@ -923,6 +996,16 @@ fn register_irq_handler(state: &NetdevState, cookie: *mut c_void) -> Result<()> 
     // Mark the IRQ registered so `free_irq_if_registered` releases it exactly
     // once on the eventual teardown path (open rollback guard or ndo_stop).
     state.irq.requested.inner.store(true, Ordering::Release);
+    if state.irq_mode() == IrqMode::Msi && state.use_v2_irq_surface() {
+        ub::request_irq(state.irq.tx_num, raw_irq_handler, cookie, irq_flags)?;
+        state.irq.tx_requested.inner.store(true, Ordering::Release);
+        ub::request_irq(state.irq.link_num, raw_irq_handler, cookie, irq_flags)?;
+        state
+            .irq
+            .link_requested
+            .inner
+            .store(true, Ordering::Release);
+    }
     Ok(())
 }
 
@@ -938,8 +1021,15 @@ fn release_irq_registration(state: &NetdevState) -> bool {
 }
 
 fn free_irq_if_registered(state: &NetdevState) {
+    let cookie = cookie_from_state(state);
+    if state.irq.link_requested.inner.swap(false, Ordering::AcqRel) {
+        ub::free_irq(state.irq.link_num, cookie);
+    }
+    if state.irq.tx_requested.inner.swap(false, Ordering::AcqRel) {
+        ub::free_irq(state.irq.tx_num, cookie);
+    }
     if release_irq_registration(state) {
-        ub::free_irq(state.irq.num, cookie_from_state(state));
+        ub::free_irq(state.irq.num, cookie);
     }
 }
 
@@ -993,7 +1083,14 @@ fn program_interrupt_moderation(state: &NetdevState, regs: &Regs<'_>) {
     let rx_timer = *crate::module_parameters::rx_coalesce_timer.value();
     let tx_timer = *crate::module_parameters::tx_coalesce_timer.value();
     let use_v2 = state.irq_mode() == IrqMode::Msi && state.use_v2_irq_surface();
-    let (rx_rb, tx_rb) = regs.set_coalesce_8125b(rx_timer, tx_timer);
+    let (rx_rb, tx_rb) = if use_v2 {
+        let (rx_rb, _) = regs.set_coalesce_8125b_vector(regs::V2_RX_Q0_VECTOR, rx_timer, 0);
+        let (_, tx_rb) = regs.set_coalesce_8125b_vector(regs::V2_TX_Q0_VECTOR, 0, tx_timer);
+        regs.set_coalesce_8125b_vector(regs::V2_LINK_VECTOR, 0, 0);
+        (rx_rb, tx_rb)
+    } else {
+        regs.set_coalesce_8125b(rx_timer, tx_timer)
+    };
     pr_info!(
         "r8125_rust: INT_MITI timers use_v2={} RX=0x{:04x}/rb=0x{:04x} TX=0x{:04x}/rb=0x{:04x}\n",
         use_v2,
@@ -1077,10 +1174,12 @@ fn log_ndo_open_complete(state: &NetdevState, regs: &Regs<'_>) {
         (IrqMode::Msi, true) => (0, 0, regs.isr_v2(), regs.imr_v2_set_diagnostic()),
     };
     pr_info!(
-        "r8125_rust ndo_open complete: mode={:?} use_v2={} IRQ={} ChipCmd=0x{:02x} ISR=0x{:08x} IMR_rb=0x{:08x} ISR_v2=0x{:08x} IMR_V2_SET_diag=0x{:08x} INT_CFG0=0x{:02x} PHYStatus=0x{:02x} tx_dma=0x{:016x} rx_dma=0x{:016x}\n",
+        "r8125_rust ndo_open complete: mode={:?} use_v2={} IRQ={} tx_irq={} link_irq={} ChipCmd=0x{:02x} ISR=0x{:08x} IMR_rb=0x{:08x} ISR_v2=0x{:08x} IMR_V2_SET_diag=0x{:08x} INT_CFG0=0x{:02x} PHYStatus=0x{:02x} tx_dma=0x{:016x} rx_dma=0x{:016x}\n",
         irq_mode,
         use_v2,
         state.irq.num,
+        state.irq.tx_num,
+        state.irq.link_num,
         regs.chip_cmd(),
         isr,
         imr,
@@ -1089,7 +1188,7 @@ fn log_ndo_open_complete(state: &NetdevState, regs: &Regs<'_>) {
         regs.int_cfg0(),
         regs.phy_status(),
         state.tx.dma,
-        state.rx.dma,
+        state.rx_queue0().dma,
     );
 }
 
@@ -1235,7 +1334,7 @@ fn ndo_open(state: &NetdevState, feature_flags: u32) -> Result<()> {
     // pool's buffers hold. Set after hw_start, before the RX engine is
     // enabled below. `buf_len` is the pool's device-writable length, ≤
     // RX_MAX_SIZE_JUMBO (0x3FFF), so it fits the 16-bit register.
-    regs.set_rx_max_size(state.rx.buf_len.inner.load(Ordering::Relaxed) as u16);
+    regs.set_rx_max_size(state.rx_queue0().buf_len.inner.load(Ordering::Relaxed) as u16);
 
     // `hw_start_8125b` force-clears RSS_CTRL/Q_NUM as a safe baseline. Program
     // the hash-only state after that clear and before RX/TX engines run.
@@ -1320,9 +1419,7 @@ fn ndo_stop(state: &NetdevState) {
     // double-free.
     // Keep this explicit to prove `clear_imr_v2_mask` happens before free_irq
     // for static-design tooling.
-    if release_irq_registration(state) {
-        ub::free_irq(state.irq.num, cookie_from_state(state));
-    }
+    free_irq_if_registered(state);
 
     reap_inflight_tx_shadow(state);
     state.debug_counters.store(false, Ordering::Relaxed);
@@ -1331,12 +1428,9 @@ fn ndo_stop(state: &NetdevState) {
     // Zero the descriptor rings so a subsequent open starts fresh.
     for i in 0..RING_LEN {
         ub::desc_write(state.tx.desc, i, Descriptor::default());
-        ub::desc_write_rx(
-            state.rx.desc.cast::<u8>(),
-            i,
-            RxDescriptor::default(),
-            state.rx.format,
-        );
+        for rx in &state.rx_queues {
+            ub::desc_write_rx(rx.desc.cast::<u8>(), i, RxDescriptor::default(), rx.format);
+        }
     }
 
     // M6 #2 — release every RX slot's page chunk + DMA mapping. The
@@ -1838,7 +1932,7 @@ extern "C" fn raw_irq_handler(_irq: c_int, dev_id: *mut c_void) -> bindings::irq
         regs.set_imr(0);
     }
     let ndev = state.ndev.load(Ordering::Acquire);
-    ub::bridge_napi_schedule(ndev);
+    ub::bridge_napi_schedule(ndev, RX_QUEUE0);
     bindings::irqreturn_IRQ_HANDLED as bindings::irqreturn_t
 }
 

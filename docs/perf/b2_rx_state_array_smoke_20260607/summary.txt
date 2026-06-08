@@ -1,0 +1,9 @@
+pre_tcp_rx: 2.353 Gbps lost=
+pre_tcp_tx: 2.353 Gbps lost=
+pre_udp_tx: 2.200 Gbps lost=0.00196315806694369
+pre_udp_rx: 2.200 Gbps lost=0
+post_tcp_rx: 2.353 Gbps lost=
+post_tcp_tx: 2.353 Gbps lost=
+post_udp_tx: 2.200 Gbps lost=0
+post_udp_rx: 2.196 Gbps lost=0.19588211299649463
+vlan_tcp_rx: 2.347 Gbps

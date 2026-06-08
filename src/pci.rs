@@ -49,6 +49,7 @@ use crate::hw;
 use crate::mmio::{self, Regs};
 use crate::netdev::{IrqMode, NetdevHandle, NetdevState};
 use crate::pm;
+use crate::regs;
 use crate::ring;
 use crate::unsafe_boundary;
 
@@ -240,6 +241,10 @@ impl pci::Driver for R8125Driver {
                     // any MSI/MSI-X allocation failure.
                     let intx_only =
                         *crate::module_parameters::intx_only.value() != 0;
+                    // V2 surface escape hatch: 0=off (legacy single-vector),
+                    // 1=auto (try V2 then fall back, default), 2=on (require
+                    // V2). `intx_only` still wins (forces INTx outright).
+                    let irq_v2 = *crate::module_parameters::irq_v2.value();
                     let (irq_mode, use_v2) = if intx_only {
                         unsafe_boundary::alloc_one_irq_vector(
                             pdev,
@@ -248,24 +253,39 @@ impl pci::Driver for R8125Driver {
                         )?;
                         (IrqMode::Intx, false)
                     } else {
-                        // Prefer MSI-X → MSI → INTx for delivery, but ALWAYS
-                        // use the legacy combined ISR/IMR surface (use_v2 =
-                        // false). The V2 per-queue ISR surface routes each
-                        // source to MSI-X entry == its bit position (RX Q0 →
-                        // entry 0, TX Q0 → entry 16); the vendor r8125 driver
-                        // only enables it with ≥ R8125_MIN_MSIX_VEC_8125B (22)
-                        // vectors allocated, and downgrades to the legacy
-                        // surface (HwCurrIsrVer = 1) otherwise. We allocate a
-                        // single vector, so under V2 the TX-completion message
-                        // (entry 16) is never delivered — TX-only flows (e.g.
-                        // unidirectional UDP) wedge because completions are
-                        // only reaped when an RX interrupt happens to run NAPI.
-                        // The legacy combined ISR (0x3C/0x38) delivers RxOK and
-                        // TxOK on the one vector, matching mainline r8169. See
-                        // docs/perf/byte_budget_20260605/UDP_TX_WEDGE.md.
                         let msix_only =
                             pci::IrqTypes::default().with(pci::IrqType::MsiX);
-                        if unsafe_boundary::alloc_one_irq_vector(pdev, msix_only).is_ok() {
+                        // RTL8125B V2 routes source bit N to MSI-X table entry
+                        // N. TX Q0 is entry 16 and LINKCHG is entry 21, so the
+                        // V2 surface is valid only after an exact 22-vector
+                        // MSI-X allocation. The `irq_v2` knob gates the
+                        // attempt: off (0) skips V2 and goes straight to the
+                        // proven single-vector legacy ISR/IMR surface; on (2)
+                        // fails probe if the 22-vector surface is unavailable.
+                        // See UDP_TX_WEDGE.md.
+                        let want_v2 = irq_v2 != 0;
+                        if want_v2
+                            && unsafe_boundary::alloc_irq_vectors(
+                                pdev,
+                                regs::V2_MIN_MSIX_VECTORS_8125B,
+                                regs::V2_MIN_MSIX_VECTORS_8125B,
+                                msix_only,
+                            )
+                            .is_ok()
+                        {
+                            (IrqMode::Msi, true)
+                        } else if irq_v2 == 2 {
+                            // on: V2 explicitly required but the 22-vector
+                            // MSI-X surface is unavailable — refuse to load
+                            // rather than silently downgrade to legacy.
+                            dev_err!(
+                                pdev,
+                                "RTL8125 irq_v2=on but 22-vector MSI-X V2 unavailable; not loading\n"
+                            );
+                            Err::<(IrqMode, bool), kernel::error::Error>(
+                                kernel::error::code::EINVAL,
+                            )?
+                        } else if unsafe_boundary::alloc_one_irq_vector(pdev, msix_only).is_ok() {
                             (IrqMode::Msi, false)
                         } else {
                             match unsafe_boundary::alloc_one_irq_vector(
@@ -284,12 +304,26 @@ impl pci::Driver for R8125Driver {
                             }
                         }
                     };
-                    let irq_num =
-                        unsafe_boundary::pci_irq_vector(pdev, 0)?;
+                    let irq_num = unsafe_boundary::pci_irq_vector(
+                        pdev,
+                        regs::V2_RX_Q0_VECTOR,
+                    )?;
+                    let tx_irq_num = if use_v2 {
+                        unsafe_boundary::pci_irq_vector(pdev, regs::V2_TX_Q0_VECTOR)?
+                    } else {
+                        0
+                    };
+                    let link_irq_num = if use_v2 {
+                        unsafe_boundary::pci_irq_vector(pdev, regs::V2_LINK_VECTOR)?
+                    } else {
+                        0
+                    };
                     dev_info!(
                         pdev,
-                        "RTL8125 IRQ allocated: vector#0 = IRQ {} (mode={:?}, use_v2={}){}\n",
+                        "RTL8125 IRQ allocated: rx0 IRQ {} tx0 IRQ {} link IRQ {} (mode={:?}, use_v2={}){}\n",
                         irq_num,
+                        tx_irq_num,
+                        link_irq_num,
                         irq_mode,
                         use_v2,
                         if intx_only { ", forced by intx_only" } else { "" }
@@ -310,43 +344,46 @@ impl pci::Driver for R8125Driver {
                     // is logged and we proceed — driver still works.
                     let pin_policy =
                         *crate::module_parameters::irq_pin_cpu.value();
-                    let (pin_rc, chosen_cpu) = match pin_policy {
-                        255 => unsafe_boundary::bridge_irq_pin_auto(
-                            unsafe_boundary::pci_dev_raw(pdev),
-                            irq_num as u32,
-                        ),
-                        254 => {
-                            dev_info!(
-                                pdev,
-                                "RTL8125 IRQ {} affinity hint skipped (irq_pin_cpu=254)\n",
-                                irq_num
-                            );
-                            (0, -1)
-                        }
-                        n => {
-                            let cpu = core::ffi::c_int::from(n);
-                            (
-                                unsafe_boundary::bridge_irq_pin_cpu(
-                                    irq_num as u32, cpu,
-                                ),
-                                cpu,
-                            )
+                    let pin_irq = |label: &str, irq: u32| {
+                        let (pin_rc, chosen_cpu) = match pin_policy {
+                            255 => unsafe_boundary::bridge_irq_pin_auto(
+                                unsafe_boundary::pci_dev_raw(pdev),
+                                irq,
+                            ),
+                            254 => {
+                                dev_info!(
+                                    pdev,
+                                    "RTL8125 {} IRQ {} affinity hint skipped (irq_pin_cpu=254)\n",
+                                    label,
+                                    irq
+                                );
+                                (0, -1)
+                            }
+                            n => {
+                                let cpu = core::ffi::c_int::from(n);
+                                (unsafe_boundary::bridge_irq_pin_cpu(irq, cpu), cpu)
+                            }
+                        };
+                        if pin_policy != 254 {
+                            if pin_rc == 0 {
+                                dev_info!(
+                                    pdev,
+                                    "RTL8125 {} IRQ {} affinity hint set to CPU {} (policy={})\n",
+                                    label, irq, chosen_cpu, pin_policy
+                                );
+                            } else {
+                                dev_info!(
+                                    pdev,
+                                    "RTL8125 {} IRQ {} affinity hint failed: rc={} policy={} (driver still functional)\n",
+                                    label, irq, pin_rc, pin_policy
+                                );
+                            }
                         }
                     };
-                    if pin_policy != 254 {
-                        if pin_rc == 0 {
-                            dev_info!(
-                                pdev,
-                                "RTL8125 IRQ {} affinity hint set to CPU {} (policy={})\n",
-                                irq_num, chosen_cpu, pin_policy
-                            );
-                        } else {
-                            dev_info!(
-                                pdev,
-                                "RTL8125 IRQ {} affinity hint failed: rc={} policy={} (driver still functional)\n",
-                                irq_num, pin_rc, pin_policy
-                            );
-                        }
+                    pin_irq("rx0", irq_num);
+                    if use_v2 {
+                        pin_irq("tx0", tx_irq_num);
+                        pin_irq("link", link_irq_num);
                     }
 
                     // Tier 3c: `aspm_force_off=1` operator intent.
@@ -368,7 +405,7 @@ impl pci::Driver for R8125Driver {
                     }
 
                     // Heap-in-place construction (task #58 stack-overflow
-                    // fix). Each substruct (`TxRingState`, `RxRingState`,
+                    // fix). Each substruct (`TxRingState`, `RxQueueState`,
                     // `IrqState`, `PhyState` from task #59) carries its
                     // own `new()` returning `impl Init<Self, Error>`,
                     // so `KBox::init(try_init!(NetdevState { tx <- ... }))`
@@ -388,22 +425,27 @@ impl pci::Driver for R8125Driver {
                                 tx_ring.desc_ptr_mut(),
                                 tx_ring.dma_handle(),
                             ),
-                            rx <- crate::netdev::RxRingState::new(
-                                rx_ring.desc_ptr_mut(),
-                                rx_ring.dma_handle(),
-                                // RXHASH requires the 32-byte V3 descriptor
-                                // layout to expose RSSResult. Fixed
-                                // at probe (no per-packet switching). The
-                                // `rx_legacy_desc=1` rollback knob forces the
-                                // legacy 16-byte path (and disables RXHASH).
-                                if *crate::module_parameters::rx_legacy_desc.value() != 0 {
-                                    crate::ring::RxDescFormat::Legacy
-                                } else {
-                                    crate::ring::RxDescFormat::V3
-                                },
-                            ),
+                            rx_queues <- pin_init::init_array_from_fn(|_| {
+                                crate::netdev::RxQueueState::new(
+                                    rx_ring.desc_ptr_mut(),
+                                    rx_ring.dma_handle(),
+                                    // RXHASH requires the 32-byte V3
+                                    // descriptor layout to expose RSSResult.
+                                    // Fixed at probe (no per-packet switching).
+                                    // The `rx_legacy_desc=1` rollback knob
+                                    // forces the legacy 16-byte path (and
+                                    // disables RXHASH).
+                                    if *crate::module_parameters::rx_legacy_desc.value() != 0 {
+                                        crate::ring::RxDescFormat::Legacy
+                                    } else {
+                                        crate::ring::RxDescFormat::V3
+                                    },
+                                )
+                            }),
                             irq <- crate::netdev::IrqState::new(
                                 irq_num,
+                                tx_irq_num,
+                                link_irq_num,
                                 irq_mode,
                                 use_v2,
                             ),

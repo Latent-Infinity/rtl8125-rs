@@ -1,0 +1,4 @@
+     rx_hash_l3: 0
+     rx_hash_l4: 0
+     rx_hash_missing: 0
+     rx_hash_disabled: 0

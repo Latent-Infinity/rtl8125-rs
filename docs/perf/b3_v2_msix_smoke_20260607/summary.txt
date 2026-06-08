@@ -1,0 +1,26 @@
+B3 V2 MSI-X smoke - 2026-06-07
+kernel: 7.0.0-22-generic
+srcversion: C4D540CF527C558A8F2C072
+irq_alloc: [181351.079061] r8125_rust 0000:03:00.0: RTL8125 IRQ allocated: rx0 IRQ 68 tx0 IRQ 197 link IRQ 202 (mode=Msi, use_v2=true)
+open: [181351.206938] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=true IRQ=68 tx_irq=197 link_irq=202 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x00000000 ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x01 PHYStatus=0x88 tx_dma=0x00000000b0512000 rx_dma=0x00000000aef50000
+irq_numbers: rx=68 tx=197 link=202
+tcp_tx: rc=0 gbps=2.353 loss=
+tcp_rx: rc=0 gbps=2.353 loss=
+udp_tx_1448: rc=0 gbps=2.200 loss=0
+udp_rx_1448: rc=0 gbps=2.200 loss=0.00021057308517997156
+udp_tx_64: rc=0 gbps=0.392 loss=21.933944563456389
+     tx_dropped_error: 0
+     rx_dropped_error: 0
+     rx_hash_l3: 0
+     rx_hash_l4: 2006515
+     rx_hash_missing: 0
+     rx_hash_disabled: 1
+active IRQs before:
+  68:          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0 IR-PCI-MSIX-0000:03:00.0    0-edge      r8125_rust
+ 197:          5          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0 IR-PCI-MSIX-0000:03:00.0   16-edge      r8125_rust
+ 202:          1          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0 IR-PCI-MSIX-0000:03:00.0   21-edge      r8125_rust
+active IRQs after:
+  68:     235179          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0 IR-PCI-MSIX-0000:03:00.0    0-edge      r8125_rust
+ 197:    2699681          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0 IR-PCI-MSIX-0000:03:00.0   16-edge      r8125_rust
+ 202:          1          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0          0 IR-PCI-MSIX-0000:03:00.0   21-edge      r8125_rust
+fault_scan_lines=0

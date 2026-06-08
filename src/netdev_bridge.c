@@ -8,10 +8,9 @@
  * has no stable Rust API today: net_device + net_device_ops + NAPI +
  * sk_buff plumbing.
  *
- * Hard cap: 540 LOC including comments. Candidate G/L/M additions fit
- * under the original 450 cap after the dead RX helpers were removed;
- * raised to 480 for the two ndo_change_mtu accessors the per-MTU
- * zero-copy RX path needs (netif_running + WRITE_ONCE(dev->mtu)).
+ * Hard cap: 540 LOC including comments. Candidate G/L/M additions and
+ * the per-MTU zero-copy RX path fit after dead RX helpers moved out;
+ * Queue-id plumbing keeps this TU at the cap while still bounded.
  * See cshim/README.md.
  *
  * Every ndo callback below is a thin delegation to the Rust vtable.
@@ -60,10 +59,10 @@ static int bridge_ndo_open(struct net_device *ndev)
 	struct r8125_bridge *b = netdev_priv(ndev);
 	int rc;
 
-	napi_enable(&b->napi);
+	napi_enable(&b->rxq[0].napi);
 	rc = b->ops.open(b->priv, bridge_feature_flags(ndev->features));
 	if (rc) {
-		napi_disable(&b->napi);
+		napi_disable(&b->rxq[0].napi);
 		return rc;
 	}
 	/* Rust open() performs the hardware bring-up and decides when the
@@ -77,7 +76,7 @@ static int bridge_ndo_stop(struct net_device *ndev)
 	struct r8125_bridge *b = netdev_priv(ndev);
 
 	netif_tx_disable(ndev);
-	napi_disable(&b->napi);
+	napi_disable(&b->rxq[0].napi);
 	b->ops.stop(b->priv);
 	return 0;
 }
@@ -148,9 +147,11 @@ static int bridge_ndo_set_features(struct net_device *ndev,
 /* NAPI poll wrapper: same delegation pattern. */
 static int bridge_napi_poll(struct napi_struct *napi, int budget)
 {
-	struct r8125_bridge *b = container_of(napi, struct r8125_bridge, napi);
+	struct r8125_bridge_rx_queue *rxq =
+		container_of(napi, struct r8125_bridge_rx_queue, napi);
+	struct r8125_bridge *b = rxq->bridge;
 
-	return b->ops.poll(b->priv, budget);
+	return b->ops.poll(b->priv, rxq->queue_id, budget);
 }
 
 static const struct net_device_ops bridge_ops = {
@@ -243,13 +244,15 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	b->pdev = pdev;
 	b->priv = priv;
 	b->ops = *ops;
+	b->rxq[0].bridge = b;
+	b->rxq[0].queue_id = 0;
 
 	if (r8125_bridge_counters_alloc(b)) {
 		free_netdev(ndev);
 		return NULL;
 	}
 
-	netif_napi_add_weight(ndev, &b->napi, bridge_napi_poll,
+	netif_napi_add_weight(ndev, &b->rxq[0].napi, bridge_napi_poll,
 			      BRIDGE_NAPI_WEIGHT);
 	return ndev;
 }
@@ -258,7 +261,7 @@ void r8125_bridge_free(struct net_device *ndev)
 {
 	struct r8125_bridge *b = netdev_priv(ndev);
 
-	netif_napi_del(&b->napi);
+	netif_napi_del(&b->rxq[0].napi);
 	r8125_bridge_counters_free(b);
 	free_netdev(ndev);
 }
@@ -286,7 +289,7 @@ void r8125_bridge_unregister_and_free(struct net_device *ndev)
 		b->mii_bus = NULL;
 		b->phydev = NULL;
 	}
-	netif_napi_del(&b->napi);
+	netif_napi_del(&b->rxq[0].napi);
 	r8125_bridge_counters_free(b);
 	free_netdev(ndev);
 }
@@ -420,18 +423,23 @@ void r8125_bridge_rss_key_fill(u8 *key, u32 len)
 	netdev_rss_key_fill(key, len);
 }
 
-void r8125_bridge_napi_schedule(struct net_device *ndev)
+void r8125_bridge_napi_schedule(struct net_device *ndev, unsigned int queue_id)
 {
 	struct r8125_bridge *b = netdev_priv(ndev);
 
-	napi_schedule(&b->napi);
+	if (WARN_ON_ONCE(queue_id >= R8125_BRIDGE_RX_QUEUE_COUNT))
+		return;
+	napi_schedule(&b->rxq[queue_id].napi);
 }
 
-void r8125_bridge_napi_complete_done(struct net_device *ndev, int work_done)
+void r8125_bridge_napi_complete_done(struct net_device *ndev,
+				     unsigned int queue_id, int work_done)
 {
 	struct r8125_bridge *b = netdev_priv(ndev);
 
-	napi_complete_done(&b->napi, work_done);
+	if (WARN_ON_ONCE(queue_id >= R8125_BRIDGE_RX_QUEUE_COUNT))
+		return;
+	napi_complete_done(&b->rxq[queue_id].napi, work_done);
 }
 
 void r8125_bridge_carrier_on(struct net_device *ndev)
@@ -508,11 +516,11 @@ int r8125_bridge_reopen_for_mtu(struct net_device *ndev, int new_mtu)
 		return 0;
 
 	netif_tx_disable(ndev);
-	napi_disable(&b->napi);
+	napi_disable(&b->rxq[0].napi);
 	b->ops.stop(b->priv);
 
 	WRITE_ONCE(ndev->mtu, new_mtu);
-	napi_enable(&b->napi);
+	napi_enable(&b->rxq[0].napi);
 	rc = b->ops.open(b->priv, bridge_feature_flags(ndev->features));
 	if (!rc)
 		return 0;
@@ -522,7 +530,7 @@ int r8125_bridge_reopen_for_mtu(struct net_device *ndev, int new_mtu)
 	 * requested value.
 	 */
 	WRITE_ONCE(ndev->mtu, old_mtu);
-	napi_disable(&b->napi);
+	napi_disable(&b->rxq[0].napi);
 	return rc;
 }
 

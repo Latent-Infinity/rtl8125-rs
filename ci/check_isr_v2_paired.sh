@@ -37,7 +37,7 @@ fi
 HW="$ROOT/src/hw.rs"
 # Phase A.2 moves the activation out of hw_start_8125b into ndo_open
 # (gated on `state.irq_mode()`). Accept either location.
-if ! grep -hE 'set_int_cfg0\([^)]*INT_CFG0_ENABLE_8125' "$HW" "$NETDEV" >/dev/null 2>&1; then
+if ! grep -hE 'set_int_cfg0\([^)]*INT_CFG0_ENABLE_8125|set_int_cfg0_v2_enable\(true\)' "$HW" "$NETDEV" >/dev/null 2>&1; then
 	yel "V2 surface scaffolded but chip-side activation deferred — pairing checks skipped"
 	exit 0
 fi
@@ -65,7 +65,7 @@ fi
 if awk '/fn[[:space:]]+ndo_stop\(/,/^}/' "$NETDEV" | \
 		awk '/clear_imr_v2_mask\(\s*(0xFFFF_FFFF|!0u32|u32::MAX)/{c=NR}
 		     /quiesce_chip\(/{c=NR}
-		     /ub::free_irq\(/{if (c && NR > c) found=1}
+		     /ub::free_irq\(|free_irq_if_registered\(/{if (c && NR > c) found=1}
 		     END {exit (found ? 0 : 1)}'; then
 	grn "ndo_stop masks all v2 sources before free_irq"
 else

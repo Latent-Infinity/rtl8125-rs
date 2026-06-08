@@ -123,6 +123,24 @@ kernel::module_pci_driver! {
             default: 0,
             description: "Force legacy INTx ISR/IMR register layout (test rollback)",
         },
+        // V2 MSI-X interrupt surface selection (escape hatch for the
+        // historically wedge-prone per-queue ISR). The V2 surface needs an
+        // exact 22-vector MSI-X allocation (TX Q0 = entry 16, LINKCHG = 21);
+        // see docs/perf/byte_budget_20260605/UDP_TX_WEDGE.md.
+        //   0 → off:  never enable V2 — allocate a single MSI/MSI-X vector and
+        //             use the proven legacy combined ISR/IMR surface
+        //             (use_v2=false). The MSI-delivery escape hatch that does
+        //             NOT drop all the way to INTx like `intx_only=1`.
+        //   1 → auto: try the 22-vector V2 surface, fall back to the
+        //             single-vector legacy surface, then INTx (default — the
+        //             current behavior).
+        //   2 → on:   require V2 — fail probe if the 22-vector MSI-X surface
+        //             cannot be allocated (strict validation / CI only).
+        // `intx_only=1` still wins over this knob (forces INTx outright).
+        irq_v2: u8 {
+            default: 1,
+            description: "V2 MSI-X surface: 0=off (legacy MSI), 1=auto (default), 2=on (require V2)",
+        },
         // Operator escape hatch for any future ASPM regression.
         // When non-zero, probe logs an informational dmesg line so
         // the operator can confirm the intent reached the driver.

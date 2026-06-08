@@ -81,7 +81,16 @@
  *               as the frag size; skb_shared_info lives at its end, so the
  *               order is chosen so headroom + max_len + shinfo all fit.
  */
-static void r8125_bridge_rx_geometry(struct r8125_bridge *b, unsigned int mtu)
+static struct r8125_bridge_rx_queue *
+r8125_bridge_rxq(struct r8125_bridge *b, unsigned int queue_id)
+{
+	if (queue_id >= R8125_BRIDGE_RX_QUEUE_COUNT)
+		return NULL;
+	return &b->rxq[queue_id];
+}
+
+static void r8125_bridge_rx_geometry(struct r8125_bridge_rx_queue *q,
+				     unsigned int mtu)
 {
 	unsigned int frame_max = mtu + VLAN_ETH_HLEN + ETH_FCS_LEN;
 	size_t data_room = SKB_DATA_ALIGN(R8125_RX_HEADROOM + frame_max);
@@ -89,11 +98,11 @@ static void r8125_bridge_rx_geometry(struct r8125_bridge *b, unsigned int mtu)
 			   SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
 	unsigned int order = get_order(buf_total);
 
-	b->rx_headroom = R8125_RX_HEADROOM;
-	b->rx_offset = R8125_RX_HEADROOM;
-	b->rx_max_len = min_t(unsigned int, frame_max, R8125_RX_DESC_MAX);
-	b->rx_buf_total = (size_t)PAGE_SIZE << order;
-	b->rx_order = order;
+	q->rx_headroom = R8125_RX_HEADROOM;
+	q->rx_offset = R8125_RX_HEADROOM;
+	q->rx_max_len = min_t(unsigned int, frame_max, R8125_RX_DESC_MAX);
+	q->rx_buf_total = (size_t)PAGE_SIZE << order;
+	q->rx_order = order;
 }
 
 /*
@@ -105,19 +114,22 @@ static void r8125_bridge_rx_geometry(struct r8125_bridge *b, unsigned int mtu)
  * `b->page_pool` NULL. Idempotent against a double-create only in the
  * sense that the caller (Rust ndo_open) never does so; we WARN otherwise.
  */
-int r8125_bridge_rx_pool_create(struct net_device *ndev, unsigned int ring_len,
-				u32 *out_buf_len)
+int r8125_bridge_rx_pool_create(struct net_device *ndev, unsigned int queue_id,
+				unsigned int ring_len, u32 *out_buf_len)
 {
 	struct r8125_bridge *b = netdev_priv(ndev);
+	struct r8125_bridge_rx_queue *q = r8125_bridge_rxq(b, queue_id);
 	struct page_pool_params pp = { 0 };
 	struct page_pool *pool;
 
-	if (WARN_ON(b->page_pool))
+	if (WARN_ON(!q))
+		return -EINVAL;
+	if (WARN_ON(q->page_pool))
 		return -EBUSY;
 
-	r8125_bridge_rx_geometry(b, READ_ONCE(ndev->mtu));
+	r8125_bridge_rx_geometry(q, READ_ONCE(ndev->mtu));
 
-	pp.order = b->rx_order;
+	pp.order = q->rx_order;
 	pp.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV;
 	/* Zero-copy RX can have up to one ring worth of pages posted to the
 	 * device while another burst is still returning from the stack via skb
@@ -127,17 +139,17 @@ int r8125_bridge_rx_pool_create(struct net_device *ndev, unsigned int ring_len,
 	pp.pool_size = ring_len * 2;
 	pp.nid = dev_to_node(&b->pdev->dev);
 	pp.dev = &b->pdev->dev;
-	pp.napi = &b->napi;
+	pp.napi = &q->napi;
 	pp.dma_dir = DMA_FROM_DEVICE;
-	pp.offset = b->rx_offset;
-	pp.max_len = b->rx_max_len;
+	pp.offset = q->rx_offset;
+	pp.max_len = q->rx_max_len;
 
 	pool = page_pool_create(&pp);
 	if (IS_ERR(pool))
 		return PTR_ERR(pool);
 
-	b->page_pool = pool;
-	*out_buf_len = b->rx_max_len;
+	q->page_pool = pool;
+	*out_buf_len = q->rx_max_len;
 	return 0;
 }
 
@@ -149,14 +161,15 @@ int r8125_bridge_rx_pool_create(struct net_device *ndev, unsigned int ring_len,
  *                                  r8125_bridge_rx_free before calling).
  * Idempotent against a NULL pool (ndo_open rollback before create).
  */
-void r8125_bridge_rx_pool_destroy(struct net_device *ndev)
+void r8125_bridge_rx_pool_destroy(struct net_device *ndev, unsigned int queue_id)
 {
 	struct r8125_bridge *b = netdev_priv(ndev);
+	struct r8125_bridge_rx_queue *q = r8125_bridge_rxq(b, queue_id);
 
-	if (!b->page_pool)
+	if (!q || !q->page_pool)
 		return;
-	page_pool_destroy(b->page_pool);
-	b->page_pool = NULL;
+	page_pool_destroy(q->page_pool);
+	q->page_pool = NULL;
 }
 
 /*
@@ -169,18 +182,22 @@ void r8125_bridge_rx_pool_destroy(struct net_device *ndev)
  * pool maps + syncs-for-device the page on alloc (PP_FLAG_DMA_*), so the
  * buffer is immediately safe to hand to the chip.
  */
-int r8125_bridge_rx_alloc(struct net_device *ndev, void **out_cpu,
-			  dma_addr_t *out_dma)
+int r8125_bridge_rx_alloc(struct net_device *ndev, unsigned int queue_id,
+			  void **out_cpu, dma_addr_t *out_dma)
 {
 	struct r8125_bridge *b = netdev_priv(ndev);
+	struct r8125_bridge_rx_queue *q = r8125_bridge_rxq(b, queue_id);
 	struct page *page;
 
-	page = page_pool_dev_alloc_pages(b->page_pool);
+	if (WARN_ON(!q || !q->page_pool))
+		return -EINVAL;
+
+	page = page_pool_dev_alloc_pages(q->page_pool);
 	if (!page)
 		return -ENOMEM;
 
 	*out_cpu = page_address(page);
-	*out_dma = page_pool_get_dma_addr(page) + b->rx_offset;
+	*out_dma = page_pool_get_dma_addr(page) + q->rx_offset;
 	return 0;
 }
 
@@ -192,13 +209,14 @@ int r8125_bridge_rx_alloc(struct net_device *ndev, void **out_cpu,
  * `cpu` (the empty-slot sentinel on ndo_open rollback). Used only on the
  * teardown / rollback path (not from NAPI), so `allow_direct == false`.
  */
-void r8125_bridge_rx_free(struct net_device *ndev, void *cpu)
+void r8125_bridge_rx_free(struct net_device *ndev, unsigned int queue_id, void *cpu)
 {
 	struct r8125_bridge *b = netdev_priv(ndev);
+	struct r8125_bridge_rx_queue *q = r8125_bridge_rxq(b, queue_id);
 
-	if (!cpu || !b->page_pool)
+	if (!cpu || !q || !q->page_pool)
 		return;
-	page_pool_put_full_page(b->page_pool, virt_to_head_page(cpu), false);
+	page_pool_put_full_page(q->page_pool, virt_to_head_page(cpu), false);
 }
 
 /*
@@ -217,12 +235,13 @@ void r8125_bridge_rx_free(struct net_device *ndev, void *cpu)
  *
  * Callable only from NAPI poll context (napi_build_skb + direct recycle).
  */
-void r8125_bridge_rx_one_packet(struct net_device *ndev, dma_addr_t dma,
-				const void *buf, size_t len, u32 desc_opts1,
+void r8125_bridge_rx_one_packet(struct net_device *ndev, unsigned int queue_id,
+				dma_addr_t dma, const void *buf, size_t len, u32 desc_opts1,
 				u32 desc_opts2, u64 hash_info, void **new_cpu,
 				dma_addr_t *new_dma)
 {
 	struct r8125_bridge *b = netdev_priv(ndev);
+	struct r8125_bridge_rx_queue *q = r8125_bridge_rxq(b, queue_id);
 	struct page *newpage;
 	struct sk_buff *skb;
 	struct device *dev = &b->pdev->dev;
@@ -231,7 +250,13 @@ void r8125_bridge_rx_one_packet(struct net_device *ndev, dma_addr_t dma,
 	const bool hash_enabled = (hash_info >> 61) & 1ULL;
 	const u32 hash_value = (u32)(hash_info & 0xFFFFFFFFULL);
 
-	newpage = page_pool_dev_alloc_pages(b->page_pool);
+	if (WARN_ON_ONCE(!q || !q->page_pool)) {
+		*new_cpu = (void *)buf;
+		*new_dma = dma;
+		return;
+	}
+
+	newpage = page_pool_dev_alloc_pages(q->page_pool);
 	if (unlikely(!newpage)) {
 		/* Refill failed — drop, keep the old buffer in the slot. */
 		this_cpu_inc(*b->rx_dropped_error);
@@ -241,17 +266,17 @@ void r8125_bridge_rx_one_packet(struct net_device *ndev, dma_addr_t dma,
 		return;
 	}
 
-	page_pool_dma_sync_for_cpu(b->page_pool, virt_to_head_page(buf), 0, len);
-	prefetch(buf + b->rx_offset);
+	page_pool_dma_sync_for_cpu(q->page_pool, virt_to_head_page(buf), 0, len);
+	prefetch(buf + q->rx_offset);
 
-	skb = napi_build_skb((void *)buf, b->rx_buf_total);
+	skb = napi_build_skb((void *)buf, q->rx_buf_total);
 	if (unlikely(!skb)) {
 		/* skb alloc failed: recycle page to pool (NAPI context) and install fresh one. */
 		this_cpu_inc(*b->rx_dropped_error);
-		page_pool_put_page(b->page_pool, virt_to_head_page(buf), len, true);
+		page_pool_put_page(q->page_pool, virt_to_head_page(buf), len, true);
 	} else {
 		skb_mark_for_recycle(skb);
-		skb_reserve(skb, b->rx_offset);
+		skb_reserve(skb, q->rx_offset);
 		__skb_put(skb, len);
 		skb->protocol = eth_type_trans(skb, ndev);
 		if (!hash_enabled) {
@@ -274,11 +299,11 @@ void r8125_bridge_rx_one_packet(struct net_device *ndev, dma_addr_t dma,
 							 R8125_RX_VLAN_MASK));
 		this_cpu_inc(*b->rx_handed_to_stack);
 		dev_sw_netstats_rx_add(ndev, len);
-		napi_gro_receive(&b->napi, skb);
+		napi_gro_receive(&q->napi, skb);
 	}
 
 	*new_cpu = page_address(newpage);
-	*new_dma = page_pool_get_dma_addr(newpage) + b->rx_offset;
+	*new_dma = page_pool_get_dma_addr(newpage) + q->rx_offset;
 }
 
 MODULE_LICENSE("GPL v2");

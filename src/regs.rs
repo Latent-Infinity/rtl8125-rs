@@ -42,6 +42,9 @@ pub(crate) const TNPDS_HIGH: usize = 0x24;
 /// `RDSAR` — Receive Descriptor Start Address Register. Same shape as TNPDS.
 pub(crate) const RDSAR_LOW: usize = 0xE4;
 pub(crate) const RDSAR_HIGH: usize = 0xE8;
+/// RX queue 1+ descriptor base registers. Vendor maps queue N at
+/// `RDSAR_Q1_LOW_8125 + (N - 1) * 8`; queue 0 uses legacy `RDSAR`.
+pub(crate) const RDSAR_Q1_LOW_8125: usize = 0x4000;
 
 // ── ChipCmd RX/TX enable bits ────────────────────────────────────────────
 // (CHIP_CMD offset + CMD_RESET already defined at top of file.)
@@ -72,7 +75,8 @@ pub(crate) const INTR_M4_BASELINE: u32 = INTR_ROK | INTR_RER | INTR_TOK | INTR_T
 // with an MSI/MSI-X vector allocation from probe. Bit N corresponds to
 // MSI-X message_id N. We use a small subset: ROK_Q0 (bit 0), TOK_Q0
 // (bit 16), LINKCHG (bit 21 — vendor default `HwCurrIsrVer`).
-// Multi-queue is N/A on 8125B (docs/M6_MULTIQ_NA.md).
+// Full hardware RSS can later add RX queue bits here; this checkpoint only
+// unmasks queue 0 plus the single TX/link owners validated for B3.
 //
 // Vendor: `IMR_V2_CLEAR_REG_8125 = 0x0D00`, `ISR_V2_8125 = 0x0D04`,
 // `IMR_V2_SET_REG_8125 = 0x0D0C` (r8125.h:1496-1498).
@@ -98,10 +102,17 @@ pub(crate) const ISRIMR_V2_LINKCHG: u32 = 1 << 21;
 /// chip surfaces them as TOK_Q0 / ROK_Q0 with status flags in the
 /// descriptor, which the NAPI reaper inspects per-packet.
 pub(crate) const INTR_V2_M4_BASELINE: u32 = ISRIMR_V2_ROK_Q0 | ISRIMR_V2_TOK_Q0 | ISRIMR_V2_LINKCHG;
+/// RTL8125B ISR version 2 fixed MSI-X message IDs. Bit position == MSI-X table
+/// entry; there is no remap for this surface.
+pub(crate) const V2_RX_Q0_VECTOR: u32 = 0;
+pub(crate) const V2_TX_Q0_VECTOR: u32 = 16;
+pub(crate) const V2_LINK_VECTOR: u32 = 21;
+/// Vendor `R8125_MIN_MSIX_VEC_8125B`: minimum allocation that covers LINKCHG.
+pub(crate) const V2_MIN_MSIX_VECTORS_8125B: u32 = 22;
 
 // ── INT_CFG — 8125 interrupt config ──────────────────────────────────────
 /// `INT_CFG0` (8-bit at 0x34). At M4 we write 0 (legacy-ISR mode).
-/// M6 sub-feature #1 sets `INT_CFG0_ENABLE_8125` to activate the
+/// The B3 interrupt model sets `INT_CFG0_ENABLE_8125` to activate the
 /// per-message-id ISR_V2 register layout (`IMR_V2_*` / `ISR_V2` at
 /// 0x0D0C / 0x0D04). See docs/M6_MSIX_DESIGN.md.
 pub(crate) const INT_CFG0: usize = 0x34;

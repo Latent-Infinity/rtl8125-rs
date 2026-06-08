@@ -33,7 +33,7 @@ grn()  { printf '\033[1;32mPASS\033[0m %s\n' "$*"; }
 STRUCTS=(
 	"src/netdev.rs|NetdevState"
 	"src/netdev.rs|TxRingState"
-	"src/netdev.rs|RxRingState"
+	"src/netdev.rs|RxQueueState"
 	"src/netdev.rs|IrqState"
 	"src/netdev.rs|PhyState"
 )

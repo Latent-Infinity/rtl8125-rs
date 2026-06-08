@@ -2,17 +2,18 @@
 
 **Status: 2026-06-07.** VLAN hardware acceleration and single-queue RXHASH are
 implemented in the Rust driver. RXHASH uses one RX queue with V3 descriptor hash
-reporting; full hardware RSS remains deferred until multi-ring RX and the
-RTL8125B 22-vector MSI-X model are implemented.
+reporting; full hardware RSS is now tracked against the Realtek vendor `r8125`
+driver and remains disabled until multi-ring RX and the RTL8125B 22-vector
+MSI-X model are implemented.
 
 ## Run Shape
 
-Use the same Gateway direct-link topology as the TX byte-budget sweep. Run the
-new harness once with the in-tree C driver bound, then once with `r8125_rust`
-bound:
+Use the same Gateway direct-link topology as the TX byte-budget sweep. For
+future RSS feature/performance comparisons, run the harness once with the
+Realtek vendor `r8125` driver bound, then once with `r8125_rust` bound:
 
 ```bash
-LABEL=c_r8169  DUT_IFACE=enp3s0 PEER_IFACE=enp4s0 scripts/gateway_hw_offload_validate.sh
+LABEL=c_vendor DUT_IFACE=enp3s0 PEER_IFACE=enp4s0 scripts/gateway_hw_offload_validate.sh
 LABEL=rust     DUT_IFACE=enp3s0 PEER_IFACE=enp4s0 scripts/gateway_hw_offload_validate.sh
 ```
 

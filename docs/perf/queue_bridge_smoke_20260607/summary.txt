@@ -1,0 +1,5 @@
+tcp_rx: 2.353 Gbps lost=
+tcp_tx: 2.353 Gbps lost=
+udp_tx: 2.200 Gbps lost=0
+udp_rx: 2.198 Gbps lost=0.0952061054050458
+vlan_tcp_rx: 2.347 Gbps lost=

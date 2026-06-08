@@ -49,7 +49,7 @@ fi
 # actually written to the chip": look for an actual set_int_cfg0 call
 # that includes INT_CFG0_ENABLE_8125 as a written value, in either
 # hw_start_8125b or ndo_open (Phase A.2 home).
-if ! grep -hE 'set_int_cfg0\([^)]*INT_CFG0_ENABLE_8125' "$HW" "$NETDEV" >/dev/null 2>&1; then
+if ! grep -hE 'set_int_cfg0\([^)]*INT_CFG0_ENABLE_8125|set_int_cfg0_v2_enable\(true\)' "$HW" "$NETDEV" >/dev/null 2>&1; then
 	yel "V2 register surface scaffolded but chip-side INT_CFG0_ENABLE_8125 not active yet — full check deferred"
 	exit 0
 fi
@@ -67,7 +67,7 @@ fi
 # 2. INT_CFG0_ENABLE_8125 is written conditionally (mode-gated) at
 # bring-up. Phase A.2 keeps it in ndo_open guarded by
 # `state.irq_mode() != IrqMode::Intx`; accept either gating idiom.
-if ! grep -hE 'set_int_cfg0\([^)]*INT_CFG0_ENABLE_8125' "$HW" "$NETDEV" >/dev/null 2>&1; then
+if ! grep -hE 'set_int_cfg0\([^)]*INT_CFG0_ENABLE_8125|set_int_cfg0_v2_enable\(true\)' "$HW" "$NETDEV" >/dev/null 2>&1; then
 	red "no set_int_cfg0(INT_CFG0_ENABLE_8125) call found — chip will stay on legacy ISR"
 elif ! grep -hE 'irq_mode\(\)|IrqMode::' "$NETDEV" >/dev/null 2>&1; then
 	red "INT_CFG0_ENABLE_8125 written but not gated on IrqMode — INTx fallback will break"

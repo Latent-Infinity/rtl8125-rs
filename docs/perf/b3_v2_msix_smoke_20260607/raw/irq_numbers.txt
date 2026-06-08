@@ -1,0 +1,3 @@
+rx_irq=68
+tx_irq=197
+link_irq=202

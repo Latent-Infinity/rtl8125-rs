@@ -163,7 +163,7 @@ pub(crate) struct BridgeOps {
     pub open: extern "C" fn(cookie: *mut c_void, feature_flags: u32) -> c_int,
     pub stop: extern "C" fn(cookie: *mut c_void),
     pub xmit: extern "C" fn(cookie: *mut c_void, skb: *mut bindings::sk_buff) -> c_int,
-    pub poll: extern "C" fn(cookie: *mut c_void, budget: c_int) -> c_int,
+    pub poll: extern "C" fn(cookie: *mut c_void, queue_id: u32, budget: c_int) -> c_int,
     pub change_mtu: extern "C" fn(cookie: *mut c_void, new_mtu: c_int) -> c_int,
     pub set_features: extern "C" fn(cookie: *mut c_void, feature_flags: u32) -> c_int,
 }
@@ -186,8 +186,12 @@ extern "C" {
     fn r8125_bridge_unregister_and_free(ndev: *mut bindings::net_device);
     fn r8125_bridge_skb_free_error(skb: *mut bindings::sk_buff);
 
-    fn r8125_bridge_napi_schedule(ndev: *mut bindings::net_device);
-    fn r8125_bridge_napi_complete_done(ndev: *mut bindings::net_device, work_done: c_int);
+    fn r8125_bridge_napi_schedule(ndev: *mut bindings::net_device, queue_id: c_uint);
+    fn r8125_bridge_napi_complete_done(
+        ndev: *mut bindings::net_device,
+        queue_id: c_uint,
+        work_done: c_int,
+    );
     fn r8125_bridge_irq_pin_cpu(irq: u32, cpu: c_int) -> c_int;
     fn r8125_bridge_irq_pin_auto(
         pdev: *mut bindings::pci_dev,
@@ -267,16 +271,18 @@ extern "C" {
     // RxMaxSize). Destroy happens after every slot is freed.
     fn r8125_bridge_rx_pool_create(
         ndev: *mut bindings::net_device,
+        queue_id: c_uint,
         ring_len: c_uint,
         out_buf_len: *mut u32,
     ) -> c_int;
-    fn r8125_bridge_rx_pool_destroy(ndev: *mut bindings::net_device);
+    fn r8125_bridge_rx_pool_destroy(ndev: *mut bindings::net_device, queue_id: c_uint);
     fn r8125_bridge_rx_alloc(
         ndev: *mut bindings::net_device,
+        queue_id: c_uint,
         out_cpu: *mut *mut c_void,
         out_dma: *mut bindings::dma_addr_t,
     ) -> c_int;
-    fn r8125_bridge_rx_free(ndev: *mut bindings::net_device, cpu: *mut c_void);
+    fn r8125_bridge_rx_free(ndev: *mut bindings::net_device, queue_id: c_uint, cpu: *mut c_void);
 
     // RX super-call (Candidate B + #3): zero-copy napi_build_skb +
     // page-pool recycle, with alloc-before-consume refill. Outputs the
@@ -284,6 +290,7 @@ extern "C" {
     // re-posts the descriptor. On drop the outputs equal the inputs.
     fn r8125_bridge_rx_one_packet(
         ndev: *mut bindings::net_device,
+        queue_id: c_uint,
         dma: bindings::dma_addr_t,
         buf: *const core::ffi::c_void,
         len: usize,
@@ -421,6 +428,21 @@ pub(crate) fn alloc_one_irq_vector(
     pdev.alloc_irq_vectors(1, 1, irq_types).map(|_range| ())
 }
 
+/// Allocate an exact IRQ-vector range for `pdev`.
+///
+/// RTL8125B ISR version 2 maps interrupt source bits directly to MSI-X table
+/// entries. TX Q0 is entry 16 and LINKCHG is entry 21, so callers must allocate
+/// at least 22 vectors before enabling V2.
+pub(crate) fn alloc_irq_vectors(
+    pdev: &pci::Device<kernel::device::Core>,
+    min_vecs: u32,
+    max_vecs: u32,
+    irq_types: pci::IrqTypes,
+) -> Result<()> {
+    pdev.alloc_irq_vectors(min_vecs, max_vecs, irq_types)
+        .map(|_range| ())
+}
+
 /// `pci_irq_vector(pdev, index)` — fetch the kernel IRQ number for the
 /// vector at `index`. Returns a `u32` rather than an `IrqVector` because
 /// the call sites pass the number into `request_threaded_irq`, which
@@ -462,11 +484,20 @@ pub(crate) fn pci_irq_vector<Ctx: device::DeviceContext>(
 /// `ndev` is the registered net_device; called once per ndo_open with no
 /// pool currently live (the cshim WARNs on a double-create). Must be
 /// balanced by `rx_pool_destroy` after all slots are freed.
-pub(crate) fn rx_pool_create(ndev: *mut bindings::net_device, ring_len: usize) -> Result<u32> {
+pub(crate) fn rx_pool_create(
+    ndev: *mut bindings::net_device,
+    queue_id: u32,
+    ring_len: usize,
+) -> Result<u32> {
     let mut buf_len: u32 = 0;
     // SAFETY: see fn-level contract; out-pointer is a stack local.
     let rc = unsafe {
-        r8125_bridge_rx_pool_create(ndev, ring_len as c_uint, core::ptr::from_mut(&mut buf_len))
+        r8125_bridge_rx_pool_create(
+            ndev,
+            queue_id as c_uint,
+            ring_len as c_uint,
+            core::ptr::from_mut(&mut buf_len),
+        )
     };
     to_result(rc)?;
     Ok(buf_len)
@@ -475,10 +506,10 @@ pub(crate) fn rx_pool_create(ndev: *mut bindings::net_device, ring_len: usize) -
 /// Destroy the RX page_pool. Idempotent against a NULL pool (ndo_open
 /// rollback before create). Every slot MUST already be freed via
 /// `rx_free` — page_pool_destroy requires all pages returned first.
-pub(crate) fn rx_pool_destroy(ndev: *mut bindings::net_device) {
+pub(crate) fn rx_pool_destroy(ndev: *mut bindings::net_device, queue_id: u32) {
     // SAFETY: `ndev` is the registered net_device; the cshim no-ops on a
     // NULL pool.
-    unsafe { r8125_bridge_rx_pool_destroy(ndev) };
+    unsafe { r8125_bridge_rx_pool_destroy(ndev, queue_id as c_uint) };
 }
 
 /// Pull one buffer from the pool for a slot. Returns `(cpu, dma)`.
@@ -490,6 +521,7 @@ pub(crate) fn rx_pool_destroy(ndev: *mut bindings::net_device) {
 /// the stack via the recycle path in `bridge_rx_one_packet`.
 pub(crate) fn rx_alloc(
     ndev: *mut bindings::net_device,
+    queue_id: u32,
 ) -> Result<(*mut c_void, bindings::dma_addr_t)> {
     let mut cpu: *mut c_void = core::ptr::null_mut();
     let mut dma: bindings::dma_addr_t = 0;
@@ -497,6 +529,7 @@ pub(crate) fn rx_alloc(
     let rc = unsafe {
         r8125_bridge_rx_alloc(
             ndev,
+            queue_id as c_uint,
             core::ptr::from_mut(&mut cpu),
             core::ptr::from_mut(&mut dma),
         )
@@ -508,10 +541,10 @@ pub(crate) fn rx_alloc(
 /// Return one slot's page to the pool. Idempotent against a null `cpu`
 /// (the empty-slot sentinel) so the ndo_open rollback path can call it on
 /// partially-allocated state.
-pub(crate) fn rx_free(ndev: *mut bindings::net_device, cpu: *mut c_void) {
+pub(crate) fn rx_free(ndev: *mut bindings::net_device, queue_id: u32, cpu: *mut c_void) {
     // SAFETY: `cpu` is either null (no-op) or a page base from a prior
     // `rx_alloc` on the same pool.
-    unsafe { r8125_bridge_rx_free(ndev, cpu) };
+    unsafe { r8125_bridge_rx_free(ndev, queue_id as c_uint, cpu) };
 }
 
 /// RX super-call: zero-copy `napi_build_skb` + page-pool recycle +
@@ -524,8 +557,10 @@ pub(crate) fn rx_free(ndev: *mut bindings::net_device, cpu: *mut c_void) {
 /// `NetdevHandle`); `dma`/`buf` came from a prior `rx_alloc` on the live
 /// pool; `len` ≤ chip-reported frame length, ≤ the pool's `max_len`.
 /// Callable only from NAPI poll context.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn bridge_rx_one_packet(
     ndev: *mut bindings::net_device,
+    queue_id: u32,
     dma: bindings::dma_addr_t,
     buf: *const core::ffi::c_void,
     len: usize,
@@ -539,6 +574,7 @@ pub(crate) fn bridge_rx_one_packet(
     unsafe {
         r8125_bridge_rx_one_packet(
             ndev,
+            queue_id as c_uint,
             dma,
             buf,
             len,
@@ -778,15 +814,19 @@ pub(crate) fn tx_busy_exception(ndev: *mut bindings::net_device) {
 
 // ── NAPI / queue / carrier helpers ────────────────────────────────────────
 
-pub(crate) fn bridge_napi_schedule(ndev: *mut bindings::net_device) {
+pub(crate) fn bridge_napi_schedule(ndev: *mut bindings::net_device, queue_id: u32) {
     // SAFETY: ndev is alive (registered until NetdevHandle drops).
-    unsafe { r8125_bridge_napi_schedule(ndev) };
+    unsafe { r8125_bridge_napi_schedule(ndev, queue_id as c_uint) };
 }
 
-pub(crate) fn bridge_napi_complete_done(ndev: *mut bindings::net_device, work_done: c_int) {
+pub(crate) fn bridge_napi_complete_done(
+    ndev: *mut bindings::net_device,
+    queue_id: u32,
+    work_done: c_int,
+) {
     // SAFETY: as above; called from NAPI poll context which guarantees the
     // napi_struct is valid.
-    unsafe { r8125_bridge_napi_complete_done(ndev, work_done) };
+    unsafe { r8125_bridge_napi_complete_done(ndev, queue_id as c_uint, work_done) };
 }
 
 /// Suggest IRQ CPU affinity for the chip's MSI-X / MSI / INTx vector.

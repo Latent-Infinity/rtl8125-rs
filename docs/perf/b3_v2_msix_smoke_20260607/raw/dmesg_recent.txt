@@ -1,0 +1,320 @@
+[168892.754473] igc 0000:04:00.0 enp4s0: NIC Link is Down
+[168892.847938] r8125_rust: r8125_rust: INT_MITI timers use_v2=false RX=0x0008/rb=0x0008 TX=0x0010/rb=0x0010
+[168892.868760] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=false IRQ=68 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x0000002f ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x00 PHYStatus=0x81 tx_dma=0x00000000fde1a000 rx_dma=0x00000000ffcd0000
+[168892.869182] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[168896.025791] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[168896.999511] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[168904.091754] r8125_rust: r8125_rust ndo_stop: xmit_calls=0 irq_fires=0 napi_polls=0 tx_doorbells=0
+[168904.091765] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[168904.093588] igc 0000:04:00.0 enp4s0: NIC Link is Down
+[168904.187051] r8125_rust: r8125_rust: INT_MITI timers use_v2=false RX=0x0008/rb=0x0008 TX=0x0010/rb=0x0010
+[168904.207865] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=false IRQ=68 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x0000002f ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x00 PHYStatus=0x81 tx_dma=0x00000000fde1a000 rx_dma=0x00000000ffcd0000
+[168904.208288] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[168907.635006] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[168908.326625] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[169160.421171] audit: type=1400 audit(1780852407.276:568): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=107870 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[169262.052482] audit: type=1400 audit(1780852508.906:569): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=107936 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[169330.040886] audit: type=1400 audit(1780852576.894:570): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=108333 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[169330.315060] r8125_rust: r8125_rust ndo_stop: xmit_calls=0 irq_fires=0 napi_polls=0 tx_doorbells=0
+[169330.315090] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[169330.317468] igc 0000:04:00.0 enp4s0: NIC Link is Down
+[169330.450246] r8125_rust 0000:03:00.0: RTL8125 probe: vendor=REALTEK device=0x8125 rev=0x05
+[169330.450289] r8125_rust 0000:03:00.0: RTL8125 chip identified: RTL8125B (MAC version Rtl8125B)
+[169330.450308] r8125_rust 0000:03:00.0: RTL8125 reset OK
+[169330.450310] r8125_rust 0000:03:00.0: ASPM: PCI Status=0x1010 CAP_LIST=1 — cap-list walk + policy deferred until kernel::pci or cshim exposes ASPM control (no fallible config read and no ASPM API yet; see src/pm.rs)
+[169330.450337] r8125_rust 0000:03:00.0: DMA rings allocated: TX dma=0x00000000adb28000 RX dma=0x00000000bccac000 (256 descriptors each, +1 tail canary)
+[169330.450728] r8125_rust 0000:03:00.0: RTL8125 IRQ allocated: vector#0 = IRQ 68 (mode=Msi, use_v2=false)
+[169330.450731] r8125_rust 0000:03:00.0: RTL8125 IRQ 68 affinity hint set to CPU 0 (policy=255)
+[169330.452153] r8125_rust 0000:03:00.0: r8125_rust: PHY attached: Realtek Internal NBASE-T PHY (phy_id=0x001cc840)
+[169330.452156] r8125_rust 0000:03:00.0: r8125_rust netdev registered: MAC 38:05:25:36:a6:1d (M4-full)
+[169330.452846] r8125_rust 0000:03:00.0 enp3s0: renamed from eth0
+[169330.555962] r8125_rust: r8125_rust: INT_MITI timers use_v2=false RX=0x0008/rb=0x0008 TX=0x0010/rb=0x0010
+[169330.576426] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=false IRQ=68 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x0000002f ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x00 PHYStatus=0x88 tx_dma=0x00000000adb28000 rx_dma=0x00000000bccac000
+[169330.576572] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[169333.881883] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[169334.463719] r8125_rust: r8125_rust ndo_stop: xmit_calls=0 irq_fires=0 napi_polls=0 tx_doorbells=0
+[169334.465519] igc 0000:04:00.0 enp4s0: NIC Link is Down
+[169334.582035] r8125_rust: r8125_rust: INT_MITI timers use_v2=false RX=0x0008/rb=0x0008 TX=0x0010/rb=0x0010
+[169334.602841] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=false IRQ=68 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x0000002f ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x00 PHYStatus=0x88 tx_dma=0x00000000adb28000 rx_dma=0x00000000bccac000
+[169334.603037] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[169337.581943] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[169337.707929] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[169361.467575] igc 0000:04:00.0 enp4s0: PHC removed
+[169362.560929] igc 0000:04:00.0: PCIe PTM not supported by PCIe bus/controller
+[169362.591726] igc 0000:04:00.0 (unnamed net_device) (uninitialized): PHC added
+[169362.619502] igc 0000:04:00.0: 4.000 Gb/s available PCIe bandwidth (5.0 GT/s PCIe x1 link)
+[169362.619517] igc 0000:04:00.0 eth0: MAC: 38:05:25:36:a6:1e
+[169362.622275] igc 0000:04:00.0 enp4s0: renamed from eth0
+[169363.308297] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[169367.819277] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[169368.428325] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[169412.409298] audit: type=1400 audit(1780852659.262:571): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=108916 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[169412.505573] audit: type=1400 audit(1780852659.358:572): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=108953 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[169624.655884] audit: type=1400 audit(1780852871.506:573): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=110399 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[169624.656078] audit: type=1400 audit(1780852871.506:574): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=110398 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[169624.657620] audit: type=1400 audit(1780852871.507:575): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=110400 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[169818.445291] audit: type=1400 audit(1780853065.293:576): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=111383 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[169818.510865] audit: type=1400 audit(1780853065.358:577): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=111420 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[169818.513050] audit: type=1400 audit(1780853065.361:578): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=111421 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[169954.384420] audit: type=1400 audit(1780853201.230:579): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=111532 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[170808.985994] audit: type=1400 audit(1780854055.822:580): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=111660 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[170892.949863] audit: type=1400 audit(1780854139.785:581): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=111780 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[170956.639700] audit: type=1400 audit(1780854203.474:582): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=111855 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[170975.145384] r8125_rust: r8125_rust ndo_stop: xmit_calls=0 irq_fires=0 napi_polls=0 tx_doorbells=0
+[170975.145395] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[170975.147463] igc 0000:04:00.0 enp4s0: NIC Link is Down
+[170976.251025] r8125_rust: r8125_rust: INT_MITI timers use_v2=false RX=0x0008/rb=0x0008 TX=0x0010/rb=0x0010
+[170976.271818] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=false IRQ=68 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x0000002f ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x00 PHYStatus=0x88 tx_dma=0x00000000adb28000 rx_dma=0x00000000bccac000
+[170976.271978] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[170979.512923] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[170980.350954] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[171072.255220] audit: type=1400 audit(1780854319.088:583): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=112168 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[171090.647025] r8125_rust: r8125_rust ndo_stop: xmit_calls=0 irq_fires=0 napi_polls=0 tx_doorbells=0
+[171090.647037] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171090.648825] igc 0000:04:00.0 enp4s0: NIC Link is Down
+[171091.753367] r8125_rust: r8125_rust: INT_MITI timers use_v2=false RX=0x0008/rb=0x0008 TX=0x0010/rb=0x0010
+[171091.774362] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=false IRQ=68 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x0000002f ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x00 PHYStatus=0x88 tx_dma=0x00000000adb28000 rx_dma=0x00000000bccac000
+[171091.774560] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171095.017259] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[171095.872054] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[171097.419115] r8125_rust: r8125_rust ndo_stop: xmit_calls=0 irq_fires=0 napi_polls=0 tx_doorbells=0
+[171097.419129] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171097.420878] igc 0000:04:00.0 enp4s0: NIC Link is Down
+[171097.523463] r8125_rust: r8125_rust: INT_MITI timers use_v2=false RX=0x0008/rb=0x0008 TX=0x0010/rb=0x0010
+[171097.543896] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=false IRQ=68 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x0000002f ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x00 PHYStatus=0x88 tx_dma=0x00000000adb28000 rx_dma=0x00000000bccac000
+[171097.544065] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171100.541324] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[171100.607975] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[171141.356330] audit: type=1400 audit(1780854388.189:584): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=112370 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[171142.592371] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171145.753812] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[171146.688904] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[171154.881027] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171157.569981] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[171157.952997] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[171190.739380] r8125_rust: r8125_rust ndo_stop: xmit_calls=0 irq_fires=0 napi_polls=0 tx_doorbells=0
+[171190.739395] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171190.740996] igc 0000:04:00.0 enp4s0: NIC Link is Down
+[171190.921486] r8125_rust: r8125_rust: INT_MITI timers use_v2=false RX=0x0008/rb=0x0008 TX=0x0010/rb=0x0010
+[171190.942284] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=false IRQ=68 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x0000002f ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x00 PHYStatus=0x88 tx_dma=0x00000000adb28000 rx_dma=0x00000000bccac000
+[171190.942442] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171194.252372] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[171195.073387] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[171195.537286] r8125_rust: r8125_rust ndo_stop: xmit_calls=0 irq_fires=0 napi_polls=0 tx_doorbells=0
+[171195.537299] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171195.539012] igc 0000:04:00.0 enp4s0: NIC Link is Down
+[171195.632506] r8125_rust: r8125_rust: INT_MITI timers use_v2=false RX=0x0008/rb=0x0008 TX=0x0010/rb=0x0010
+[171195.653346] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=false IRQ=68 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x0000002f ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x00 PHYStatus=0x81 tx_dma=0x00000000adb28000 rx_dma=0x00000000bccac000
+[171195.653806] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171198.807431] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[171199.745522] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[171250.281093] audit: type=1400 audit(1780854497.112:585): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=112612 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[171269.612321] r8125_rust: r8125_rust ndo_stop: xmit_calls=0 irq_fires=0 napi_polls=0 tx_doorbells=0
+[171269.612330] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171269.613889] igc 0000:04:00.0 enp4s0: NIC Link is Down
+[171270.718396] r8125_rust: r8125_rust: INT_MITI timers use_v2=false RX=0x0008/rb=0x0008 TX=0x0010/rb=0x0010
+[171270.739264] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=false IRQ=68 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x0000002f ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x00 PHYStatus=0x88 tx_dma=0x00000000adb28000 rx_dma=0x00000000bccac000
+[171270.739452] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171273.973325] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[171274.818103] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[171276.365876] r8125_rust: r8125_rust ndo_stop: xmit_calls=0 irq_fires=0 napi_polls=0 tx_doorbells=0
+[171276.365891] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171276.367968] igc 0000:04:00.0 enp4s0: NIC Link is Down
+[171276.570495] r8125_rust: r8125_rust: INT_MITI timers use_v2=false RX=0x0008/rb=0x0008 TX=0x0010/rb=0x0010
+[171276.591252] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=false IRQ=68 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x0000002f ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x00 PHYStatus=0x88 tx_dma=0x00000000adb28000 rx_dma=0x00000000bccac000
+[171276.591451] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171279.894389] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[171280.706417] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[171282.188054] r8125_rust: r8125_rust ndo_stop: xmit_calls=0 irq_fires=0 napi_polls=0 tx_doorbells=0
+[171282.188068] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171282.191030] igc 0000:04:00.0 enp4s0: NIC Link is Down
+[171282.388583] r8125_rust: r8125_rust: INT_MITI timers use_v2=false RX=0x0008/rb=0x0008 TX=0x0010/rb=0x0010
+[171282.409324] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=false IRQ=68 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x0000002f ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x00 PHYStatus=0x88 tx_dma=0x00000000adb28000 rx_dma=0x00000000bccac000
+[171282.409522] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171285.634422] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[171286.530456] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[171350.129010] audit: type=1400 audit(1780854596.960:586): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=112919 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[171368.662481] r8125_rust: r8125_rust ndo_stop: xmit_calls=0 irq_fires=0 napi_polls=0 tx_doorbells=0
+[171368.662490] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171368.663999] igc 0000:04:00.0 enp4s0: NIC Link is Down
+[171369.768581] r8125_rust: r8125_rust: INT_MITI timers use_v2=false RX=0x0008/rb=0x0008 TX=0x0010/rb=0x0010
+[171369.788960] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=false IRQ=68 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x0000002f ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x00 PHYStatus=0x88 tx_dma=0x00000000adb28000 rx_dma=0x00000000bccac000
+[171369.789134] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171372.789435] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[171372.867253] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[171374.415392] r8125_rust: r8125_rust ndo_stop: xmit_calls=0 irq_fires=0 napi_polls=0 tx_doorbells=0
+[171374.415405] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171374.417091] igc 0000:04:00.0 enp4s0: NIC Link is Down
+[171374.617638] r8125_rust: r8125_rust: INT_MITI timers use_v2=false RX=0x0008/rb=0x0008 TX=0x0010/rb=0x0010
+[171374.638371] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=false IRQ=68 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x0000002f ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x00 PHYStatus=0x88 tx_dma=0x00000000adb28000 rx_dma=0x00000000bccac000
+[171374.638536] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171377.776492] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[171378.755609] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[171380.236461] r8125_rust: r8125_rust ndo_stop: xmit_calls=0 irq_fires=0 napi_polls=0 tx_doorbells=0
+[171380.236476] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171380.238151] igc 0000:04:00.0 enp4s0: NIC Link is Down
+[171380.439747] r8125_rust: r8125_rust: INT_MITI timers use_v2=false RX=0x0008/rb=0x0008 TX=0x0010/rb=0x0010
+[171380.460477] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=false IRQ=68 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x0000002f ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x00 PHYStatus=0x88 tx_dma=0x00000000adb28000 rx_dma=0x00000000bccac000
+[171380.460638] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171383.802585] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[171384.579611] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[171393.255511] r8125_rust: r8125_rust ndo_stop: xmit_calls=0 irq_fires=0 napi_polls=0 tx_doorbells=0
+[171393.255522] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171393.258293] igc 0000:04:00.0 enp4s0: NIC Link is Down
+[171394.314455] r8125_rust 0000:03:00.0: RTL8125 probe: vendor=REALTEK device=0x8125 rev=0x05
+[171394.314525] r8125_rust 0000:03:00.0: RTL8125 chip identified: RTL8125B (MAC version Rtl8125B)
+[171394.314546] r8125_rust 0000:03:00.0: RTL8125 reset OK
+[171394.314548] r8125_rust 0000:03:00.0: ASPM: PCI Status=0x1010 CAP_LIST=1 — cap-list walk + policy deferred until kernel::pci or cshim exposes ASPM control (no fallible config read and no ASPM API yet; see src/pm.rs)
+[171394.314573] r8125_rust 0000:03:00.0: DMA rings allocated: TX dma=0x00000000b2b32000 RX dma=0x00000000b5638000 (256 descriptors each, +1 tail canary)
+[171394.314982] r8125_rust 0000:03:00.0: RTL8125 IRQ allocated: vector#0 = IRQ 68 (mode=Msi, use_v2=false)
+[171394.314985] r8125_rust 0000:03:00.0: RTL8125 IRQ 68 affinity hint set to CPU 0 (policy=255)
+[171394.316740] r8125_rust 0000:03:00.0: r8125_rust: PHY attached: Realtek Internal NBASE-T PHY (phy_id=0x001cc840)
+[171394.316743] r8125_rust 0000:03:00.0: r8125_rust netdev registered: MAC 38:05:25:36:a6:1d (M4-full)
+[171394.317032] r8125_rust 0000:03:00.0 enp3s0: renamed from eth0
+[171394.418858] r8125_rust: r8125_rust: INT_MITI timers use_v2=false RX=0x0008/rb=0x0008 TX=0x0010/rb=0x0010
+[171394.439827] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=false IRQ=68 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x0000002f ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x00 PHYStatus=0x88 tx_dma=0x00000000b2b32000 rx_dma=0x00000000b5638000
+[171394.440028] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171397.685722] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[171398.531786] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[171409.615553] r8125_rust: r8125_rust ndo_stop: xmit_calls=0 irq_fires=0 napi_polls=0 tx_doorbells=0
+[171409.615579] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171409.617502] igc 0000:04:00.0 enp4s0: NIC Link is Down
+[171478.730102] audit: type=1400 audit(1780854725.558:587): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=113487 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[171479.230867] r8125_rust: r8125_rust: INT_MITI timers use_v2=false RX=0x0008/rb=0x0008 TX=0x0010/rb=0x0010
+[171479.251618] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=false IRQ=68 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x0000002f ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x00 PHYStatus=0x88 tx_dma=0x00000000b2b32000 rx_dma=0x00000000b5638000
+[171479.251780] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171482.488696] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[171483.332363] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[171501.934325] r8125_rust: r8125_rust ndo_stop: xmit_calls=0 irq_fires=0 napi_polls=0 tx_doorbells=0
+[171501.934336] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171501.936552] igc 0000:04:00.0 enp4s0: NIC Link is Down
+[171503.041105] r8125_rust: r8125_rust: INT_MITI timers use_v2=false RX=0x0008/rb=0x0008 TX=0x0010/rb=0x0010
+[171503.061893] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=false IRQ=68 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x0000002f ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x00 PHYStatus=0x88 tx_dma=0x00000000b2b32000 rx_dma=0x00000000b5638000
+[171503.062081] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171506.311973] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[171507.140779] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[171508.694458] r8125_rust: r8125_rust ndo_stop: xmit_calls=0 irq_fires=0 napi_polls=0 tx_doorbells=0
+[171508.694472] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171508.696653] igc 0000:04:00.0 enp4s0: NIC Link is Down
+[171508.913102] r8125_rust: r8125_rust: INT_MITI timers use_v2=false RX=0x0008/rb=0x0008 TX=0x0010/rb=0x0010
+[171508.934074] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=false IRQ=68 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x0000002f ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x00 PHYStatus=0x88 tx_dma=0x00000000b2b32000 rx_dma=0x00000000b5638000
+[171508.934233] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171512.252068] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[171513.028739] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[171514.583000] r8125_rust: r8125_rust ndo_stop: xmit_calls=0 irq_fires=0 napi_polls=0 tx_doorbells=0
+[171514.583015] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171514.585702] igc 0000:04:00.0 enp4s0: NIC Link is Down
+[171514.798175] r8125_rust: r8125_rust: INT_MITI timers use_v2=false RX=0x0008/rb=0x0008 TX=0x0010/rb=0x0010
+[171514.819009] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=false IRQ=68 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x0000002f ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x00 PHYStatus=0x88 tx_dma=0x00000000b2b32000 rx_dma=0x00000000b5638000
+[171514.819172] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171518.046115] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[171518.916809] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[171527.688650] r8125_rust: r8125_rust ndo_stop: xmit_calls=0 irq_fires=0 napi_polls=0 tx_doorbells=0
+[171527.688660] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171527.690847] igc 0000:04:00.0 enp4s0: NIC Link is Down
+[171528.785086] r8125_rust 0000:03:00.0: RTL8125 probe: vendor=REALTEK device=0x8125 rev=0x05
+[171528.785132] r8125_rust 0000:03:00.0: RTL8125 chip identified: RTL8125B (MAC version Rtl8125B)
+[171528.785151] r8125_rust 0000:03:00.0: RTL8125 reset OK
+[171528.785153] r8125_rust 0000:03:00.0: ASPM: PCI Status=0x1010 CAP_LIST=1 — cap-list walk + policy deferred until kernel::pci or cshim exposes ASPM control (no fallible config read and no ASPM API yet; see src/pm.rs)
+[171528.785170] r8125_rust 0000:03:00.0: DMA rings allocated: TX dma=0x00000000b51a8000 RX dma=0x00000000aef04000 (256 descriptors each, +1 tail canary)
+[171528.785556] r8125_rust 0000:03:00.0: RTL8125 IRQ allocated: vector#0 = IRQ 68 (mode=Msi, use_v2=false)
+[171528.785559] r8125_rust 0000:03:00.0: RTL8125 IRQ 68 affinity hint set to CPU 0 (policy=255)
+[171528.787234] r8125_rust 0000:03:00.0: r8125_rust: PHY attached: Realtek Internal NBASE-T PHY (phy_id=0x001cc840)
+[171528.787237] r8125_rust 0000:03:00.0: r8125_rust netdev registered: MAC 38:05:25:36:a6:1d (M4-full)
+[171528.787661] r8125_rust 0000:03:00.0 enp3s0: renamed from eth0
+[171529.015507] r8125_rust: r8125_rust: INT_MITI timers use_v2=false RX=0x0008/rb=0x0008 TX=0x0010/rb=0x0010
+[171529.036274] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=false IRQ=68 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x0000002f ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x00 PHYStatus=0x88 tx_dma=0x00000000b51a8000 rx_dma=0x00000000aef04000
+[171529.036476] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[171532.280281] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[171533.124942] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[171562.089516] audit: type=1400 audit(1780854808.917:588): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=114042 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[171562.089524] audit: type=1400 audit(1780854808.917:589): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=114041 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[178375.123141] audit: type=1400 audit(1780861621.874:590): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=114401 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[178474.558793] audit: type=1400 audit(1780861721.308:591): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=114840 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[178474.976459] r8125_rust: r8125_rust ndo_stop: xmit_calls=0 irq_fires=0 napi_polls=0 tx_doorbells=0
+[178474.976474] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[178474.978292] igc 0000:04:00.0 enp4s0: NIC Link is Down
+[178475.035283] r8125_rust 0000:03:00.0: RTL8125 probe: vendor=REALTEK device=0x8125 rev=0x05
+[178475.035316] r8125_rust 0000:03:00.0: RTL8125 chip identified: RTL8125B (MAC version Rtl8125B)
+[178475.035337] r8125_rust 0000:03:00.0: RTL8125 reset OK
+[178475.035339] r8125_rust 0000:03:00.0: ASPM: PCI Status=0x1010 CAP_LIST=1 — cap-list walk + policy deferred until kernel::pci or cshim exposes ASPM control (no fallible config read and no ASPM API yet; see src/pm.rs)
+[178475.035351] r8125_rust 0000:03:00.0: DMA rings allocated: TX dma=0x00000000bbf04000 RX dma=0x00000000aa9e8000 (256 descriptors each, +1 tail canary)
+[178475.035720] r8125_rust 0000:03:00.0: RTL8125 IRQ allocated: vector#0 = IRQ 68 (mode=Msi, use_v2=false)
+[178475.035722] r8125_rust 0000:03:00.0: RTL8125 IRQ 68 affinity hint set to CPU 0 (policy=255)
+[178475.036985] r8125_rust 0000:03:00.0: r8125_rust: PHY attached: Realtek Internal NBASE-T PHY (phy_id=0x001cc840)
+[178475.036988] r8125_rust 0000:03:00.0: r8125_rust netdev registered: MAC 38:05:25:36:a6:1d (M4-full)
+[178475.037475] r8125_rust 0000:03:00.0 enp3s0: renamed from eth0
+[178475.270666] r8125_rust: r8125_rust: INT_MITI timers use_v2=false RX=0x0008/rb=0x0008 TX=0x0010/rb=0x0010
+[178475.291628] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=false IRQ=68 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x0000002f ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x00 PHYStatus=0x88 tx_dma=0x00000000bbf04000 rx_dma=0x00000000aa9e8000
+[178475.291826] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[178478.532687] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[178479.379390] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[178497.969322] r8125_rust: r8125_rust ndo_stop: xmit_calls=0 irq_fires=0 napi_polls=0 tx_doorbells=0
+[178497.969332] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[178497.971538] igc 0000:04:00.0 enp4s0: NIC Link is Down
+[178499.075063] r8125_rust: r8125_rust: INT_MITI timers use_v2=false RX=0x0008/rb=0x0008 TX=0x0010/rb=0x0010
+[178499.095907] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=false IRQ=68 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x0000002f ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x00 PHYStatus=0x88 tx_dma=0x00000000bbf04000 rx_dma=0x00000000aa9e8000
+[178499.096103] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[178502.358980] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[178503.187671] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[178504.743862] r8125_rust: r8125_rust ndo_stop: xmit_calls=0 irq_fires=0 napi_polls=0 tx_doorbells=0
+[178504.743877] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[178504.745628] igc 0000:04:00.0 enp4s0: NIC Link is Down
+[178504.956132] r8125_rust: r8125_rust: INT_MITI timers use_v2=false RX=0x0008/rb=0x0008 TX=0x0010/rb=0x0010
+[178504.976903] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=false IRQ=68 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x0000002f ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x00 PHYStatus=0x88 tx_dma=0x00000000bbf04000 rx_dma=0x00000000aa9e8000
+[178504.977094] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[178508.208064] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[178509.075743] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[178510.631184] r8125_rust: r8125_rust ndo_stop: xmit_calls=0 irq_fires=0 napi_polls=0 tx_doorbells=0
+[178510.631198] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[178510.632713] igc 0000:04:00.0 enp4s0: NIC Link is Down
+[178510.845176] r8125_rust: r8125_rust: INT_MITI timers use_v2=false RX=0x0008/rb=0x0008 TX=0x0010/rb=0x0010
+[178510.866210] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=false IRQ=68 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x0000002f ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x00 PHYStatus=0x88 tx_dma=0x00000000bbf04000 rx_dma=0x00000000aa9e8000
+[178510.866395] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[178514.112102] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[178514.963950] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[178523.718047] r8125_rust: r8125_rust ndo_stop: xmit_calls=0 irq_fires=0 napi_polls=0 tx_doorbells=0
+[178523.718059] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[178523.720837] igc 0000:04:00.0 enp4s0: NIC Link is Down
+[178524.775739] r8125_rust 0000:03:00.0: RTL8125 probe: vendor=REALTEK device=0x8125 rev=0x05
+[178524.775783] r8125_rust 0000:03:00.0: RTL8125 chip identified: RTL8125B (MAC version Rtl8125B)
+[178524.775803] r8125_rust 0000:03:00.0: RTL8125 reset OK
+[178524.775805] r8125_rust 0000:03:00.0: ASPM: PCI Status=0x1010 CAP_LIST=1 — cap-list walk + policy deferred until kernel::pci or cshim exposes ASPM control (no fallible config read and no ASPM API yet; see src/pm.rs)
+[178524.775821] r8125_rust 0000:03:00.0: DMA rings allocated: TX dma=0x00000000b35d2000 RX dma=0x00000000b580c000 (256 descriptors each, +1 tail canary)
+[178524.776208] r8125_rust 0000:03:00.0: RTL8125 IRQ allocated: vector#0 = IRQ 68 (mode=Msi, use_v2=false)
+[178524.776211] r8125_rust 0000:03:00.0: RTL8125 IRQ 68 affinity hint set to CPU 0 (policy=255)
+[178524.778058] r8125_rust 0000:03:00.0: r8125_rust: PHY attached: Realtek Internal NBASE-T PHY (phy_id=0x001cc840)
+[178524.778063] r8125_rust 0000:03:00.0: r8125_rust netdev registered: MAC 38:05:25:36:a6:1d (M4-full)
+[178524.778519] r8125_rust 0000:03:00.0 enp3s0: renamed from eth0
+[178525.005301] r8125_rust: r8125_rust: INT_MITI timers use_v2=false RX=0x0008/rb=0x0008 TX=0x0010/rb=0x0010
+[178525.026141] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=false IRQ=68 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x0000002f ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x00 PHYStatus=0x88 tx_dma=0x00000000b35d2000 rx_dma=0x00000000b580c000
+[178525.026348] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[178528.279260] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[178529.107962] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[178559.665756] audit: type=1400 audit(1780861806.414:592): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=115399 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[181149.748890] audit: type=1400 audit(1780864396.468:593): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=115541 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[181268.407470] audit: type=1400 audit(1780864515.125:594): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=115927 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[181270.387011] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[181272.836996] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[181273.458824] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[181298.992008] r8125_rust: r8125_rust ndo_stop: xmit_calls=0 irq_fires=0 napi_polls=0 tx_doorbells=0
+[181298.992022] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[181298.994005] igc 0000:04:00.0 enp4s0: NIC Link is Down
+[181349.706196] audit: type=1400 audit(1780864596.423:595): apparmor="DENIED" operation="open" class="file" profile="who" name="/usr/share/coreutils/locales/uucore/en-US.ftl" pid=116272 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+[181351.077429] r8125_rust 0000:03:00.0: RTL8125 probe: vendor=REALTEK device=0x8125 rev=0x05
+[181351.077467] r8125_rust 0000:03:00.0: RTL8125 chip identified: RTL8125B (MAC version Rtl8125B)
+[181351.077487] r8125_rust 0000:03:00.0: RTL8125 reset OK
+[181351.077489] r8125_rust 0000:03:00.0: ASPM: PCI Status=0x1010 CAP_LIST=1 — cap-list walk + policy deferred until kernel::pci or cshim exposes ASPM control (no fallible config read and no ASPM API yet; see src/pm.rs)
+[181351.077504] r8125_rust 0000:03:00.0: DMA rings allocated: TX dma=0x00000000b0512000 RX dma=0x00000000aef50000 (256 descriptors each, +1 tail canary)
+[181351.079061] r8125_rust 0000:03:00.0: RTL8125 IRQ allocated: rx0 IRQ 68 tx0 IRQ 197 link IRQ 202 (mode=Msi, use_v2=true)
+[181351.079064] r8125_rust 0000:03:00.0: RTL8125 rx0 IRQ 68 affinity hint set to CPU 0 (policy=255)
+[181351.079066] r8125_rust 0000:03:00.0: RTL8125 tx0 IRQ 197 affinity hint set to CPU 0 (policy=255)
+[181351.079067] r8125_rust 0000:03:00.0: RTL8125 link IRQ 202 affinity hint set to CPU 0 (policy=255)
+[181351.080566] r8125_rust 0000:03:00.0: r8125_rust: PHY attached: Realtek Internal NBASE-T PHY (phy_id=0x001cc840)
+[181351.080568] r8125_rust 0000:03:00.0: r8125_rust netdev registered: MAC 38:05:25:36:a6:1d (M4-full)
+[181351.084364] r8125_rust 0000:03:00.0 enp3s0: renamed from eth0
+[181351.185625] r8125_rust: r8125_rust: INT_MITI timers use_v2=true RX=0x0008/rb=0x0008 TX=0x0010/rb=0x0010
+[181351.206938] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=true IRQ=68 tx_irq=197 link_irq=202 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x00000000 ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x01 PHYStatus=0x88 tx_dma=0x00000000b0512000 rx_dma=0x00000000aef50000
+[181351.207135] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[181358.477019] igc 0000:04:00.0 enp4s0: NIC Link is Up 2500 Mbps Full Duplex, Flow Control: RX/TX
+[181359.411928] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx

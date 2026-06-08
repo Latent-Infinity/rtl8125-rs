@@ -51,7 +51,7 @@ fi
 
 # 2. Alloc-before-consume refill: a fresh page is pulled from the pool, and
 #    a refill failure drops the frame (never starves the ring).
-if grep -q 'page_pool_dev_alloc_pages(b->page_pool)' <<<"$body"; then
+if grep -q 'page_pool_dev_alloc_pages(q->page_pool)' <<<"$body"; then
 	grn "RX super-call refills the slot from the page_pool"
 else
 	red "RX super-call must refill the slot via page_pool_dev_alloc_pages"
@@ -74,12 +74,12 @@ fi
 
 # 5. Hot-path order: refill-alloc -> sync_for_cpu -> build_skb ->
 #    mark_for_recycle -> csum -> GRO.
-alloc_line=$(grep -n 'page_pool_dev_alloc_pages(b->page_pool)' <<<"$body" | head -n1 | cut -d: -f1)
+alloc_line=$(grep -n 'page_pool_dev_alloc_pages(q->page_pool)' <<<"$body" | head -n1 | cut -d: -f1)
 cpu_line=$(grep -nE 'dma_sync_single_for_cpu|page_pool_dma_sync_for_cpu' <<<"$body" | head -n1 | cut -d: -f1)
 build_line=$(grep -n 'napi_build_skb(' <<<"$body" | head -n1 | cut -d: -f1)
 recycle_line=$(grep -n 'skb_mark_for_recycle(skb)' <<<"$body" | head -n1 | cut -d: -f1)
 csum_line=$(grep -n 'r8125_bridge_skb_rx_csum_set' <<<"$body" | head -n1 | cut -d: -f1)
-gro_line=$(grep -n 'napi_gro_receive(&b->napi, skb)' <<<"$body" | head -n1 | cut -d: -f1)
+gro_line=$(grep -n 'napi_gro_receive(&q->napi, skb)' <<<"$body" | head -n1 | cut -d: -f1)
 if [[ -n "$alloc_line" && -n "$cpu_line" && -n "$build_line" && -n "$recycle_line" && -n "$csum_line" && -n "$gro_line" ]] \
    && (( alloc_line < cpu_line && cpu_line < build_line && build_line < recycle_line && recycle_line < csum_line && csum_line < gro_line )); then
 	grn "RX super-call preserves refill/sync/build/recycle/csum/GRO order"
@@ -129,15 +129,15 @@ fi
 # The poll must install the refilled buffer the super-call returns, or the
 # next wrap reads a page now owned by the stack (use-after-handoff).
 if echo "$process_rx_body" | awk '
-	/set_rx_slot\(.*RxSlot/ { found = 1; exit }
-	/set_rx_slot\(/ { in_call = 1 }
+	/(set_rx_slot|set_slot)\(.*RxSlot/ { found = 1; exit }
+	/(set_rx_slot|set_slot)\(/ { in_call = 1 }
 	in_call && /RxSlot/ { found = 1; exit }
 	in_call && /^\s*\)/ { in_call = 0 }
 	END { exit (found ? 0 : 1) }
 '; then
 	grn "NAPI RX poll installs the refilled buffer into the slot shadow"
 else
-	red "NAPI RX poll must set_rx_slot() with the refilled (cpu, dma) from the super-call"
+	red "NAPI RX poll must set the queue slot with the refilled (cpu, dma) from the super-call"
 fi
 
 exit "$rc"

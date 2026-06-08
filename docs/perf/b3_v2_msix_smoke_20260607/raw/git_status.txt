@@ -1,0 +1,95 @@
+ M .gitignore
+ M ci/.unsafe-census
+ M ci/CENSUS_JUSTIFICATIONS.md
+ M ci/check_active_soak.sh
+ M ci/check_aspm_both_soaks.sh
+ M ci/check_aspm_idle_soak.sh
+ M ci/check_aspm_on_idle_soak.sh
+ M ci/check_bare_metal_stack_teardown.sh
+ M ci/check_cache_padding.sh
+ M ci/check_clean_contract_docs.sh
+ M ci/check_counter_infrastructure.sh
+ M ci/check_flr_cycle.sh
+ M ci/check_irq_mode_contract.sh
+ M ci/check_isr_v2_paired.sh
+ M ci/check_mdio_bridge.sh
+ M ci/check_napi_contract.sh
+ M ci/check_offload_path.sh
+ M ci/check_packet_mutation.sh
+ M ci/check_rmmod_while_up.sh
+ M ci/check_rx_pool_pages.sh
+ M ci/run_checks.sh
+ M docs/M5_CLOSEOUT.md
+ M docs/M5_PM_GAP.md
+ M docs/M7_PREP.md
+ M docs/RUST_STANDARDS.md
+ M docs/SESSION_RESUME.md
+ M src/README.md
+ M src/hw.rs
+ M src/mmio.rs
+ M src/napi.rs
+ M src/netdev.rs
+ M src/netdev_bridge.c
+ M src/netdev_bridge.h
+ M src/netdev_bridge_counters.c
+ M src/netdev_bridge_ethtool.c
+ M src/netdev_bridge_internal.h
+ M src/netdev_bridge_offload.c
+ M src/netdev_bridge_phy.c
+ M src/netdev_bridge_rx_pool.c
+ M src/pci.rs
+ M src/phy.rs
+ M src/pm.rs
+ M src/r8125_rust_main.rs
+ M src/regs.rs
+ M src/ring.rs
+ M src/skb.rs
+ M src/unsafe_boundary.rs
+?? .claude/
+?? .gitmessage
+?? Documentation/
+?? Kconfig
+?? MAINTAINERS
+?? ci/GATE_INVENTORY.md
+?? ci/HARNESS_PARAMETERS.md
+?? ci/check_aspm_force_off_param.sh
+?? ci/check_bql_accounting.sh
+?? ci/check_checkpatch.sh
+?? ci/check_cshim_loc_caps.sh
+?? ci/check_dma_barriers.sh
+?? ci/check_driver_contract_fuzz.sh
+?? ci/check_hw_offload_features.sh
+?? ci/check_kbuild_static_analyzer.sh
+?? ci/check_latency_knobs.sh
+?? ci/check_no_bridge_exports.sh
+?? ci/check_no_panic_paths.sh
+?? ci/check_rss_queue_contract.sh
+?? ci/check_rustfmt.sh
+?? ci/check_rx_desc_stride.sh
+?? ci/check_rx_skb_build.sh
+?? ci/check_selftest_smoke.sh
+?? ci/check_skb_ownership.sh
+?? ci/check_smatch.sh
+?? ci/check_soak_harness.sh
+?? ci/check_sparse.sh
+?? docs/BQL_RETRY_PLAN.md
+?? docs/CHECKPATCH_NOTES.md
+?? docs/COMMIT_POLICY.md
+?? docs/FAILURE_MODES.md
+?? docs/GATEWAY_HARDWARE.md
+?? docs/LESSONS_LEARNED.md
+?? docs/M7_BLOCK_CADENCE.md
+?? docs/M7_CSHIM_KERNEL_DIFF.md
+?? docs/M7_PRE_RFC_DOSSIER.md
+?? docs/M7_RUST_NETDEV_LANDSCAPE.md
+?? docs/PATTERNS.md
+?? docs/PER_MTU_RX_SIZING.md
+?? docs/POST_SOAK_PLAN.md
+?? docs/RSS_RXHASH_IMPLEMENTATION_PLAN.md
+?? docs/RX_OPTIMIZATION_CANDIDATES.md
+?? docs/UPSTREAM_REVIEW.md
+?? docs/perf/
+?? scripts/
+?? tools/driver_contract_fuzz/
+?? tools/safe_capture.sh
+?? tools/testing/

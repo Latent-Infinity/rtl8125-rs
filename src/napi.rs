@@ -48,8 +48,8 @@ const RX_HASH_INFO_VALUE_MASK: u64 = 0xFFFF_FFFF;
 // Per-descriptor RX length advertised to the chip is now per-MTU (M6 #2
 // v3): the pool's device-writable `buf_len` (already ≤ `DESC_LEN_MASK`,
 // the 14-bit descriptor field). It's read once per poll from
-// `state.rx.buf_len` and reused for both the frame-length clamp and the
-// descriptor LEN field — see `process_rx_completions`.
+// the selected queue's `buf_len` and reused for both the frame-length clamp
+// and the descriptor LEN field — see `process_rx_completions`.
 
 /// Re-arm the chip's interrupt sources to the baseline mask. Branches on
 /// the probe-chosen [`IrqMode`]:
@@ -86,16 +86,19 @@ pub(crate) fn rearm_irq_baseline(state: &NetdevState) {
 /// `BRIDGE_NAPI_WEIGHT`, `netif_set_tso_max_segs`, `netif_set_tso_max_size`.
 pub(crate) const TX_START_THRS: usize = 64;
 
-/// Walk the RX descriptor ring from `state.rx.tail` while OWN-clear
+/// Walk the selected RX queue descriptor ring from its tail while OWN-clear
 /// slots remain and `work_done < budget_u`. Each frame is built into
 /// an skb, hardware-CSUM annotated, handed to GRO, and the descriptor
 /// re-posted with the same slot's DMA address. Returns the new
 /// `work_done` count. Streaming-DMA sync is performed before
 /// (`for_cpu`) and after (`for_device`) the CPU touches the slot — no-op
 /// on x86 cache-coherent DMA but mandatory for ARM/RISC-V portability.
-fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
+fn process_rx_completions(state: &NetdevState, queue_id: u32, budget_u: usize) -> usize {
+    let Some(rx) = state.rx_queue(queue_id) else {
+        return 0;
+    };
     let mut work_done = 0usize;
-    let mut rx_tail = state.rx.tail.inner.load(Ordering::Acquire);
+    let mut rx_tail = rx.tail.inner.load(Ordering::Acquire);
     // Candidate F (RX_OPTIMIZATION_CANDIDATES.md §F): hoist the
     // `ndev` atomic load out of the per-packet loop. `ndev` is
     // invariant across the whole NAPI poll call — load it once.
@@ -104,13 +107,13 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
     // Per-MTU buffer length for this open (M6 #2 v3): drives both the
     // frame-length clamp and the descriptor LEN field. Invariant across
     // the poll, so load once. Already ≤ DESC_LEN_MASK (the cshim caps it).
-    let buf_len = state.rx.buf_len.load(Ordering::Relaxed);
+    let buf_len = rx.buf_len.load(Ordering::Relaxed);
     let buf_desc_len = buf_len & regs::DESC_LEN_MASK;
     let buf_len = buf_len as usize;
     // Resolve the descriptor format ONCE per poll into precomputed byte offsets
     // so the hot loop has no per-packet `match RxDescFormat` and no double read.
-    let parse = crate::ring::RxParse::new(state.rx.format);
-    let rx_ring = state.rx.desc.cast::<u8>();
+    let parse = crate::ring::RxParse::new(rx.format);
+    let rx_ring = rx.desc.cast::<u8>();
     while work_done < budget_u {
         // Cheap OWN check first (single word read, pre-barrier). If the slot is
         // still device-owned it isn't filled yet — stop.
@@ -132,7 +135,7 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
         // Default re-post address is the slot's current DMA buffer (the
         // `len == 0` case below never consumes it, so it stays
         // device-owned and needs no refill).
-        let slot_dma = state.rx.slot_dma[rx_tail].load(Ordering::Relaxed);
+        let slot_dma = rx.slot_dma[rx_tail].load(Ordering::Relaxed);
         let mut post_dma = slot_dma;
         if len > 0 {
             // RX super-call (RX_OPTIMIZATION_CANDIDATES.md §B + per-MTU #3):
@@ -142,7 +145,7 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
             // page; the call returns the slot's new (cpu, dma). On a refill
             // failure it drops the frame and returns the old (cpu, dma)
             // unchanged. The cshim handles all §6.3 counter accounting.
-            let slot_cpu = state.rx.slot_cpu[rx_tail].load(Ordering::Relaxed);
+            let slot_cpu = rx.slot_cpu[rx_tail].load(Ordering::Relaxed);
             let hash_info = if !rx_hash_enabled {
                 0
             } else {
@@ -159,6 +162,7 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
             };
             let (new_cpu, new_dma) = ub::bridge_rx_one_packet(
                 ndev,
+                queue_id,
                 slot_dma,
                 slot_cpu.cast_const(),
                 len,
@@ -169,7 +173,7 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
             // Publish the refilled buffer into the slot shadow so the next
             // wrap-around reads the live page, not the one now owned by the
             // stack. (No-op store on the drop path — values are unchanged.)
-            state.set_rx_slot(
+            rx.set_slot(
                 rx_tail,
                 RxSlot {
                     cpu: new_cpu,
@@ -186,20 +190,20 @@ fn process_rx_completions(state: &NetdevState, budget_u: usize) -> usize {
         }
         // Publish OWN only after addr/opts2 are visible to the device.
         ub::desc_publish_own(
-            state.rx.desc.cast::<u8>(),
+            rx.desc.cast::<u8>(),
             rx_tail,
             crate::ring::Descriptor {
                 opts1,
                 opts2: 0,
                 addr: post_dma,
             },
-            state.rx.format,
+            rx.format,
         );
 
         rx_tail = (rx_tail + 1) % RING_LEN;
         work_done += 1;
     }
-    state.rx.tail.inner.store(rx_tail, Ordering::Release);
+    rx.tail.inner.store(rx_tail, Ordering::Release);
     work_done
 }
 
@@ -307,7 +311,7 @@ fn process_tx_completions(state: &NetdevState) -> (usize, usize, usize) {
 ///
 /// Returns `work_done` in `[0, budget]`. See the module docstring for
 /// the §6.3 / §7-M5 contract this function must satisfy.
-pub(crate) fn poll(state: &NetdevState, budget: c_int) -> c_int {
+pub(crate) fn poll(state: &NetdevState, queue_id: u32, budget: c_int) -> c_int {
     crate::netdev::note_napi_poll(state);
     // `budget == 0` is the explicit "TX-cleanup only" path (plan §7 M5).
     // The kernel uses it during netpoll / netconsole and during certain
@@ -317,7 +321,7 @@ pub(crate) fn poll(state: &NetdevState, budget: c_int) -> c_int {
     // because budget is 0 and work_done starts at 0.
     let budget_u = if budget <= 0 { 0 } else { budget as usize };
 
-    let work_done = process_rx_completions(state, budget_u);
+    let work_done = process_rx_completions(state, queue_id, budget_u);
     let (tx_tail, tx_head, reaped) = process_tx_completions(state);
     if reaped > 0 {
         // Update tx_tail BEFORE waking the queue — kernel xmit code re-
@@ -352,7 +356,7 @@ pub(crate) fn poll(state: &NetdevState, budget: c_int) -> c_int {
         // falls through this branch (0 < 0 is false) so we don't
         // call complete_done in the TX-cleanup-only path.
         let ndev = state.ndev.load(Ordering::Acquire);
-        ub::bridge_napi_complete_done(ndev, work_done);
+        ub::bridge_napi_complete_done(ndev, queue_id, work_done);
         rearm_irq_baseline(state);
     }
     // If `work_done == budget`, return without complete_done so the
