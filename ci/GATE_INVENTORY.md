@@ -63,6 +63,7 @@ they need rewriting against that chip's authoritative source.
 | `check_rx_pool_pages.sh` | `alloc_pages(order=2)` (16 KiB per slot specific to 8125B's jumbo cap) + matching unmap discipline + ndo_open rollback releases jumbo slots |
 | `check_rss_queue_contract.sh` | RTL8125B full-RSS prerequisite: queue-id-aware C/Rust bridge plus vendor RDSAR_Q1 queue-base layout while runtime stays N=1 |
 | `check_rss_hw_programming.sh` | RTL8125B RSS register programming is off-by-default, bounded by owned queues/V2 interrupt ownership, and uses Linux's default indirection helper |
+| `check_rss_multiqueue_hazard.sh` | Full hardware-RSS activation requires a runtime hazard harness proving N>1 queue/IRQ spread, small+fragmented UDP ordering/drop behavior, TCP byte integrity, and no kworker/IRQ runaway |
 | `check_rust_unit_tests.sh` | Runnable host unit tests: compiles the kernel-free `crate::layout` math with `rustc --test` and EXECUTES the assertions (descriptor stride/offset, V3 hash classification, RSS register packing). The only gate that verifies behavior by value, not by shape. Skips cleanly if rustc is absent |
 | `check_packet_mutation.sh` * | (Also netdev-pattern — RTL-side enforcement of TSO MSS 11-bit cap workaround) |
 | `check_flr_cycle.sh` | Function-Level Reset cycle behavior specific to this chip's reset state machine |
@@ -80,8 +81,8 @@ netdev-pattern, partly RTL-specific.
 |---|---:|---|
 | `[generic]` | 11 | minutes (copy + adjust paths) |
 | `[netdev]` | 12 | ~1 h (copy + adjust symbol names) |
-| `[rtl8125]` | 14 | full rewrite per chip (~half a day each) |
-| **Total** | **37** | |
+| `[rtl8125]` | 15 | full rewrite per chip (~half a day each) |
+| **Total** | **38** | |
 
 The 11 `[generic]` + 12 `[netdev]` gates are the **starter pack** the
 next Rust NIC driver project should clone first. Together they

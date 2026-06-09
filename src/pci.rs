@@ -117,7 +117,12 @@ pub(crate) struct R8125Driver {
     #[pin]
     _bar: Devres<pci::Bar<{ mmio::R8125_MMIO_LEN }>>,
     tx_ring: ring::TxRing,
-    rx_ring: ring::RxRing,
+    // One DMA RX ring per (compile-time) RX queue. Only `active_rx_queues()` of
+    // them are populated + posted at runtime; the rest stay idle until a future
+    // `rss_queues` opt-in activates more. Held here so the DMA stays mapped for
+    // the driver's lifetime; `NetdevState.rx_queues[i]` keeps a pointer into
+    // `rx_rings[i]`.
+    rx_rings: [ring::RxRing; crate::netdev::RX_QUEUE_COUNT],
     pdev: ARef<pci::Device>,
 }
 
@@ -210,16 +215,31 @@ impl pci::Driver for R8125Driver {
                     pm::log_aspm(pdev);
                 },
                 tx_ring: ring::TxRing::new(pdev.as_ref())?,
-                rx_ring: ring::RxRing::new(pdev.as_ref())?,
+                // One RX ring per RX queue. `?` propagates an allocation failure
+                // from any queue. RX_QUEUE_COUNT is small (4) so an explicit
+                // array keeps the fallible init readable; the assert pins the
+                // element count to the const so a bump forces updating this site.
+                rx_rings: {
+                    const _: () = assert!(crate::netdev::RX_QUEUE_COUNT == 4);
+                    [
+                        ring::RxRing::new(pdev.as_ref())?,
+                        ring::RxRing::new(pdev.as_ref())?,
+                        ring::RxRing::new(pdev.as_ref())?,
+                        ring::RxRing::new(pdev.as_ref())?,
+                    ]
+                },
                 _: {
                     // M3 cold-ring sanity.
                     tx_ring.verify_canaries()?;
-                    rx_ring.verify_canaries()?;
+                    for r in rx_rings.iter() {
+                        r.verify_canaries()?;
+                    }
                     dev_info!(
                         pdev,
-                        "DMA rings allocated: TX dma=0x{:016x} RX dma=0x{:016x} ({} descriptors each, +1 tail canary)\n",
+                        "DMA rings allocated: TX dma=0x{:016x} RX[0] dma=0x{:016x} x{} queues ({} descriptors each, +1 tail canary)\n",
                         tx_ring.dma_handle(),
-                        rx_ring.dma_handle(),
+                        rx_rings[0].dma_handle(),
+                        crate::netdev::RX_QUEUE_COUNT,
                         ring::RING_LEN
                     );
                 },
@@ -425,10 +445,10 @@ impl pci::Driver for R8125Driver {
                                 tx_ring.desc_ptr_mut(),
                                 tx_ring.dma_handle(),
                             ),
-                            rx_queues <- pin_init::init_array_from_fn(|_| {
+                            rx_queues <- pin_init::init_array_from_fn(|i| {
                                 crate::netdev::RxQueueState::new(
-                                    rx_ring.desc_ptr_mut(),
-                                    rx_ring.dma_handle(),
+                                    rx_rings[i].desc_ptr_mut(),
+                                    rx_rings[i].dma_handle(),
                                     // RXHASH requires the 32-byte V3
                                     // descriptor layout to expose RSSResult.
                                     // Fixed at probe (no per-packet switching).

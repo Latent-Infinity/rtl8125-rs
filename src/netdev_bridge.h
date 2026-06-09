@@ -154,11 +154,33 @@ struct r8125_bridge_ops {
 	 *         to match the effective netdev feature mask.
 	 */
 	int (*set_features)(void *priv, unsigned int feature_flags);
+
+	/*
+	 * rss_indir_check(priv, indir, len) — B5 ethtool set_rxfh validation
+	 * ─────────────────────────────────
+	 * Pre   : RTNL held. `indir` is the kernel ethtool_rxfh_param table of
+	 *         `len` entries (or NULL/0 for no indirection change).
+	 * Post  : returns 0 if every entry maps to an active RX queue, -EINVAL
+	 *         otherwise. `queue_count` is the runtime active queue count
+	 *         reported through ethtool, not the compile-time allocation max.
+	 *         Delegates to the host-tested Rust validator
+	 *         (crate::layout::rxfh_indir_all_valid) so C and Rust cannot
+	 *         disagree on the rule.
+	 */
+	int (*rss_indir_check)(void *priv, const u32 *indir, unsigned int len,
+			       unsigned int queue_count);
 };
 
 #define R8125_BRIDGE_FEATURE_RXCSUM	0x00000001U
 #define R8125_BRIDGE_FEATURE_RXVLAN	0x00000002U
 #define R8125_BRIDGE_FEATURE_RXHASH	0x00000004U
+
+/* RSS table geometry exposed via ethtool (B5). These MUST equal the Rust
+ * source-of-truth constants — regs::RSS_KEY_SIZE (40) and
+ * layout::RSS_INDIR_TBL_ENTRIES (128); ci/check_rss_ethtool.sh asserts it.
+ */
+#define R8125_RSS_KEY_SIZE	40U
+#define R8125_RSS_INDIR_SIZE	128U
 
 /* ──────────────────────────────────────────────────────────────────────
  *  Lifecycle: alloc → register → … → unregister_and_free.

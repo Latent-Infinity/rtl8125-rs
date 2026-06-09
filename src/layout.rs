@@ -164,6 +164,32 @@ pub(crate) const fn key_word(bytes: [u8; 4]) -> u32 {
     u32::from_le_bytes(bytes)
 }
 
+/// Number of RX queues to actually set up from an `rss_queues` request, clamped
+/// to the compile-time maximum (B6). `0` (RSS off / default) means the proven
+/// single-queue path; any non-zero request activates that many queues, capped
+/// at `max`. Centralizing this keeps probe, ndo_open, IRQ wiring, and RSS
+/// programming from each clamping differently.
+#[inline]
+pub(crate) const fn active_rx_queues(rss_queues: u8, max: usize) -> usize {
+    let r = rss_queues as usize;
+    if r == 0 {
+        1
+    } else if r > max {
+        max
+    } else {
+        r
+    }
+}
+
+/// Validate an ethtool RSS indirection table (B5 `set_rxfh`): every bucket must
+/// map to an owned queue (`entry < queue_count`). At the current `N=1` runtime
+/// that means every entry must be 0; the check generalizes once more queues are
+/// owned. An empty slice is vacuously valid (caller passed no indir change).
+#[inline]
+pub(crate) fn rxfh_indir_all_valid(indir: &[u32], queue_count: u32) -> bool {
+    queue_count > 0 && indir.iter().all(|&e| e < queue_count)
+}
+
 // -- TX byte-budget hysteresis (test-5 MSI-safe latency throttle) -----------
 
 /// Wake-predicate core for the TX queue. The queue may resume only when BOTH
@@ -375,5 +401,47 @@ mod tests {
         assert_eq!(tx_budget_shadow_len(1448), 1448);
         assert_eq!(tx_budget_shadow_len(u32::MAX as usize), u32::MAX);
         assert_eq!(tx_budget_shadow_len(u32::MAX as usize + 1), u32::MAX);
+    }
+
+    // ── B5 ethtool rxfh validation ─────────────────────────────────────────
+    #[test]
+    fn indir_valid_single_queue_requires_all_zero() {
+        assert!(rxfh_indir_all_valid(&[0, 0, 0, 0], 1));
+        assert!(!rxfh_indir_all_valid(&[0, 1], 1));
+        assert!(!rxfh_indir_all_valid(&[1], 1));
+    }
+
+    #[test]
+    fn indir_valid_multi_queue_bounds() {
+        assert!(rxfh_indir_all_valid(&[0, 1, 2, 3], 4));
+        assert!(!rxfh_indir_all_valid(&[0, 4], 4)); // 4 not < 4
+        assert!(!rxfh_indir_all_valid(&[0, 1, 2, 3, 99], 4));
+    }
+
+    #[test]
+    fn indir_valid_edge_cases() {
+        assert!(rxfh_indir_all_valid(&[], 1)); // no-change: vacuously valid
+        assert!(!rxfh_indir_all_valid(&[0], 0)); // zero queues: nothing valid
+    }
+
+    // ── B6 active RX queue count ───────────────────────────────────────────
+    #[test]
+    fn active_rx_queues_default_is_single() {
+        // RSS off (0) and explicit 1 both mean the single-queue path.
+        assert_eq!(active_rx_queues(0, 4), 1);
+        assert_eq!(active_rx_queues(1, 4), 1);
+    }
+
+    #[test]
+    fn active_rx_queues_activates_requested() {
+        assert_eq!(active_rx_queues(2, 4), 2);
+        assert_eq!(active_rx_queues(3, 4), 3);
+        assert_eq!(active_rx_queues(4, 4), 4);
+    }
+
+    #[test]
+    fn active_rx_queues_clamps_to_max() {
+        assert_eq!(active_rx_queues(8, 4), 4);
+        assert_eq!(active_rx_queues(255, 4), 4);
     }
 }

@@ -8,10 +8,10 @@
  * has no stable Rust API today: net_device + net_device_ops + NAPI +
  * sk_buff plumbing.
  *
- * Hard cap: 540 LOC including comments. Candidate G/L/M additions and
- * the per-MTU zero-copy RX path fit after dead RX helpers moved out;
- * Queue-id plumbing keeps this TU at the cap while still bounded.
- * See cshim/README.md.
+ * Hard cap: 600 LOC including comments. Candidate G/L/M additions and the
+ * per-MTU zero-copy RX path fit after dead RX helpers moved out; queue-id
+ * plumbing and the B6 multi-queue NAPI lifecycle helpers raised the cap from
+ * 540. See cshim/README.md.
  *
  * Every ndo callback below is a thin delegation to the Rust vtable.
  * Kernel object setup stays here; packet-side counter increments live
@@ -54,15 +54,45 @@ static unsigned int bridge_feature_flags(netdev_features_t features)
 	return flags;
 }
 
+/*
+ * NAPI lifecycle helpers. Every RX queue's NAPI is created/enabled/deleted
+ * together; idle queues beyond the runtime active count are simply never
+ * scheduled (no IRQ routes to them). One loop, one place — so adding queues
+ * cannot leave a site behind operating on rxq[0] only.
+ */
+static void bridge_napi_enable_all(struct r8125_bridge *b)
+{
+	unsigned int i;
+
+	for (i = 0; i < R8125_BRIDGE_RX_QUEUE_COUNT; i++)
+		napi_enable(&b->rxq[i].napi);
+}
+
+static void bridge_napi_disable_all(struct r8125_bridge *b)
+{
+	unsigned int i;
+
+	for (i = 0; i < R8125_BRIDGE_RX_QUEUE_COUNT; i++)
+		napi_disable(&b->rxq[i].napi);
+}
+
+static void bridge_napi_del_all(struct r8125_bridge *b)
+{
+	unsigned int i;
+
+	for (i = 0; i < R8125_BRIDGE_RX_QUEUE_COUNT; i++)
+		netif_napi_del(&b->rxq[i].napi);
+}
+
 static int bridge_ndo_open(struct net_device *ndev)
 {
 	struct r8125_bridge *b = netdev_priv(ndev);
 	int rc;
 
-	napi_enable(&b->rxq[0].napi);
+	bridge_napi_enable_all(b);
 	rc = b->ops.open(b->priv, bridge_feature_flags(ndev->features));
 	if (rc) {
-		napi_disable(&b->rxq[0].napi);
+		bridge_napi_disable_all(b);
 		return rc;
 	}
 	/* Rust open() performs the hardware bring-up and decides when the
@@ -76,7 +106,7 @@ static int bridge_ndo_stop(struct net_device *ndev)
 	struct r8125_bridge *b = netdev_priv(ndev);
 
 	netif_tx_disable(ndev);
-	napi_disable(&b->rxq[0].napi);
+	bridge_napi_disable_all(b);
 	b->ops.stop(b->priv);
 	return 0;
 }
@@ -173,6 +203,7 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 {
 	struct net_device *ndev;
 	struct r8125_bridge *b;
+	unsigned int i;
 
 	ndev = alloc_etherdev(sizeof(*b));
 	if (!ndev)
@@ -244,16 +275,22 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	b->pdev = pdev;
 	b->priv = priv;
 	b->ops = *ops;
-	b->rxq[0].bridge = b;
-	b->rxq[0].queue_id = 0;
+	/* Runtime active count starts at the single-queue default; an rss_queues
+	 * opt-in raises it (B6.3). All MAX NAPI instances are created regardless.
+	 */
+	b->active_rx_queues = 1;
 
 	if (r8125_bridge_counters_alloc(b)) {
 		free_netdev(ndev);
 		return NULL;
 	}
 
-	netif_napi_add_weight(ndev, &b->rxq[0].napi, bridge_napi_poll,
-			      BRIDGE_NAPI_WEIGHT);
+	for (i = 0; i < R8125_BRIDGE_RX_QUEUE_COUNT; i++) {
+		b->rxq[i].bridge = b;
+		b->rxq[i].queue_id = i;
+		netif_napi_add_weight(ndev, &b->rxq[i].napi, bridge_napi_poll,
+				      BRIDGE_NAPI_WEIGHT);
+	}
 	return ndev;
 }
 
@@ -261,7 +298,7 @@ void r8125_bridge_free(struct net_device *ndev)
 {
 	struct r8125_bridge *b = netdev_priv(ndev);
 
-	netif_napi_del(&b->rxq[0].napi);
+	bridge_napi_del_all(b);
 	r8125_bridge_counters_free(b);
 	free_netdev(ndev);
 }
@@ -289,7 +326,7 @@ void r8125_bridge_unregister_and_free(struct net_device *ndev)
 		b->mii_bus = NULL;
 		b->phydev = NULL;
 	}
-	netif_napi_del(&b->rxq[0].napi);
+	bridge_napi_del_all(b);
 	r8125_bridge_counters_free(b);
 	free_netdev(ndev);
 }
@@ -516,11 +553,11 @@ int r8125_bridge_reopen_for_mtu(struct net_device *ndev, int new_mtu)
 		return 0;
 
 	netif_tx_disable(ndev);
-	napi_disable(&b->rxq[0].napi);
+	bridge_napi_disable_all(b);
 	b->ops.stop(b->priv);
 
 	WRITE_ONCE(ndev->mtu, new_mtu);
-	napi_enable(&b->rxq[0].napi);
+	bridge_napi_enable_all(b);
 	rc = b->ops.open(b->priv, bridge_feature_flags(ndev->features));
 	if (!rc)
 		return 0;
@@ -530,7 +567,7 @@ int r8125_bridge_reopen_for_mtu(struct net_device *ndev, int new_mtu)
 	 * requested value.
 	 */
 	WRITE_ONCE(ndev->mtu, old_mtu);
-	napi_disable(&b->rxq[0].napi);
+	bridge_napi_disable_all(b);
 	return rc;
 }
 

@@ -386,3 +386,17 @@ Added one safe wrapper in `src/unsafe_boundary.rs`:
 
 This is a pure mechanical FFI wrapper: no pointers, ownership transfer, MMIO,
 or skb lifetime are involved.
+
+## B5 — ethtool RSS control plane (72 → 73)
+
+Added one unsafe block in `src/unsafe_boundary.rs`:
+
+- `rxfh_indir_valid(ptr, len, queue_count) -> bool` — views the kernel
+  `ethtool_rxfh_param` indirection buffer (`*const u32` + length, allocated by
+  the ethtool core to `get_rxfh_indir_size()` entries) as a read-only,
+  call-scoped slice via `core::slice::from_raw_parts`, then delegates the
+  decision to the host-unit-tested `crate::layout::rxfh_indir_all_valid`. The
+  borrow never outlives the `set_rxfh` call and the buffer is read-only, so no
+  ownership, MMIO, or skb lifetime is involved — only a bounded slice view of a
+  kernel-owned array. This keeps the indirection-validity rule (entry < owned
+  queue count) tested in safe Rust rather than duplicated in C.

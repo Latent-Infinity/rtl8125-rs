@@ -21,7 +21,13 @@
  */
 struct page_pool;	/* zero-copy RX buffer owner (netdev_bridge_rx_pool.c) */
 
-#define R8125_BRIDGE_RX_QUEUE_COUNT	1
+/* Compile-time maximum RX queues = NAPI instances + per-queue state allocated.
+ * RTL8125B HwSuppNumRxQueues is 4. The RUNTIME active count lives in
+ * `r8125_bridge.active_rx_queues` (1 unless rss_queues opts in); ethtool reports
+ * that, while all MAX NAPI instances are created/enabled (idle ones never get
+ * scheduled). Must match Rust `netdev::RX_QUEUE_COUNT`.
+ */
+#define R8125_BRIDGE_RX_QUEUE_COUNT	4
 
 struct r8125_bridge_rx_queue {
 	struct r8125_bridge *bridge;
@@ -45,6 +51,11 @@ struct r8125_bridge {
 	struct net_device *ndev;
 	struct pci_dev *pdev;
 	struct r8125_bridge_rx_queue rxq[R8125_BRIDGE_RX_QUEUE_COUNT];
+	/* RX queues actually active this open (1..RX_QUEUE_COUNT). Reported by
+	 * ethtool get_channels / get_rx_ring_count. Defaults to 1; the Rust side
+	 * updates it when an rss_queues opt-in activates more (B6.3).
+	 */
+	unsigned int active_rx_queues;
 	void *priv;
 	struct r8125_bridge_ops ops;
 

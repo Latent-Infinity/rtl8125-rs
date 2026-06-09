@@ -29,6 +29,12 @@ echo
 echo "== RTL8125B RSS hardware programming contract =="
 bash "$CI/check_rss_hw_programming.sh" || rc=1
 echo
+echo "== B5 ethtool RSS control-plane contract =="
+bash "$CI/check_rss_ethtool.sh" || rc=1
+echo
+echo "== B6 full-RSS hazard harness contract =="
+bash "$CI/check_rss_multiqueue_hazard.sh" || rc=1
+echo
 echo "== build wrapper / BTF path =="
 bash "$CI/check_build_makefile.sh" || rc=1
 echo

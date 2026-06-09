@@ -117,7 +117,29 @@ const BRIDGE_FEATURE_RXCSUM: u32 = 0x0000_0001;
 const BRIDGE_FEATURE_RXVLAN: u32 = 0x0000_0002;
 const BRIDGE_FEATURE_RXHASH: u32 = 0x0000_0004;
 pub(crate) const RX_QUEUE0: u32 = 0;
-pub(crate) const RX_QUEUE_COUNT: usize = 1;
+/// Compile-time maximum RX queues = the DMA rings, NAPI instances, and per-queue
+/// state arrays the driver allocates. RTL8125B's `HwSuppNumRxQueues` is 4. The
+/// *runtime* active count is [`active_rx_queues`] (1 until B6.2/B6.3 lift the
+/// multi-queue activation block).
+pub(crate) const RX_QUEUE_COUNT: usize = 4;
+
+/// Runtime number of RX queues actually set up this open — host-tested clamp in
+/// [`crate::layout::active_rx_queues`]. `rss_queues=0` (default) ⇒ 1 (the proven
+/// single-queue path); multi-queue activation is gated in
+/// [`validate_rss_queue_request`] until the per-vector IRQ + RSS-spread
+/// increments (B6.2/B6.3) land.
+#[inline]
+fn active_rx_queues() -> usize {
+    let requested = *crate::module_parameters::rss_queues.value();
+    if requested > 1 {
+        // B6.1 foundation only: rings/NAPI exist, but queues 1+ are not yet
+        // IRQ-drained. Keep every runtime path on the proven single queue even
+        // if the module parameter changes after open validation.
+        1
+    } else {
+        crate::layout::active_rx_queues(requested, RX_QUEUE_COUNT)
+    }
+}
 
 // RXHASH feature gate for the single-queue hash-reporting path. Hardware RSS
 // remains disabled; this only lets the stack consume descriptor hashes.
@@ -708,6 +730,22 @@ extern "C" fn rust_set_features(cookie: *mut c_void, feature_flags: u32) -> c_in
     0
 }
 
+/// B5 ethtool `set_rxfh` indirection check. Validates the kernel-supplied table
+/// against the owned RX-queue count via the host-tested
+/// `layout::rxfh_indir_all_valid`. Returns 0 (accept) or `-EINVAL`.
+extern "C" fn rust_rss_indir_check(
+    _cookie: *mut c_void,
+    indir: *const u32,
+    len: core::ffi::c_uint,
+    queue_count: core::ffi::c_uint,
+) -> c_int {
+    if ub::rxfh_indir_valid(indir, len as usize, queue_count) {
+        0
+    } else {
+        EINVAL.to_errno()
+    }
+}
+
 pub(crate) const M4_FULL_OPS: BridgeOps = BridgeOps {
     open: rust_open,
     stop: rust_stop,
@@ -715,6 +753,7 @@ pub(crate) const M4_FULL_OPS: BridgeOps = BridgeOps {
     poll: rust_poll,
     change_mtu: rust_change_mtu,
     set_features: rust_set_features,
+    rss_indir_check: rust_rss_indir_check,
 };
 
 // Skeleton vtable retained as a load-test fallback. Flip `ACTIVE_OPS`
@@ -745,6 +784,15 @@ extern "C" fn skel_change_mtu(_cookie: *mut c_void, _new_mtu: c_int) -> c_int {
 extern "C" fn skel_set_features(_cookie: *mut c_void, _feature_flags: u32) -> c_int {
     0
 }
+#[allow(dead_code)]
+extern "C" fn skel_rss_indir_check(
+    _cookie: *mut c_void,
+    _indir: *const u32,
+    _len: core::ffi::c_uint,
+    _queue_count: core::ffi::c_uint,
+) -> c_int {
+    0
+}
 
 #[allow(dead_code)]
 pub(crate) const M4_SKELETON_OPS: BridgeOps = BridgeOps {
@@ -754,6 +802,7 @@ pub(crate) const M4_SKELETON_OPS: BridgeOps = BridgeOps {
     poll: skel_poll,
     change_mtu: skel_change_mtu,
     set_features: skel_set_features,
+    rss_indir_check: skel_rss_indir_check,
 };
 
 /// Active vtable. M4-full is the production path; M4-skeleton is kept
@@ -852,6 +901,18 @@ fn validate_rss_queue_request(state: &NetdevState) -> Result<()> {
         return Err(EINVAL);
     }
 
+    // B6.1 foundation: rings/NAPI for RX_QUEUE_COUNT are allocated, but the
+    // per-vector RX IRQ routing (B6.2) and RSS spread (B6.3) are not wired yet,
+    // so refuse to half-activate multi-queue (queues 1+ would fill with no IRQ
+    // to drain them). Lifted when B6.2/B6.3 land.
+    if requested > 1 {
+        pr_warn!(
+            "r8125_rust: rss_queues={} requested but multi-queue RX activation is not enabled in this build (single-queue only)\n",
+            requested
+        );
+        return Err(EINVAL);
+    }
+
     Ok(())
 }
 
@@ -867,7 +928,7 @@ fn program_rss_key_and_indir(regs: &Regs<'_>, queue_count: u8) {
 fn apply_rss_programming(state: &NetdevState) {
     let regs = state.regs();
     let requested = requested_rss_queues();
-    let queue_count = requested.max(1);
+    let queue_count = active_rx_queues() as u8;
 
     if state.rx_hash_enabled.load(Ordering::Acquire) || requested != 0 {
         regs.set_q_num_ctrl_8125(rss_q_num_ctrl(queue_count));
@@ -898,7 +959,7 @@ fn apply_netdev_features(state: &NetdevState, feature_flags: u32) {
 #[inline]
 fn program_dma_rings(state: &NetdevState, regs: &Regs<'_>, feature_flags: u32) {
     regs.set_tx_ring_base(state.tx.dma);
-    for (queue_id, rx) in state.rx_queues.iter().enumerate() {
+    for (queue_id, rx) in state.rx_queues.iter().take(active_rx_queues()).enumerate() {
         regs.set_rx_ring_base_queue(queue_id, rx.dma);
     }
     let mut rcr = rx_feature_rcr(regs::RCR_M4_BASELINE, feature_flags);
@@ -940,7 +1001,7 @@ fn allocate_rx_queue_pool(state: &NetdevState, queue_id: u32) -> Result<()> {
 }
 
 fn allocate_rx_pool(state: &NetdevState) -> Result<()> {
-    for queue_id in 0..RX_QUEUE_COUNT {
+    for queue_id in 0..active_rx_queues() {
         allocate_rx_queue_pool(state, queue_id as u32)?;
     }
     Ok(())
@@ -977,7 +1038,7 @@ fn pre_post_rx_queue_descriptors(rx: &RxQueueState) {
 }
 
 fn pre_post_rx_descriptors(state: &NetdevState) {
-    for rx in &state.rx_queues {
+    for rx in &state.rx_queues[..active_rx_queues()] {
         pre_post_rx_queue_descriptors(rx);
     }
 }

@@ -229,8 +229,31 @@ Execution status:
   queue-0 table for validation; `rss_queues>1` fails `ndo_open` until the
   driver owns more RX queues. Smoke artifacts are in
   `docs/perf/rss_hw_programming_20260608/`.
-- **B5**: pending — ethtool RSS controls/readback are next. Full N>1 hardware
-  RSS remains disabled until B5 plus multi-ring activation gates pass.
+- **B5**: complete + Gateway-smoked — ethtool RSS control plane is wired:
+  `get_rxfh`/`get_rxfh_key_size`/`get_rxfh_indir_size` report the programmed
+  boot key + all-zero (single-queue) indirection table, `get_channels` reports
+  one RX/TX queue, and `get_rx_ring_count` answers the `ETHTOOL_GRXRINGS` query
+  (kernel 7.0.0 routes it to the dedicated op, not `get_rxnfc` — so this works
+  where the vendor's older `get_rxnfc`-only path does not). `set_rxfh` validates
+  the indirection table through the host-tested `layout::rxfh_indir_all_valid`
+  (rejecting entries that exceed owned queues) and refuses a custom hash key
+  while only one RX queue is owned; it runs under RTNL, serialized against
+  open/stop. Validated: `ethtool -x` readback, `ethtool -X equal 1` accepted,
+  `ethtool -X equal 2` rejected (EINVAL), custom `hkey` rejected (EOPNOTSUPP),
+  traffic healthy after. Gate: `ci/check_rss_ethtool.sh`. set_channels and
+  custom multi-queue keys remain deferred with N>1 activation.
+- **B6**: required before any N>1 RSS acceptance — run
+  `scripts/rss_multiqueue_hazard_validate.sh` with full hardware RSS active.
+  This is the explicit guard for RTL8125 RSS bug classes that host tests cannot
+  prove away: small-packet and fragmented-UDP stress must record
+  `udp_out_of_order=0`, no driver `rx_dropped_error` growth, and acceptable
+  loss for the offered rate; TCP byte-integrity must pass SHA-256 comparison;
+  at least two RX IRQ vectors must advance under load; the quiet post-load
+  window must show no IRQ loop and no kworker CPU runaway; timestamping
+  capabilities must be captured (current Rust path has no hardware timestamping
+  support, and any future support must rerun this hazard test with timestamping
+  enabled); and `fault_scan.txt` must be empty. Static gate:
+  `ci/check_rss_multiqueue_hazard.sh`.
 
 ### Phase 0 Evidence Protocol
 

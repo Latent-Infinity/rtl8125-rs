@@ -166,6 +166,16 @@ pub(crate) struct BridgeOps {
     pub poll: extern "C" fn(cookie: *mut c_void, queue_id: u32, budget: c_int) -> c_int,
     pub change_mtu: extern "C" fn(cookie: *mut c_void, new_mtu: c_int) -> c_int,
     pub set_features: extern "C" fn(cookie: *mut c_void, feature_flags: u32) -> c_int,
+    /// B5 ethtool `set_rxfh` indirection validation. Returns 0 if every entry
+    /// maps to a runtime-active RX queue, `-EINVAL` otherwise. `indir`/`len`
+    /// come straight from the kernel `ethtool_rxfh_param`; `queue_count` is the
+    /// C bridge's active queue count.
+    pub rss_indir_check: extern "C" fn(
+        cookie: *mut c_void,
+        indir: *const u32,
+        len: c_uint,
+        queue_count: c_uint,
+    ) -> c_int,
 }
 
 // Bindgen emits `pci_dev` / `net_device` / `sk_buff` as opaque
@@ -924,6 +934,24 @@ pub(crate) fn rss_key_fill(key: &mut [u8; crate::regs::RSS_KEY_SIZE]) {
 pub(crate) fn rxfh_indir_default(index: u32, n_rx_rings: u32) -> u32 {
     // SAFETY: see fn-level contract.
     unsafe { r8125_bridge_rxfh_indir_default(index, n_rx_rings) }
+}
+
+/// Validate a kernel-supplied ethtool RSS indirection table (B5 `set_rxfh`):
+/// every bucket must map to an owned queue. The decision is the host-tested
+/// `crate::layout::rxfh_indir_all_valid`; this wrapper only views the kernel
+/// buffer as a slice for the duration of the call.
+///
+/// # SAFETY: `ptr` points to `len` `u32` entries — the ethtool core allocated
+/// `get_rxfh_indir_size()` entries before invoking `set_rxfh`, and the borrow
+/// does not outlive this call.
+pub(crate) fn rxfh_indir_valid(ptr: *const u32, len: usize, queue_count: u32) -> bool {
+    if ptr.is_null() || len == 0 {
+        // No indirection change requested ⇒ nothing to reject.
+        return true;
+    }
+    // SAFETY: see fn-level contract; slice is read-only and call-scoped.
+    let indir = unsafe { core::slice::from_raw_parts(ptr, len) };
+    crate::layout::rxfh_indir_all_valid(indir, queue_count)
 }
 
 pub(crate) fn bridge_tx_disable(ndev: *mut bindings::net_device) {

@@ -67,6 +67,18 @@ above is low-risk and fine to land; **flipping N>1 on is not yet justified by
 data.** Follow-up artifacts: `docs/perf/trackb_20260607/TRACKB_VALUE.md` and
 `docs/perf/rps_collapse_fe00_20260607/`.
 
+**Track B capacity evidence (2026-06-08): the gap is real but narrow.** The
+2026-06-07 run was generator-bound; a pktgen 64B flood now measures the actual
+ceilings. A **single RX queue saturates one core at ~2.0M pps** (87.5% softirq
+at 1.78M offered) — below 64B line rate (~3.72M pps) but above all large-packet
+rates and above a single igc sender's output. Hardware RSS spreads to ~35%/CPU
+across 4 cores ⇒ **~4.5M+ pps**, BUT only with source-IP/4-tuple diversity; a
+single-IP UDP flood hashes to one queue (no spread, no benefit). **Verdict:
+activate N>1 (B6) only if a target deployment sees >2M pps small-packet RX from
+many peers (multi-client 2.5GbE server/LB/DNS/CDN); otherwise defer — single
+queue + RXHASH→RPS covers line rate for realistic traffic. Now an evidence-based
+choice, not an unknown.** Artifacts: `docs/perf/trackb_capacity_20260608/`.
+
 ## Required proof artifacts
 
 - Hashability probe:

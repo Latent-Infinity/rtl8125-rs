@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# Full-RSS prerequisite: the C/Rust bridge must be queue-aware before
-# Rust grows multiple RX rings. This gate keeps the N=1 transition honest:
-# queue_id is threaded through NAPI poll, RX page-pool lifecycle, and RX
-# packet delivery, while the current runtime still registers exactly one queue.
+# Full-RSS prerequisite: the C/Rust bridge must be queue-aware. queue_id is
+# threaded through NAPI poll, RX page-pool lifecycle, and RX packet delivery.
+# B6.1 foundation: the driver allocates RX_QUEUE_COUNT(=4) DMA rings + NAPI
+# instances, but the RUNTIME active count is clamped by
+# `layout::active_rx_queues` (1 unless an rss_queues opt-in raises it once the
+# per-vector IRQ + RSS-spread increments land).
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -59,16 +61,26 @@ else
 	red "RX page-pool lifecycle and RX delivery must accept queue_id"
 fi
 
-if grep -Fq 'pub(crate) const RX_QUEUE_COUNT: usize = 1;' "$NETDEV" &&
-   grep -Fq 'for queue_id in 0..RX_QUEUE_COUNT' "$NETDEV" &&
+if grep -Fq 'pub(crate) const RX_QUEUE_COUNT: usize = 4;' "$NETDEV" &&
+   grep -Fq 'crate::layout::active_rx_queues(' "$NETDEV" &&
+   grep -Fq 'for queue_id in 0..active_rx_queues()' "$NETDEV" &&
    grep -Fq 'ub::rx_pool_create(ndev, queue_id, RING_LEN)' "$NETDEV" &&
    grep -Fq 'ub::rx_alloc(ndev, queue_id)' "$NETDEV" &&
    grep -Fq 'ub::rx_free(ndev, queue_id, slot.cpu)' "$NETDEV" &&
-   grep -Fq 'ub::rx_pool_destroy(ndev, queue_id)' "$NETDEV" &&
-   grep -Fq 'ub::bridge_napi_schedule(ndev, RX_QUEUE0)' "$NETDEV"; then
-	grn "current runtime keeps one RX queue while open/stop paths are queue-indexed"
+   grep -Fq 'ub::rx_pool_destroy(ndev, queue_id)' "$NETDEV"; then
+	grn "B6.1: RX_QUEUE_COUNT=4 foundation; runtime active count clamped via layout::active_rx_queues, open/stop queue-indexed"
 else
-	red "B2 runtime must keep RX_QUEUE_COUNT=1 and queue-index open/stop without scheduling nonzero queues"
+	red "B6.1 foundation must set RX_QUEUE_COUNT=4 and drive setup loops by active_rx_queues()"
+fi
+
+PCI="$ROOT/src/pci.rs"
+if grep -Fq 'rx_rings: [ring::RxRing; crate::netdev::RX_QUEUE_COUNT]' "$PCI" &&
+   grep -Fq 'rx_rings[i].desc_ptr_mut()' "$PCI" &&
+   grep -Fq 'unsigned int active_rx_queues;' "$INTERNAL" &&
+   grep -Fq '#define R8125_BRIDGE_RX_QUEUE_COUNT	4' "$INTERNAL"; then
+	grn "probe allocates one DMA RX ring per queue; C bridge sizes 4 queues with a runtime active count"
+else
+	red "probe must allocate an RX ring per queue and C must expose active_rx_queues with COUNT=4"
 fi
 
 if grep -Fq 'ub::bridge_rx_one_packet(' "$NAPI" &&
