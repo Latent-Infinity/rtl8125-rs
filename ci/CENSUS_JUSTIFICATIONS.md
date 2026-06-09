@@ -387,7 +387,7 @@ Added one safe wrapper in `src/unsafe_boundary.rs`:
 This is a pure mechanical FFI wrapper: no pointers, ownership transfer, MMIO,
 or skb lifetime are involved.
 
-## B5 — ethtool RSS control plane (72 → 73)
+## ethtool RSS control plane (72 → 73)
 
 Added one unsafe block in `src/unsafe_boundary.rs`:
 
@@ -400,3 +400,31 @@ Added one unsafe block in `src/unsafe_boundary.rs`:
   ownership, MMIO, or skb lifetime is involved — only a bounded slice view of a
   kernel-owned array. This keeps the indirection-validity rule (entry < owned
   queue count) tested in safe Rust rather than duplicated in C.
+
+## Multi-queue RSS activation (73 → 74)
+
+Added one unsafe block in `src/unsafe_boundary.rs`:
+
+- `set_active_rx_queues(ndev, n)` — wraps the cshim
+  `r8125_bridge_set_active_rx_queues`, which clamps the count and calls
+  `netif_set_real_num_rx_queues`. Pure mechanical FFI to a registered
+  net_device from `ndo_open` (RTNL held); no pointers beyond `ndev`, no
+  ownership transfer, MMIO, or skb lifetime.
+
+## Multi-queue IRQ affinity spread (74 → 75)
+
+Net +1 unsafe block in `src/unsafe_boundary.rs`: added two, removed one. The
+spread *policy* is the host-unit-tested `crate::layout::irq_affinity_cpu`; these
+wrappers only feed it kernel facts / apply its result:
+
+- ADDED `bridge_num_online_cpus() -> u32` — wraps `num_online_cpus()`. No
+  pointers, no preconditions; reports the fan-out width.
+- ADDED `bridge_node_base_cpu(pdev) -> c_int` — wraps the cshim helper that
+  returns the PCI device's NUMA-local first-online CPU (the fan-out base).
+  `pdev` is a live `pci_dev` from probe (`pci::Device<Bound>`); the helper only
+  reads the device's NUMA node + online-CPU mask. No ownership/MMIO/skb.
+- REMOVED `bridge_irq_pin_auto` — the old single-CPU auto-pin, superseded by
+  the spread (`node_base_cpu` + `irq_affinity_cpu` + the existing
+  `bridge_irq_pin_cpu`), which fans the active vectors across distinct CPUs so
+  each queue's DMA stays on one per-CPU IOVA cache (the `tx_dropped_error`
+  multi-queue TX-collapse fix).

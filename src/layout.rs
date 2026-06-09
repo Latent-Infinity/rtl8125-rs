@@ -140,11 +140,29 @@ impl RxParse {
 
 // -- RSS register packing ---------------------------------------------------
 
-/// `Q_NUM_CTRL_8125` value for a queue count: the vendor programs `count - 1`
-/// (0 means single queue), clamped so a `0` request never underflows.
+/// `Q_NUM_CTRL_8125` queue-count field, pre-shifted into bits 2..4. The vendor
+/// (`rtl8125_set_rx_q_num`) writes `ilog2(num_rx_queues)` into bits 2..4 — NOT
+/// `count - 1`. So 1→0, 2→1<<2, 4→2<<2. The MMIO writer read-modify-writes this
+/// into the register, preserving the other bits. `0` is treated as 1 queue.
 #[inline]
 pub(crate) const fn rss_q_num_ctrl(queue_count: u8) -> u16 {
-    queue_count.saturating_sub(1) as u16
+    let n = if queue_count == 0 { 1 } else { queue_count } as u32;
+    ((n.ilog2() as u16) & 0x7) << 2
+}
+
+/// Full `RSS_CTRL_8125` value (vendor `_rtl8125_set_rss_hash_opt`). The register
+/// packs THREE fields, not just the hash-type enables: `supp_bits` (hash-type
+/// enables, TCP/IP v4/v6 + UDP, bits 0..13); the queue count
+/// `ilog2(queue_count)` at `RSS_CPU_NUM_OFFSET = 16` — the field that actually
+/// steers RX across queues (missing ⇒ everything pins to queue 0); and the mask
+/// length `ilog2(indir_entries)` at `RSS_MASK_BITS_OFFSET = 8` (how many hash
+/// bits index the indirection table).
+#[inline]
+pub(crate) const fn rss_ctrl_value(queue_count: u8, indir_entries: usize, supp_bits: u32) -> u32 {
+    let n = if queue_count == 0 { 1 } else { queue_count } as u32;
+    let cpu_num = (n.ilog2() & 0x7) << 16;
+    let mask_len = ((indir_entries as u32).ilog2() & 0x7) << 8;
+    supp_bits | cpu_num | mask_len
 }
 
 /// Pack four 1-byte indirection-table queue entries into the little-endian
@@ -165,7 +183,7 @@ pub(crate) const fn key_word(bytes: [u8; 4]) -> u32 {
 }
 
 /// Number of RX queues to actually set up from an `rss_queues` request, clamped
-/// to the compile-time maximum (B6). `0` (RSS off / default) means the proven
+/// to the compile-time maximum. `0` (RSS off / default) means the proven
 /// single-queue path; any non-zero request activates that many queues, capped
 /// at `max`. Centralizing this keeps probe, ndo_open, IRQ wiring, and RSS
 /// programming from each clamping differently.
@@ -181,13 +199,78 @@ pub(crate) const fn active_rx_queues(rss_queues: u8, max: usize) -> usize {
     }
 }
 
-/// Validate an ethtool RSS indirection table (B5 `set_rxfh`): every bucket must
+/// Whether an `rss_queues` module-parameter request is representable in the
+/// RTL8125 queue-count fields. The chip stores `ilog2(queue_count)`, so only
+/// power-of-two queue counts can be programmed exactly. `0` keeps RSS off and
+/// is accepted as the default single-queue path.
+#[inline]
+pub(crate) const fn rss_queue_request_supported(rss_queues: u8, max: usize) -> bool {
+    let r = rss_queues as usize;
+    r == 0 || (r <= max && r.is_power_of_two())
+}
+
+/// V2 IMR/ISR source bit for RX queue `queue_id`. The chip maps RX queue N to
+/// MSI-X message-id N and ISR/IMR bit `1<<N` (vendor `RTL_W32(ISR_V2,
+/// BIT(message_id))`), so the bit is `rok_q0 << queue_id` where `rok_q0` is
+/// the queue-0 ROK mask (`1<<0`).
+#[inline]
+pub(crate) const fn v2_rx_queue_bit(queue_id: u32, rok_q0: u32) -> u32 {
+    rok_q0 << queue_id
+}
+
+/// V2 source bits a given RX queue's NAPI owns and re-arms on poll completion.
+/// Queue 0 also drains TX completions (`tok_q0`) and link-change (`linkchg`) —
+/// those vectors schedule queue 0's NAPI — so it re-arms them too; queues 1+
+/// own only their ROK bit. Pure ⇒ host-unit-tested, since a wrong re-arm mask
+/// silently wedges a queue or storms interrupts.
+#[inline]
+pub(crate) const fn v2_queue_rearm_mask(
+    queue_id: u32,
+    rok_q0: u32,
+    tok_q0: u32,
+    linkchg: u32,
+) -> u32 {
+    if queue_id == 0 {
+        rok_q0 | tok_q0 | linkchg
+    } else {
+        rok_q0 << queue_id
+    }
+}
+
+/// Validate an ethtool RSS indirection table (`set_rxfh`): every bucket must
 /// map to an owned queue (`entry < queue_count`). At the current `N=1` runtime
 /// that means every entry must be 0; the check generalizes once more queues are
 /// owned. An empty slice is vacuously valid (caller passed no indir change).
 #[inline]
 pub(crate) fn rxfh_indir_all_valid(indir: &[u32], queue_count: u32) -> bool {
     queue_count > 0 && indir.iter().all(|&e| e < queue_count)
+}
+
+// -- MSI-X vector → CPU affinity (multi-queue DMA locality) -----------------
+
+/// Assign MSI-X vector `index` to a CPU so the driver's interrupts (and the
+/// per-CPU DMA map/unmap they drive) fan out across *distinct* CPUs instead of
+/// piling onto one or migrating freely.
+///
+/// Why this matters (gateway multi-queue): with `rss_queues>1`, leaving the
+/// extra RX vectors on a broad affinity mask lets the kernel/irqbalance migrate
+/// them, so each queue's RX refill `dma_map`/`dma_unmap` lands on a rotating set
+/// of CPUs. That churns the per-CPU IOVA rcache and makes `dma_map_single`
+/// sporadically fail, which the TX path counts as `tx_dropped_error` → TCP
+/// retransmits → throughput collapse. Pinning each vector to one CPU keeps every
+/// queue's DMA on a single per-CPU IOVA cache → zero drops. Single-queue never
+/// hit this because all DMA already stayed on one CPU.
+///
+/// Vectors fan out from `base_cpu` (the PCI-local NUMA-node first-online CPU)
+/// modulo `num_cpus`, so consecutive vectors get consecutive online CPUs and
+/// wrap when there are more vectors than CPUs. Pure ⇒ host-unit-tested: a wrong
+/// assignment silently reintroduces the DMA-contention drops.
+#[inline]
+pub(crate) const fn irq_affinity_cpu(index: usize, base_cpu: usize, num_cpus: usize) -> usize {
+    if num_cpus == 0 {
+        return 0;
+    }
+    (base_cpu % num_cpus + index % num_cpus) % num_cpus
 }
 
 // -- TX byte-budget hysteresis (test-5 MSI-safe latency throttle) -----------
@@ -320,11 +403,29 @@ mod tests {
 
     // -- RSS register packing ----------------------------------------------
     #[test]
-    fn q_num_ctrl_is_count_minus_one_clamped() {
-        assert_eq!(rss_q_num_ctrl(0), 0);
-        assert_eq!(rss_q_num_ctrl(1), 0);
-        assert_eq!(rss_q_num_ctrl(2), 1);
-        assert_eq!(rss_q_num_ctrl(4), 3);
+    fn q_num_ctrl_is_log2_in_bits_2_4() {
+        // Vendor: ilog2(n) shifted into bits 2..4 (NOT count-1).
+        assert_eq!(rss_q_num_ctrl(0), 0); // treated as 1 queue
+        assert_eq!(rss_q_num_ctrl(1), 0); // log2(1)=0
+        assert_eq!(rss_q_num_ctrl(2), 1 << 2); // log2(2)=1 → 0x04
+        assert_eq!(rss_q_num_ctrl(4), 2 << 2); // log2(4)=2 → 0x08
+                                               // Every value sits only in bits 2..4.
+        for n in [1u8, 2, 4] {
+            assert_eq!(rss_q_num_ctrl(n) & !0x1C, 0);
+        }
+    }
+
+    #[test]
+    fn rss_ctrl_packs_queue_count_and_mask_len() {
+        const SUPP: u32 = 0x183F;
+        // 128 indir entries ⇒ ilog2=7 ⇒ mask_len 7<<8 = 0x700.
+        assert_eq!(rss_ctrl_value(1, 128, SUPP), SUPP | 0x700); // 1 queue: cpu=0
+        assert_eq!(rss_ctrl_value(2, 128, SUPP), SUPP | (1 << 16) | 0x700);
+        assert_eq!(rss_ctrl_value(4, 128, SUPP), SUPP | (2 << 16) | 0x700);
+        // The queue-count field (bits 16..18) is what steers; must be nonzero
+        // for multi-queue.
+        assert_ne!(rss_ctrl_value(4, 128, SUPP) & (0x7 << 16), 0);
+        assert_eq!(rss_ctrl_value(1, 128, SUPP) & (0x7 << 16), 0);
     }
 
     #[test]
@@ -403,7 +504,7 @@ mod tests {
         assert_eq!(tx_budget_shadow_len(u32::MAX as usize + 1), u32::MAX);
     }
 
-    // ── B5 ethtool rxfh validation ─────────────────────────────────────────
+    // -- ethtool rxfh validation -----------------------------------------
     #[test]
     fn indir_valid_single_queue_requires_all_zero() {
         assert!(rxfh_indir_all_valid(&[0, 0, 0, 0], 1));
@@ -424,7 +525,7 @@ mod tests {
         assert!(!rxfh_indir_all_valid(&[0], 0)); // zero queues: nothing valid
     }
 
-    // ── B6 active RX queue count ───────────────────────────────────────────
+    // -- active RX queue count -------------------------------------------
     #[test]
     fn active_rx_queues_default_is_single() {
         // RSS off (0) and explicit 1 both mean the single-queue path.
@@ -443,5 +544,102 @@ mod tests {
     fn active_rx_queues_clamps_to_max() {
         assert_eq!(active_rx_queues(8, 4), 4);
         assert_eq!(active_rx_queues(255, 4), 4);
+    }
+
+    #[test]
+    fn rss_queue_request_allows_only_representable_counts() {
+        // The hardware stores ilog2(queue_count), so 3 queues cannot be
+        // represented even though the software arrays have four slots.
+        assert!(rss_queue_request_supported(0, 4));
+        assert!(rss_queue_request_supported(1, 4));
+        assert!(rss_queue_request_supported(2, 4));
+        assert!(!rss_queue_request_supported(3, 4));
+        assert!(rss_queue_request_supported(4, 4));
+        assert!(!rss_queue_request_supported(5, 4));
+        assert!(!rss_queue_request_supported(8, 4));
+    }
+
+    // -- V2 per-source interrupt masks -----------------------------------
+    const ROK0: u32 = 1 << 0;
+    const TOK0: u32 = 1 << 16;
+    const LINK: u32 = 1 << 21;
+
+    #[test]
+    fn rx_queue_bit_is_one_shifted() {
+        assert_eq!(v2_rx_queue_bit(0, ROK0), 1 << 0);
+        assert_eq!(v2_rx_queue_bit(1, ROK0), 1 << 1);
+        assert_eq!(v2_rx_queue_bit(2, ROK0), 1 << 2);
+        assert_eq!(v2_rx_queue_bit(3, ROK0), 1 << 3);
+    }
+
+    #[test]
+    fn queue0_rearm_owns_rx_tx_and_link() {
+        // Queue 0 drains TX + link, so it re-arms ROK0|TOK0|LINKCHG.
+        assert_eq!(v2_queue_rearm_mask(0, ROK0, TOK0, LINK), ROK0 | TOK0 | LINK);
+    }
+
+    #[test]
+    fn nonzero_queue_rearm_owns_only_its_rok() {
+        assert_eq!(v2_queue_rearm_mask(1, ROK0, TOK0, LINK), 1 << 1);
+        assert_eq!(v2_queue_rearm_mask(2, ROK0, TOK0, LINK), 1 << 2);
+        assert_eq!(v2_queue_rearm_mask(3, ROK0, TOK0, LINK), 1 << 3);
+        // A non-zero queue never re-enables TX or link.
+        assert_eq!(v2_queue_rearm_mask(1, ROK0, TOK0, LINK) & (TOK0 | LINK), 0);
+    }
+
+    // -- irq_affinity_cpu (multi-queue) ----------------------------------
+
+    #[test]
+    fn affinity_spreads_vectors_to_distinct_cpus() {
+        // The core invariant: with at least as many CPUs as vectors, every
+        // vector lands on a DISTINCT CPU (so no two queues share a per-CPU
+        // IOVA cache). 6 vectors (rx0..rx3, tx0, link) on 32 CPUs, base 0.
+        let cpus: Vec<usize> = (0..6).map(|i| irq_affinity_cpu(i, 0, 32)).collect();
+        let mut sorted = cpus.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            cpus.len(),
+            "vectors must map to distinct CPUs"
+        );
+        assert_eq!(cpus, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn affinity_honours_numa_base_offset() {
+        // Fan out from the PCI-local base CPU, not always 0.
+        assert_eq!(irq_affinity_cpu(0, 8, 32), 8);
+        assert_eq!(irq_affinity_cpu(1, 8, 32), 9);
+        assert_eq!(irq_affinity_cpu(3, 8, 32), 11);
+    }
+
+    #[test]
+    fn affinity_wraps_when_more_vectors_than_cpus() {
+        // 6 vectors but only 4 CPUs: wrap modulo, still deterministic. Two
+        // vectors may share a CPU (unavoidable) but the spread is even.
+        let cpus: Vec<usize> = (0..6).map(|i| irq_affinity_cpu(i, 0, 4)).collect();
+        assert_eq!(cpus, vec![0, 1, 2, 3, 0, 1]);
+    }
+
+    #[test]
+    fn affinity_base_wraps_too() {
+        // base_cpu may itself be >= num_cpus on odd topologies; normalise it.
+        assert_eq!(irq_affinity_cpu(0, 5, 4), 1);
+        assert_eq!(irq_affinity_cpu(2, 5, 4), 3);
+    }
+
+    #[test]
+    fn affinity_defensive_zero_cpus() {
+        // Degenerate input must not divide-by-zero; fall back to CPU 0.
+        assert_eq!(irq_affinity_cpu(0, 0, 0), 0);
+        assert_eq!(irq_affinity_cpu(3, 7, 0), 0);
+    }
+
+    #[test]
+    fn affinity_is_deterministic() {
+        for i in 0..16 {
+            assert_eq!(irq_affinity_cpu(i, 2, 8), irq_affinity_cpu(i, 2, 8));
+        }
     }
 }

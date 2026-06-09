@@ -10,7 +10,7 @@
  *
  * Hard cap: 600 LOC including comments. Candidate G/L/M additions and the
  * per-MTU zero-copy RX path fit after dead RX helpers moved out; queue-id
- * plumbing and the B6 multi-queue NAPI lifecycle helpers raised the cap from
+ * plumbing and the multi-queue NAPI lifecycle helpers raised the cap from
  * 540. See cshim/README.md.
  *
  * Every ndo callback below is a thin delegation to the Rust vtable.
@@ -205,9 +205,15 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	struct r8125_bridge *b;
 	unsigned int i;
 
-	ndev = alloc_etherdev(sizeof(*b));
+	/* Allocate with RX_QUEUE_COUNT hardware RX queues (1 TX) so the stack can
+	 * track up to that many RX queues (RPS sysfs, real_num_rx_queues). The
+	 * runtime active count starts at 1 and is raised at ndo_open when an
+	 * rss_queues opt-in activates more.
+	 */
+	ndev = alloc_etherdev_mqs(sizeof(*b), 1, R8125_BRIDGE_RX_QUEUE_COUNT);
 	if (!ndev)
 		return NULL;
+	netif_set_real_num_rx_queues(ndev, 1);
 
 	SET_NETDEV_DEV(ndev, &pdev->dev);
 	ndev->netdev_ops = &bridge_ops;
@@ -276,7 +282,7 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	b->priv = priv;
 	b->ops = *ops;
 	/* Runtime active count starts at the single-queue default; an rss_queues
-	 * opt-in raises it (B6.3). All MAX NAPI instances are created regardless.
+	 * opt-in raises it. All MAX NAPI instances are created regardless.
 	 */
 	b->active_rx_queues = 1;
 
@@ -362,42 +368,35 @@ int r8125_bridge_irq_pin_cpu(unsigned int irq, int cpu)
 }
 
 /*
- * `r8125_bridge_irq_pin_auto` — Candidate #4 of
- * `docs/RX_OPTIMIZATION_CANDIDATES.md`.
+ * `r8125_bridge_num_online_cpus` / `r8125_bridge_node_base_cpu` — multi-queue
+ * affinity spread inputs.
  *
- * Pick the first online CPU on the PCI device's NUMA node and pin the
- * vector there. On boxes where the chip's IOMMU/root-complex hangs off
- * a specific NUMA node, servicing the IRQ on a CPU in the same node
- * keeps the RX-completion data on the right side of the inter-socket
- * link. On UMA boxes (most desktops, the MS-A2) every CPU is "local"
- * so this collapses to "pick the lowest-numbered online CPU." Both
- * cases are better than the previous hardcoded CPU 0 default.
- *
- * Output via `out_cpu` so the Rust side can log which CPU was chosen.
- * On failure (no online CPU on the node), returns -EINVAL and leaves
- * *out_cpu unchanged.
+ * The Rust side's host-tested `layout::irq_affinity_cpu(index, base, ncpus)`
+ * decides which CPU each MSI-X vector pins to so the active vectors fan out
+ * across distinct per-CPU IOVA caches (see that function's docs and the gateway
+ * multi-queue DMA-contention finding). These two helpers feed it the kernel
+ * facts it can't read directly: the count of online CPUs and the PCI-local
+ * NUMA-node first-online CPU (the fan-out base). The actual pin still goes
+ * through `r8125_bridge_irq_pin_cpu`, which validates `cpu_online` and falls
+ * back gracefully if the computed CPU is offline.
  */
-int r8125_bridge_irq_pin_auto(struct pci_dev *pdev, unsigned int irq,
-			      int *out_cpu)
+unsigned int r8125_bridge_num_online_cpus(void)
+{
+	return num_online_cpus();
+}
+
+int r8125_bridge_node_base_cpu(struct pci_dev *pdev)
 {
 	int node = dev_to_node(&pdev->dev);
-	const struct cpumask *node_mask;
 	int cpu;
 
-	if (node == NUMA_NO_NODE) {
-		/* Box doesn't know its NUMA topology; just pick CPU 0
-		 * if it's online, else the first online CPU.
-		 */
+	if (node == NUMA_NO_NODE)
 		cpu = cpumask_first(cpu_online_mask);
-	} else {
-		node_mask = cpumask_of_node(node);
-		cpu = cpumask_first_and(node_mask, cpu_online_mask);
-	}
+	else
+		cpu = cpumask_first_and(cpumask_of_node(node), cpu_online_mask);
 	if (cpu >= nr_cpu_ids)
 		return -EINVAL;
-	if (out_cpu)
-		*out_cpu = cpu;
-	return irq_set_affinity_and_hint(irq, cpumask_of(cpu));
+	return cpu;
 }
 
 void r8125_bridge_dma_rmb(void)
@@ -477,6 +476,23 @@ void r8125_bridge_napi_complete_done(struct net_device *ndev,
 	if (WARN_ON_ONCE(queue_id >= R8125_BRIDGE_RX_QUEUE_COUNT))
 		return;
 	napi_complete_done(&b->rxq[queue_id].napi, work_done);
+}
+
+/* Set the runtime active RX queue count. Reported by ethtool
+ * get_channels / get_rx_ring_count and pushed to the stack via
+ * netif_set_real_num_rx_queues (RPS sysfs). Called by Rust ndo_open under RTNL
+ * with the netdev down. Clamped to [1, R8125_BRIDGE_RX_QUEUE_COUNT].
+ */
+void r8125_bridge_set_active_rx_queues(struct net_device *ndev, unsigned int n)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+
+	if (n < 1)
+		n = 1;
+	if (n > R8125_BRIDGE_RX_QUEUE_COUNT)
+		n = R8125_BRIDGE_RX_QUEUE_COUNT;
+	b->active_rx_queues = n;
+	WARN_ON_ONCE(netif_set_real_num_rx_queues(ndev, n));
 }
 
 void r8125_bridge_carrier_on(struct net_device *ndev)

@@ -22,7 +22,7 @@ RUN="$ROOT/ci/run_checks.sh"
 
 if grep -q 'rss_queues: u8' "$MAIN" &&
    grep -q 'default: 0' "$MAIN" &&
-   grep -q 'description: "Hardware RSS queue request: 0=off' "$MAIN"; then
+   grep -q 'description: "Hardware RSS queue request: 0=off, 1=single-queue validation, 2/4=multi-queue"' "$MAIN"; then
 	grn "hardware RSS has an explicit off-by-default module parameter"
 else
 	red "hardware RSS must be gated by rss_queues=0 default"
@@ -30,16 +30,18 @@ fi
 
 if grep -q 'fn validate_rss_queue_request(state: &NetdevState) -> Result<()> ' "$NETDEV" &&
    grep -q 'requested > RX_QUEUE_COUNT as u8' "$NETDEV" &&
+   grep -q 'rss_queue_request_supported(requested, RX_QUEUE_COUNT)' "$NETDEV" &&
    grep -q 'requested > 1 && !state.use_v2_irq_surface()' "$NETDEV" &&
    grep -q 'return Err(EINVAL)' "$NETDEV"; then
-	grn "hardware RSS requests are bounded by owned queues and V2 interrupt ownership"
+	grn "hardware RSS requests are bounded by owned queues, representable counts, and V2 interrupt ownership"
 else
-	red "rss_queues must fail fast when queues/vectors are not owned"
+	red "rss_queues must fail fast when queues/counts/vectors are not owned or representable"
 fi
 
 if grep -q 'fn apply_rss_programming(state: &NetdevState)' "$NETDEV" &&
    grep -q 'regs.set_q_num_ctrl_8125(rss_q_num_ctrl(queue_count))' "$NETDEV" &&
-   grep -q 'regs.set_rss_ctrl_8125(regs::RSS_CTRL_HASH_BITS)' "$NETDEV" &&
+   grep -q 'regs.set_rss_ctrl_8125(crate::layout::rss_ctrl_value(' "$NETDEV" &&
+   grep -q 'regs::RSS_CTRL_HASH_BITS' "$NETDEV" &&
    grep -q 'regs.set_rss_ctrl_8125(0)' "$NETDEV" &&
    grep -q 'apply_rss_programming(state)' "$NETDEV"; then
 	grn "RSS programming is centralized and has an explicit disabled path"

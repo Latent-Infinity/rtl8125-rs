@@ -92,15 +92,25 @@ if grep -qE 'irq_pin_cpu:\s*u8' "$ROOT/src/r8125_rust_main.rs"; then
 else
 	red "#4: r8125_rust_main.rs must declare irq_pin_cpu: u8 module param"
 fi
-if grep -q 'r8125_bridge_irq_pin_auto' "$BRIDGE_C"; then
-	grn "#4: r8125_bridge_irq_pin_auto cshim helper defined"
+# multi-queue: the auto policy now SPREADS active vectors across distinct CPUs
+# (host-tested layout::irq_affinity_cpu) instead of pinning all to one
+# NUMA-local CPU — the fix for multi-queue TX DMA-map drops from per-CPU
+# IOVA rcache churn. The cshim provides the fan-out base + width.
+if grep -q 'r8125_bridge_node_base_cpu' "$BRIDGE_C" &&
+	grep -q 'r8125_bridge_num_online_cpus' "$BRIDGE_C"; then
+	grn "#4/multi-queue: cshim defines affinity-spread inputs (node_base_cpu + num_online_cpus)"
 else
-	red "#4: cshim must define r8125_bridge_irq_pin_auto(pdev, irq, out_cpu)"
+	red "#4/multi-queue: cshim must define r8125_bridge_node_base_cpu + r8125_bridge_num_online_cpus"
+fi
+if grep -q 'irq_affinity_cpu' "$PCI_RS"; then
+	grn "#4/multi-queue: pci.rs spreads vectors via host-tested layout::irq_affinity_cpu"
+else
+	red "#4/multi-queue: pci.rs auto-pin must fan out via crate::layout::irq_affinity_cpu"
 fi
 if grep -q 'cpumask_of_node\|NUMA_NO_NODE' "$BRIDGE_C"; then
-	grn "#4: auto-pick respects NUMA topology"
+	grn "#4: auto-pick base respects NUMA topology"
 else
-	red "#4: auto-pick must use cpumask_of_node(dev_to_node(pdev->dev))"
+	red "#4: auto-pick base must use cpumask_of_node(dev_to_node(pdev->dev))"
 fi
 
 # ── Candidate M — tx_queue_len ─────────────────────────────────

@@ -166,7 +166,7 @@ pub(crate) struct BridgeOps {
     pub poll: extern "C" fn(cookie: *mut c_void, queue_id: u32, budget: c_int) -> c_int,
     pub change_mtu: extern "C" fn(cookie: *mut c_void, new_mtu: c_int) -> c_int,
     pub set_features: extern "C" fn(cookie: *mut c_void, feature_flags: u32) -> c_int,
-    /// B5 ethtool `set_rxfh` indirection validation. Returns 0 if every entry
+    /// ethtool `set_rxfh` indirection validation. Returns 0 if every entry
     /// maps to a runtime-active RX queue, `-EINVAL` otherwise. `indir`/`len`
     /// come straight from the kernel `ethtool_rxfh_param`; `queue_count` is the
     /// C bridge's active queue count.
@@ -202,12 +202,10 @@ extern "C" {
         queue_id: c_uint,
         work_done: c_int,
     );
+    fn r8125_bridge_set_active_rx_queues(ndev: *mut bindings::net_device, n: c_uint);
     fn r8125_bridge_irq_pin_cpu(irq: u32, cpu: c_int) -> c_int;
-    fn r8125_bridge_irq_pin_auto(
-        pdev: *mut bindings::pci_dev,
-        irq: u32,
-        out_cpu: *mut c_int,
-    ) -> c_int;
+    fn r8125_bridge_num_online_cpus() -> c_uint;
+    fn r8125_bridge_node_base_cpu(pdev: *mut bindings::pci_dev) -> c_int;
     fn r8125_bridge_dma_rmb();
     fn r8125_bridge_dma_wmb();
     fn r8125_bridge_tx_stop_queue(ndev: *mut bindings::net_device);
@@ -840,6 +838,16 @@ pub(crate) fn bridge_napi_complete_done(
     unsafe { r8125_bridge_napi_complete_done(ndev, queue_id as c_uint, work_done) };
 }
 
+/// Publish the runtime active RX queue count to the C bridge. The cshim clamps
+/// it and calls `netif_set_real_num_rx_queues`.
+///
+/// # SAFETY: `ndev` is the registered net_device; called from `ndo_open` under
+/// RTNL with the netdev down.
+pub(crate) fn set_active_rx_queues(ndev: *mut bindings::net_device, n: u32) {
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_set_active_rx_queues(ndev, n as c_uint) };
+}
+
 /// Suggest IRQ CPU affinity for the chip's MSI-X / MSI / INTx vector.
 /// Latency-aligned default (Candidate L of
 /// `docs/RX_OPTIMIZATION_CANDIDATES.md`). Best-effort: the kernel may
@@ -854,19 +862,23 @@ pub(crate) fn bridge_irq_pin_cpu(irq: u32, cpu: c_int) -> c_int {
     unsafe { r8125_bridge_irq_pin_cpu(irq, cpu) }
 }
 
-/// Pick the first online CPU on `pdev`'s NUMA node and pin `irq`
-/// there. Returns `(rc, cpu)` — `rc == 0` means success and `cpu`
-/// is the CPU that was actually chosen (useful for the dmesg log).
-/// Candidate #4 of `docs/RX_OPTIMIZATION_CANDIDATES.md`.
+/// Number of online CPUs — fan-out width for the multi-queue affinity spread
+/// (`layout::irq_affinity_cpu`).
 ///
-/// # SAFETY: as `bridge_irq_pin_cpu` plus: `pdev` must be a live
-/// `pci_dev` (the caller is probe-time, so probe's
-/// `pci::Device<Bound>` guarantees this).
-pub(crate) fn bridge_irq_pin_auto(pdev: *mut bindings::pci_dev, irq: u32) -> (c_int, c_int) {
-    let mut cpu_chosen: c_int = -1;
+/// # SAFETY: trivial — wraps `num_online_cpus()`, no preconditions.
+pub(crate) fn bridge_num_online_cpus() -> u32 {
     // SAFETY: see fn-level contract.
-    let rc = unsafe { r8125_bridge_irq_pin_auto(pdev, irq, &mut cpu_chosen) };
-    (rc, cpu_chosen)
+    unsafe { r8125_bridge_num_online_cpus() }
+}
+
+/// PCI-local NUMA-node first-online CPU — the fan-out base for the multi-queue
+/// affinity spread. Returns a negative errno if no online CPU is found.
+///
+/// # SAFETY: as `bridge_irq_pin_auto` — `pdev` must be a live `pci_dev`
+/// (probe-time `pci::Device<Bound>` guarantees this).
+pub(crate) fn bridge_node_base_cpu(pdev: *mut bindings::pci_dev) -> c_int {
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_node_base_cpu(pdev) }
 }
 
 /// DMA read barrier for the RX descriptor OWN-bit handoff.
@@ -936,7 +948,7 @@ pub(crate) fn rxfh_indir_default(index: u32, n_rx_rings: u32) -> u32 {
     unsafe { r8125_bridge_rxfh_indir_default(index, n_rx_rings) }
 }
 
-/// Validate a kernel-supplied ethtool RSS indirection table (B5 `set_rxfh`):
+/// Validate a kernel-supplied ethtool RSS indirection table (`set_rxfh`):
 /// every bucket must map to an owned queue. The decision is the host-tested
 /// `crate::layout::rxfh_indir_all_valid`; this wrapper only views the kernel
 /// buffer as a slice for the duration of the call.

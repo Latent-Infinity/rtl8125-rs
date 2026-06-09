@@ -66,9 +66,32 @@ const RX_HASH_INFO_VALUE_MASK: u64 = 0xFFFF_FFFF;
 /// the IRQ handler tail, and napi_complete_done) read the same surface
 /// choice — keeping the IMR/IMR_V2 selection in one place keeps the
 /// invariant from drifting as the V2 surface gets used elsewhere.
-pub(crate) fn rearm_irq_baseline(state: &NetdevState) {
+// Queue 0's per-queue V2 re-arm mask must equal the documented baseline
+// (`ROK_Q0 | TOK_Q0 | LINKCHG`) — queue 0 owns RX0 + TX + link. Compile-time
+// tie so the host-tested `v2_queue_rearm_mask` and the `regs` baseline can't
+// drift apart.
+const _: () = assert!(
+    crate::layout::v2_queue_rearm_mask(
+        0,
+        regs::ISRIMR_V2_ROK_Q0,
+        regs::ISRIMR_V2_TOK_Q0,
+        regs::ISRIMR_V2_LINKCHG,
+    ) == regs::INTR_V2_M4_BASELINE
+);
+
+pub(crate) fn rearm_irq_baseline(state: &NetdevState, queue_id: u32) {
     match (state.irq_mode(), state.use_v2_irq_surface()) {
-        (IrqMode::Msi, true) => state.regs().set_imr_v2_mask(regs::INTR_V2_M4_BASELINE),
+        // V2: re-arm only the source bits this queue owns — its own ROK, plus
+        // TX-completion + link-change for queue 0. The per-vector handler masked
+        // exactly those. For queue 0 this equals INTR_V2_M4_BASELINE.
+        (IrqMode::Msi, true) => state
+            .regs()
+            .set_imr_v2_mask(crate::layout::v2_queue_rearm_mask(
+                queue_id,
+                regs::ISRIMR_V2_ROK_Q0,
+                regs::ISRIMR_V2_TOK_Q0,
+                regs::ISRIMR_V2_LINKCHG,
+            )),
         (IrqMode::Intx, _) | (IrqMode::Msi, false) => state.regs().set_imr(regs::INTR_M4_BASELINE),
     }
 }
@@ -322,31 +345,42 @@ pub(crate) fn poll(state: &NetdevState, queue_id: u32, budget: c_int) -> c_int {
     let budget_u = if budget <= 0 { 0 } else { budget as usize };
 
     let work_done = process_rx_completions(state, queue_id, budget_u);
-    let (tx_tail, tx_head, reaped) = process_tx_completions(state);
-    if reaped > 0 {
-        // Update tx_tail BEFORE waking the queue — kernel xmit code re-
-        // reads tx_tail (indirectly through `in_flight`) to decide whether
-        // to start posting again. Stale tail with woken queue means an
-        // immediate NETDEV_TX_BUSY.
-        state.tx.tail.inner.store(tx_tail, Ordering::Release);
-        // Pair with the `fence(SeqCst)` in `stop_tx_queue_with_recheck`: this
-        // full StoreLoad barrier orders the `tx_tail` publish (and the
-        // inflight-bytes subtract done in `process_tx_completions` above)
-        // before the wake decision, so xmit's recheck and our wake can never
-        // both miss each other (Dekker). Without it the queue can wedge XOFF
-        // forever under UDP TX. See netdev::stop_tx_queue_with_recheck.
-        core::sync::atomic::fence(Ordering::SeqCst);
-        let in_flight = tx_head.wrapping_sub(tx_tail);
-        let free = RING_LEN - in_flight;
-        // Wake only when we've drained past the start threshold AND in-flight
-        // bytes are back under the byte-budget low-water. This is the wake-side
-        // half of the hysteresis (xmit stops the queue at `TX_STOP_THRS` or at
-        // the byte budget); `tx_should_wake` folds in both so we don't thrash
-        // kernel queue state on every reaped descriptor, and don't re-open the
-        // queue while it's still over the latency byte budget.
-        if crate::netdev::tx_should_wake(state, free) {
-            let ndev = state.ndev.load(Ordering::Acquire);
-            ub::bridge_tx_wake_queue(ndev);
+    // TX is a single ring owned by RX queue 0: the tx0 MSI-X vector schedules
+    // queue 0's NAPI (see netdev::v2_vector_source). ONLY queue 0 reaps it —
+    // letting queues 1..N also call process_tx_completions would race the shared
+    // TX shadow/tail across NAPIs (corrupting completion accounting + double
+    // `dma_unmap` → IOVA corruption → sporadic TX DMA-map failures, the
+    // any-queue reaper race). The tx0 vector keeps queue 0 scheduled to drain
+    // TX; with per-vector IRQ affinity each queue's DMA stays on one CPU so
+    // reaping keeps up.
+    if queue_id == crate::netdev::RX_QUEUE0 {
+        let (tx_tail, tx_head, reaped) = process_tx_completions(state);
+        if reaped > 0 {
+            // Update tx_tail BEFORE waking the queue — kernel xmit code re-
+            // reads tx_tail (indirectly through `in_flight`) to decide whether
+            // to start posting again. Stale tail with woken queue means an
+            // immediate NETDEV_TX_BUSY.
+            state.tx.tail.inner.store(tx_tail, Ordering::Release);
+            // Pair with the `fence(SeqCst)` in `stop_tx_queue_with_recheck`:
+            // this full StoreLoad barrier orders the `tx_tail` publish (and the
+            // inflight-bytes subtract done in `process_tx_completions` above)
+            // before the wake decision, so xmit's recheck and our wake can never
+            // both miss each other (Dekker). Without it the queue can wedge XOFF
+            // forever under UDP TX. See netdev::stop_tx_queue_with_recheck.
+            core::sync::atomic::fence(Ordering::SeqCst);
+            let in_flight = tx_head.wrapping_sub(tx_tail);
+            let free = RING_LEN - in_flight;
+            // Wake only when we've drained past the start threshold AND in-flight
+            // bytes are back under the byte-budget low-water. This is the
+            // wake-side half of the hysteresis (xmit stops the queue at
+            // `TX_STOP_THRS` or at the byte budget); `tx_should_wake` folds in
+            // both so we don't thrash kernel queue state on every reaped
+            // descriptor, and don't re-open the queue while it's still over the
+            // latency byte budget.
+            if crate::netdev::tx_should_wake(state, free) {
+                let ndev = state.ndev.load(Ordering::Acquire);
+                ub::bridge_tx_wake_queue(ndev);
+            }
         }
     }
 
@@ -357,7 +391,7 @@ pub(crate) fn poll(state: &NetdevState, queue_id: u32, budget: c_int) -> c_int {
         // call complete_done in the TX-cleanup-only path.
         let ndev = state.ndev.load(Ordering::Acquire);
         ub::bridge_napi_complete_done(ndev, queue_id, work_done);
-        rearm_irq_baseline(state);
+        rearm_irq_baseline(state, queue_id);
     }
     // If `work_done == budget`, return without complete_done so the
     // kernel re-polls us — IRQs stay masked across the re-poll.

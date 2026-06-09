@@ -50,7 +50,7 @@ else
 fi
 
 # RTL8125B's V2 per-queue interrupt surface routes TX Q0 to MSI-X table entry
-# 16 and link-change to entry 21. A B3-capable probe may enable V2 only after an
+# 16 and link-change to entry 21. A V2-capable probe may enable it only after an
 # exact 22-vector MSI-X allocation; every single-vector fallback must keep
 # use_v2=false.
 probe_irq_block=$(awk '/let \(irq_mode, use_v2\) = if intx_only/,/pr_info!/' "$PCI")
@@ -102,27 +102,34 @@ else
 	red "INT_CFG0_ENABLE_8125 is not guarded by IrqMode::Intx fallback"
 fi
 
+# Per-vector V2: each MSI-X vector acks + masks ONLY its own source bit
+# and schedules ONLY its queue's NAPI (whole-surface ack/mask would steal other
+# queues' interrupts). The legacy combined surface keeps the mask-all path.
 handler=$(awk '/fn raw_irq_handler/,/^}/' "$NETDEV")
 if echo "$handler" | grep -qE 'let use_v2 = state\.irq_mode\(\) == IrqMode::Msi && state\.use_v2_irq_surface\(\)' &&
-   echo "$handler" | grep -qE 'let status = if use_v2' &&
    echo "$handler" | grep -qE 'if use_v2 \{' &&
+   echo "$handler" | grep -qE 'v2_vector_source\(state, _irq as u32\)' &&
+   echo "$handler" | grep -qE 'regs\.ack_isr_v2\(bit\)' &&
+   echo "$handler" | grep -qE 'regs\.clear_imr_v2_mask\(bit\)' &&
+   echo "$handler" | grep -qE 'bridge_napi_schedule\(ndev, queue\)' &&
    echo "$handler" | grep -qE 'regs\.ack_isr\(status\)' &&
-   echo "$handler" | grep -qE 'regs\.set_imr\(0\)' &&
-   echo "$handler" | grep -qE 'regs\.ack_isr_v2\(status\)' &&
-   echo "$handler" | grep -qE 'regs\.clear_imr_v2_mask\(0xFFFF_FFFF\)'; then
-	grn "raw IRQ handler reads, acks, and masks the IrqMode-selected surface"
+   echo "$handler" | grep -qE 'regs\.set_imr\(0\)'; then
+	grn "raw IRQ handler routes each V2 vector to its own bit + queue; legacy keeps mask-all"
 else
-	red "raw IRQ handler does not fully branch on IrqMode"
+	red "raw IRQ handler does not implement per-vector V2 routing + legacy fallback"
 fi
 
+# V2 re-arm sets only the firing queue's owned source bits (its ROK, plus TX +
+# link for queue 0) via the host-tested layout::v2_queue_rearm_mask.
 rearm=$(awk '/fn rearm_irq_baseline/,/^}/' "$NAPI")
-if echo "$rearm" | grep -qE 'match \(state\.irq_mode\(\), state\.use_v2_irq_surface\(\)\)' &&
+if echo "$rearm" | grep -qE 'fn rearm_irq_baseline\(state: &NetdevState, queue_id: u32\)' &&
+   echo "$rearm" | grep -qE 'match \(state\.irq_mode\(\), state\.use_v2_irq_surface\(\)\)' &&
    echo "$rearm" | grep -qE 'IrqMode::Msi, true' &&
-   echo "$rearm" | grep -qE 'set_imr_v2_mask\(regs::INTR_V2_M4_BASELINE\)' &&
+   echo "$rearm" | grep -qE 'v2_queue_rearm_mask\(' &&
    echo "$rearm" | grep -qE 'set_imr\(regs::INTR_M4_BASELINE\)'; then
-	grn "NAPI re-arm uses the IrqMode-selected interrupt mask"
+	grn "NAPI re-arm sets the per-queue V2 source mask (or legacy baseline)"
 else
-	red "NAPI re-arm does not branch on IrqMode"
+	red "NAPI re-arm does not branch on IrqMode with per-queue V2 mask"
 fi
 
 if grep -qE 'pub\(crate\)[[:space:]]+const[[:space:]]+INT_CFG0_ENABLE_8125:[[:space:]]*u8[[:space:]]*=[[:space:]]*0x01;' "$REGS"; then

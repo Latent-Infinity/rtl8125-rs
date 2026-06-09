@@ -156,7 +156,7 @@ struct r8125_bridge_ops {
 	int (*set_features)(void *priv, unsigned int feature_flags);
 
 	/*
-	 * rss_indir_check(priv, indir, len) — B5 ethtool set_rxfh validation
+	 * rss_indir_check(priv, indir, len) — ethtool set_rxfh validation
 	 * ─────────────────────────────────
 	 * Pre   : RTNL held. `indir` is the kernel ethtool_rxfh_param table of
 	 *         `len` entries (or NULL/0 for no indirection change).
@@ -175,7 +175,7 @@ struct r8125_bridge_ops {
 #define R8125_BRIDGE_FEATURE_RXVLAN	0x00000002U
 #define R8125_BRIDGE_FEATURE_RXHASH	0x00000004U
 
-/* RSS table geometry exposed via ethtool (B5). These MUST equal the Rust
+/* RSS table geometry exposed via ethtool. These MUST equal the Rust
  * source-of-truth constants — regs::RSS_KEY_SIZE (40) and
  * layout::RSS_INDIR_TBL_ENTRIES (128); ci/check_rss_ethtool.sh asserts it.
  */
@@ -230,14 +230,13 @@ void r8125_bridge_unregister_and_free(struct net_device *ndev);
 int r8125_bridge_irq_pin_cpu(unsigned int irq, int cpu);
 
 /*
- * Pick the first online CPU on `pdev`'s NUMA node and pin `irq` there.
- * On UMA hosts this collapses to "lowest-numbered online CPU."
- * `out_cpu` receives the chosen CPU on success (may be NULL). Returns
- * 0 on success or a negative errno. See Candidate #4 of
- * `docs/RX_OPTIMIZATION_CANDIDATES.md`.
+ * Multi-queue affinity-spread inputs. The Rust side's host-tested
+ * `layout::irq_affinity_cpu` decides each vector's CPU; these feed it the
+ * kernel facts: the online-CPU count (fan-out width) and the PCI-local
+ * NUMA-node first-online CPU (fan-out base, negative errno if none online).
  */
-int r8125_bridge_irq_pin_auto(struct pci_dev *pdev, unsigned int irq,
-			      int *out_cpu);
+unsigned int r8125_bridge_num_online_cpus(void);
+int r8125_bridge_node_base_cpu(struct pci_dev *pdev);
 
 /* DMA read barrier after an RX descriptor's OWN bit clears. Mirrors
  * r8169's rtl_rx ordering: descriptor fields and DMA-written bytes are
@@ -292,6 +291,12 @@ void r8125_bridge_napi_schedule(struct net_device *ndev, unsigned int queue_id);
  */
 void r8125_bridge_napi_complete_done(struct net_device *ndev,
 				     unsigned int queue_id, int work_done);
+
+/* Set the runtime active RX queue count: updates ethtool reporting and
+ * netif_set_real_num_rx_queues. Called from Rust ndo_open under RTNL. Clamped
+ * to [1, R8125_BRIDGE_RX_QUEUE_COUNT].
+ */
+void r8125_bridge_set_active_rx_queues(struct net_device *ndev, unsigned int n);
 
 /* Link-state helpers — Rust calls these after detecting carrier change. */
 void r8125_bridge_carrier_on(struct net_device *ndev);

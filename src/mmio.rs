@@ -275,9 +275,17 @@ impl<'a> Regs<'a> {
         self.bar.write32(value, regs::RSS_CTRL_8125);
     }
 
-    /// `Q_NUM_CTRL_8125` (16-bit at 0x4800). Write 0 = single queue.
-    pub(crate) fn set_q_num_ctrl_8125(&self, value: u16) {
-        self.bar.write16(value, regs::Q_NUM_CTRL_8125);
+    /// `Q_NUM_CTRL_8125` (16-bit at 0x4800) RX-queue-count field (bits 2..4).
+    /// Read-modify-write preserving the other bits, matching vendor
+    /// `rtl8125_set_rx_q_num`. `q_num_bits` is the pre-shifted `ilog2(n)` value
+    /// from `layout::rss_q_num_ctrl` (0 ⇒ single queue).
+    pub(crate) fn set_q_num_ctrl_8125(&self, q_num_bits: u16) {
+        const Q_NUM_FIELD: u16 = 0x001C; // bits 2,3,4
+        let cur = self.bar.read16(regs::Q_NUM_CTRL_8125);
+        self.bar.write16(
+            (cur & !Q_NUM_FIELD) | (q_num_bits & Q_NUM_FIELD),
+            regs::Q_NUM_CTRL_8125,
+        );
     }
 
     /// Write the 40-byte RSS hash key (10 dwords at 0x4600).

@@ -7,9 +7,10 @@
 #   - TX: opts2 carries the tag-valid bit + swapped TCI.
 #   - RX: RTL8125 strips VLAN via RxConfig bits and reports the TCI in opts2.
 #
-# RXHASH is advertised only for single-queue V3 descriptor hash reporting. Full
-# hardware RSS remains disabled until multi-ring RX and the RTL8125B 22-vector
-# MSI-X model are implemented.
+# RXHASH is advertised with the V3 descriptor hash-reporting path (skb_set_hash
+# + per-disposition counters). Multi-queue hardware RSS is now opt-in via
+# rss_queues over the 22-vector V2 MSI-X surface; this gate only enforces that
+# the RXHASH advertisement stays paired with its V3 parser + counters.
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -96,17 +97,15 @@ if grep -q 'R8125_BRIDGE_FEATURE_RXHASH' "$BRIDGE" &&
    grep -q 'NETIF_F_RXHASH' "$BRIDGE" &&
    grep -q 'set_rss_ctrl_8125(0)' "$HW" &&
    grep -q 'set_q_num_ctrl_8125(0)' "$HW" &&
-   ! grep -q 'alloc_etherdev_mq' "$BRIDGE" &&
-   ! grep -q 'netif_set_real_num_rx_queues' "$BRIDGE" &&
    grep -q 'RX_HASH_INFO_ENABLED_BIT' "$NAPI" &&
    grep -q 'rx_hash_l3' "$RX_POOL" &&
    grep -q 'rx_hash_l4' "$RX_POOL" &&
    grep -q 'rx_hash_missing' "$RX_POOL" &&
    grep -q 'rx_hash_disabled' "$RX_POOL" &&
    grep -q 'skb_set_hash' "$RX_POOL" ; then
-	grn "RXHASH is advertised with V3 parser, skb hash reporting, counters, and single-queue RSS programming"
+	grn "RXHASH is advertised with V3 parser, skb hash reporting, counters, and hw RSS baseline clear"
 else
-	red "RXHASH advertisement must stay paired with V3 parser, skb_set_hash, counters, and single-queue RSS programming"
+	red "RXHASH advertisement must stay paired with V3 parser, skb_set_hash, counters, and hw RSS baseline clear"
 fi
 
 rxhash_order=$(awk '

@@ -324,10 +324,19 @@ impl pci::Driver for R8125Driver {
                             }
                         }
                     };
-                    let irq_num = unsafe_boundary::pci_irq_vector(
-                        pdev,
-                        regs::V2_RX_Q0_VECTOR,
-                    )?;
+                    // Per-RX-queue IRQ numbers. V2 maps RX queue i to MSI-X
+                    // entry i (0..N-1); the single-vector / INTx fallback uses
+                    // only entry 0 (the combined interrupt). Fetch all RX
+                    // vectors under V2 even if only some are activated at open —
+                    // the unused ones are simply never `request_irq`'d.
+                    let mut rx_irq_nums = [0u32; crate::netdev::RX_QUEUE_COUNT];
+                    rx_irq_nums[0] =
+                        unsafe_boundary::pci_irq_vector(pdev, regs::V2_RX_Q0_VECTOR)?;
+                    if use_v2 {
+                        for (i, slot) in rx_irq_nums.iter_mut().enumerate().skip(1) {
+                            *slot = unsafe_boundary::pci_irq_vector(pdev, i as u32)?;
+                        }
+                    }
                     let tx_irq_num = if use_v2 {
                         unsafe_boundary::pci_irq_vector(pdev, regs::V2_TX_Q0_VECTOR)?
                     } else {
@@ -338,6 +347,7 @@ impl pci::Driver for R8125Driver {
                     } else {
                         0
                     };
+                    let irq_num = rx_irq_nums[0];
                     dev_info!(
                         pdev,
                         "RTL8125 IRQ allocated: rx0 IRQ {} tx0 IRQ {} link IRQ {} (mode={:?}, use_v2={}){}\n",
@@ -349,59 +359,86 @@ impl pci::Driver for R8125Driver {
                         if intx_only { ", forced by intx_only" } else { "" }
                     );
 
-                    // Candidate L + #4 — IRQ affinity policy.
+                    // Candidate L + #4 + multi-queue — IRQ affinity policy.
                     //
                     // The `irq_pin_cpu` module param selects:
-                    //   255  → auto: pick first online CPU on the chip's
-                    //          NUMA node (PCI-local). UMA hosts collapse
-                    //          to lowest-numbered online CPU.
+                    //   255  → auto: SPREAD the active vectors across distinct
+                    //          CPUs, fanning out from the chip's NUMA-local
+                    //          first-online CPU (host-tested
+                    //          `layout::irq_affinity_cpu`). Each queue's DMA
+                    //          then stays on one per-CPU IOVA cache, fixing
+                    //          multi-queue `tx_dropped_error` from IOVA rcache
+                    //          contention. Single-queue collapses to the
+                    //          one NUMA-local CPU (unchanged behaviour).
                     //   254  → skip; leave to irqbalance.
-                    //   0..253 → explicit CPU index; must be online.
+                    //   0..253 → explicit CPU index; pins every vector there.
                     //
-                    // Default is 255 (auto). Operator can override via
-                    // module param OR per-IRQ `/proc/irq/N/smp_affinity`.
-                    // Best-effort: kernel rejection (e.g. offline CPU)
-                    // is logged and we proceed — driver still works.
+                    // Default is 255 (auto). Operator can override via module
+                    // param OR per-IRQ `/proc/irq/N/smp_affinity`. Best-effort:
+                    // kernel rejection (e.g. offline CPU) is logged and we
+                    // proceed — driver still works.
                     let pin_policy =
                         *crate::module_parameters::irq_pin_cpu.value();
-                    let pin_irq = |label: &str, irq: u32| {
-                        let (pin_rc, chosen_cpu) = match pin_policy {
-                            255 => unsafe_boundary::bridge_irq_pin_auto(
-                                unsafe_boundary::pci_dev_raw(pdev),
-                                irq,
-                            ),
-                            254 => {
-                                dev_info!(
-                                    pdev,
-                                    "RTL8125 {} IRQ {} affinity hint skipped (irq_pin_cpu=254)\n",
-                                    label,
-                                    irq
-                                );
-                                (0, -1)
-                            }
-                            n => {
-                                let cpu = core::ffi::c_int::from(n);
-                                (unsafe_boundary::bridge_irq_pin_cpu(irq, cpu), cpu)
-                            }
+                    // Resolve the auto-spread fan-out base + width once. base<0
+                    // (no online CPU on node) and ncpus==0 both degrade to CPU 0
+                    // via `irq_affinity_cpu`'s defensive path.
+                    let (spread_base, spread_ncpus) = if pin_policy == 255 {
+                        let base = unsafe_boundary::bridge_node_base_cpu(
+                            unsafe_boundary::pci_dev_raw(pdev),
+                        );
+                        let ncpus =
+                            unsafe_boundary::bridge_num_online_cpus() as usize;
+                        (if base < 0 { 0usize } else { base as usize }, ncpus)
+                    } else {
+                        (0usize, 0usize)
+                    };
+                    let mut pin_idx = 0usize;
+                    let mut pin_irq = |label: &str, irq: u32| {
+                        if pin_policy == 254 {
+                            dev_info!(
+                                pdev,
+                                "RTL8125 {} IRQ {} affinity hint skipped (irq_pin_cpu=254)\n",
+                                label,
+                                irq
+                            );
+                            return;
+                        }
+                        let chosen_cpu = if pin_policy == 255 {
+                            let cpu = crate::layout::irq_affinity_cpu(
+                                pin_idx,
+                                spread_base,
+                                spread_ncpus,
+                            ) as core::ffi::c_int;
+                            pin_idx += 1;
+                            cpu
+                        } else {
+                            core::ffi::c_int::from(pin_policy)
                         };
-                        if pin_policy != 254 {
-                            if pin_rc == 0 {
-                                dev_info!(
-                                    pdev,
-                                    "RTL8125 {} IRQ {} affinity hint set to CPU {} (policy={})\n",
-                                    label, irq, chosen_cpu, pin_policy
-                                );
-                            } else {
-                                dev_info!(
-                                    pdev,
-                                    "RTL8125 {} IRQ {} affinity hint failed: rc={} policy={} (driver still functional)\n",
-                                    label, irq, pin_rc, pin_policy
-                                );
-                            }
+                        let pin_rc =
+                            unsafe_boundary::bridge_irq_pin_cpu(irq, chosen_cpu);
+                        if pin_rc == 0 {
+                            dev_info!(
+                                pdev,
+                                "RTL8125 {} IRQ {} affinity set to CPU {} (policy={})\n",
+                                label, irq, chosen_cpu, pin_policy
+                            );
+                        } else {
+                            dev_info!(
+                                pdev,
+                                "RTL8125 {} IRQ {} affinity failed: rc={} cpu={} policy={} (driver still functional)\n",
+                                label, irq, pin_rc, chosen_cpu, pin_policy
+                            );
                         }
                     };
+                    // Spread order MUST match the request_irq order in
+                    // `register_irq_handler` so each active vector gets its own
+                    // CPU: rx0..rx_{active-1}, then tx0, then link (V2 only).
                     pin_irq("rx0", irq_num);
                     if use_v2 {
+                        let active = crate::netdev::active_rx_queues();
+                        for &rx_irq in rx_irq_nums.iter().take(active).skip(1) {
+                            pin_irq("rx", rx_irq);
+                        }
                         pin_irq("tx0", tx_irq_num);
                         pin_irq("link", link_irq_num);
                     }
@@ -463,7 +500,7 @@ impl pci::Driver for R8125Driver {
                                 )
                             }),
                             irq <- crate::netdev::IrqState::new(
-                                irq_num,
+                                rx_irq_nums,
                                 tx_irq_num,
                                 link_irq_num,
                                 irq_mode,

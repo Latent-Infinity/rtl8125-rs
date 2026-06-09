@@ -39,3 +39,8 @@ target/
 .DS_Store
 *.swp
 *~
+
+# Orchestration run evidence (BUILD_TEST_ORCHESTRATION.md): raw N-repeat run
+# dirs are not committed — only curated summaries are. See that doc's
+# "Resolved Review Questions".
+docs/perf/runs/

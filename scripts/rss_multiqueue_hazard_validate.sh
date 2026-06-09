@@ -217,7 +217,8 @@ start_iperf_server() {
 }
 
 run_udp_case() {
-	local mode="$1" length="$2" file="$RAW/${mode}.json"
+	local mode="$1" length="$2"
+	local file="$RAW/${mode}.json"
 
 	interrupt_snapshot "${mode}_irq_before"
 	ethtool -S "$DUT_IFACE" > "$RAW/ethtool_S_${mode}_before.txt" 2>/dev/null || true

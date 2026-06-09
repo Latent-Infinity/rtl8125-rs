@@ -119,30 +119,27 @@ const BRIDGE_FEATURE_RXHASH: u32 = 0x0000_0004;
 pub(crate) const RX_QUEUE0: u32 = 0;
 /// Compile-time maximum RX queues = the DMA rings, NAPI instances, and per-queue
 /// state arrays the driver allocates. RTL8125B's `HwSuppNumRxQueues` is 4. The
-/// *runtime* active count is [`active_rx_queues`] (1 until B6.2/B6.3 lift the
-/// multi-queue activation block).
+/// *runtime* active count is [`active_rx_queues`], so all users share one
+/// source of truth.
 pub(crate) const RX_QUEUE_COUNT: usize = 4;
 
 /// Runtime number of RX queues actually set up this open — host-tested clamp in
 /// [`crate::layout::active_rx_queues`]. `rss_queues=0` (default) ⇒ 1 (the proven
 /// single-queue path); multi-queue activation is gated in
-/// [`validate_rss_queue_request`] until the per-vector IRQ + RSS-spread
-/// increments (B6.2/B6.3) land.
+/// [`validate_rss_queue_request`].
 #[inline]
-fn active_rx_queues() -> usize {
-    let requested = *crate::module_parameters::rss_queues.value();
-    if requested > 1 {
-        // B6.1 foundation only: rings/NAPI exist, but queues 1+ are not yet
-        // IRQ-drained. Keep every runtime path on the proven single queue even
-        // if the module parameter changes after open validation.
-        1
-    } else {
-        crate::layout::active_rx_queues(requested, RX_QUEUE_COUNT)
-    }
+pub(crate) fn active_rx_queues() -> usize {
+    // Multi-queue RX is fully wired (per-queue rings/NAPI, per-vector IRQ
+    // routing, RSS spread), so honor the validated `rss_queues` request clamped
+    // to the compile-time maximum.
+    crate::layout::active_rx_queues(
+        *crate::module_parameters::rss_queues.value(),
+        RX_QUEUE_COUNT,
+    )
 }
 
-// RXHASH feature gate for the single-queue hash-reporting path. Hardware RSS
-// remains disabled; this only lets the stack consume descriptor hashes.
+// RXHASH feature gate for descriptor hash reporting. Hardware RSS queue
+// distribution is controlled separately by the opt-in rss_queues parameter.
 const RXHASH_FEATURE_GATE: bool = true;
 
 /// Stop the TX queue preemptively when fewer than this many descriptor
@@ -478,10 +475,11 @@ impl RxQueueState {
 /// allocation and mode detection. Read-only after probe; the atomic on `mode`
 /// is just to satisfy the `&self` access pattern.
 pub(crate) struct IrqState {
-    /// IRQ number for RX Q0 / legacy combined interrupt ownership. For
-    /// single-vector MSI/MSI-X and INTx fallback this is the only requested
-    /// IRQ. For V2 it is MSI-X entry 0.
-    pub(crate) num: u32,
+    /// Per-RX-queue IRQ numbers. `rx_nums[i]` is the MSI-X entry-`i` vector
+    /// that signals RX queue `i`'s ROK under V2. The single-vector MSI/MSI-X and
+    /// INTx fallback uses only `rx_nums[0]` (the combined interrupt); the rest
+    /// stay 0. Only `active_rx_queues()` of them are requested at open.
+    pub(crate) rx_nums: [u32; RX_QUEUE_COUNT],
     /// IRQ number for V2 TX Q0 (MSI-X entry 16). Zero when V2 is not active.
     pub(crate) tx_num: u32,
     /// IRQ number for V2 link-change (MSI-X entry 21). Zero when V2 is not
@@ -497,13 +495,14 @@ pub(crate) struct IrqState {
     /// `true` only when we know the message-ID surface is available.
     // NOT-PADDED: written once at probe, read by all contexts.
     pub(crate) use_v2: AtomicBool,
-    /// Whether the IRQ handler is currently registered (`request_irq` done,
-    /// `free_irq` not yet). Single source of truth so the IRQ is freed
-    /// exactly once across the `ndo_open` rollback guard, `ndo_stop`, and any
-    /// teardown double-close — without it, an unbind-while-up could `free_irq`
-    /// an IRQ that is no longer (or was never) registered, tripping the
-    /// kernel's "trying to free already-free IRQ" WARN at `manage.c`.
-    pub(crate) requested: CachePadded<AtomicBool>,
+    /// Per-RX-queue registration flags (`request_irq` done, `free_irq` not
+    /// yet). Single source of truth so each vector is freed exactly once across
+    /// the `ndo_open` rollback guard, `ndo_stop`, and any teardown
+    /// double-close — without it, an unbind-while-up could `free_irq` an IRQ
+    /// with no registered action and trip the kernel's "trying to free
+    /// already-free IRQ" WARN at `manage.c`. `rx_requested[0]` is the
+    /// rx0/legacy vector.
+    pub(crate) rx_requested: [CachePadded<AtomicBool>; RX_QUEUE_COUNT],
     /// V2 TX Q0 IRQ registration flag. Separate from `requested` because entry
     /// 16 is a distinct Linux IRQ and must be freed exactly once.
     pub(crate) tx_requested: CachePadded<AtomicBool>,
@@ -514,19 +513,21 @@ pub(crate) struct IrqState {
 
 impl IrqState {
     pub(crate) fn new(
-        num: u32,
+        rx_nums: [u32; RX_QUEUE_COUNT],
         tx_num: u32,
         link_num: u32,
         mode: IrqMode,
         use_v2: bool,
     ) -> impl pin_init::Init<Self, kernel::error::Error> {
         kernel::try_init!(Self {
-            num,
+            rx_nums,
             tx_num,
             link_num,
             mode: AtomicU8::new(mode as u8),
             use_v2: AtomicBool::new(use_v2),
-            requested: CachePadded::new(AtomicBool::new(false)),
+            rx_requested <- pin_init::init_array_from_fn(
+                |_| CachePadded::new(AtomicBool::new(false))
+            ),
             tx_requested: CachePadded::new(AtomicBool::new(false)),
             link_requested: CachePadded::new(AtomicBool::new(false)),
         }? kernel::error::Error)
@@ -730,7 +731,7 @@ extern "C" fn rust_set_features(cookie: *mut c_void, feature_flags: u32) -> c_in
     0
 }
 
-/// B5 ethtool `set_rxfh` indirection check. Validates the kernel-supplied table
+/// ethtool `set_rxfh` indirection check. Validates the kernel-supplied table
 /// against the owned RX-queue count via the host-tested
 /// `layout::rxfh_indir_all_valid`. Returns 0 (accept) or `-EINVAL`.
 extern "C" fn rust_rss_indir_check(
@@ -896,23 +897,22 @@ fn validate_rss_queue_request(state: &NetdevState) -> Result<()> {
         return Err(EINVAL);
     }
 
-    if requested > 1 && !state.use_v2_irq_surface() {
-        pr_warn!("r8125_rust: multi-queue RSS requires the RTL8125B V2 MSI-X surface\n");
-        return Err(EINVAL);
-    }
-
-    // B6.1 foundation: rings/NAPI for RX_QUEUE_COUNT are allocated, but the
-    // per-vector RX IRQ routing (B6.2) and RSS spread (B6.3) are not wired yet,
-    // so refuse to half-activate multi-queue (queues 1+ would fill with no IRQ
-    // to drain them). Lifted when B6.2/B6.3 land.
-    if requested > 1 {
+    if !crate::layout::rss_queue_request_supported(requested, RX_QUEUE_COUNT) {
         pr_warn!(
-            "r8125_rust: rss_queues={} requested but multi-queue RX activation is not enabled in this build (single-queue only)\n",
+            "r8125_rust: rss_queues={} is not supported; RTL8125 RSS queue counts must be 0, 1, 2, or 4\n",
             requested
         );
         return Err(EINVAL);
     }
 
+    if requested > 1 && !state.use_v2_irq_surface() {
+        pr_warn!("r8125_rust: multi-queue RSS requires the RTL8125B V2 MSI-X surface\n");
+        return Err(EINVAL);
+    }
+
+    // Multi-queue RX is now fully wired (per-queue rings, NAPI, per-vector IRQ
+    // routing, and RSS indirection spread), so representable `rss_queues`
+    // requests (2 or 4 on RTL8125B) are honored over the V2 surface.
     Ok(())
 }
 
@@ -933,7 +933,14 @@ fn apply_rss_programming(state: &NetdevState) {
     if state.rx_hash_enabled.load(Ordering::Acquire) || requested != 0 {
         regs.set_q_num_ctrl_8125(rss_q_num_ctrl(queue_count));
         program_rss_key_and_indir(&regs, queue_count);
-        regs.set_rss_ctrl_8125(regs::RSS_CTRL_HASH_BITS);
+        // RSS_CTRL carries the queue-count + mask-length fields, not just the
+        // hash-type enables — without the queue-count field the chip steers
+        // everything to queue 0. See layout::rss_ctrl_value.
+        regs.set_rss_ctrl_8125(crate::layout::rss_ctrl_value(
+            queue_count,
+            crate::layout::RSS_INDIR_TBL_ENTRIES,
+            regs::RSS_CTRL_HASH_BITS,
+        ));
         return;
     }
 
@@ -1085,11 +1092,24 @@ fn register_irq_handler(state: &NetdevState, cookie: *mut c_void) -> Result<()> 
         IrqMode::Intx => ub::IRQF_SHARED,
         IrqMode::Msi => 0,
     };
-    ub::request_irq(state.irq.num, raw_irq_handler, cookie, irq_flags)?;
-    // Mark the IRQ registered so `free_irq_if_registered` releases it exactly
-    // once on the eventual teardown path (open rollback guard or ndo_stop).
-    state.irq.requested.inner.store(true, Ordering::Release);
+    // RX queue 0 / legacy combined vector — always requested. Mark it so
+    // `free_irq_if_registered` releases each vector exactly once on teardown
+    // (open rollback guard or ndo_stop).
+    ub::request_irq(state.irq.rx_nums[0], raw_irq_handler, cookie, irq_flags)?;
+    state.irq.rx_requested[0]
+        .inner
+        .store(true, Ordering::Release);
     if state.irq_mode() == IrqMode::Msi && state.use_v2_irq_surface() {
+        // V2: each extra active RX queue gets its own MSI-X vector
+        // (entry i), routed to queue i's NAPI by `raw_irq_handler`. On a
+        // mid-loop failure the already-registered vectors are released by the
+        // IrqGuard rollback via `free_irq_if_registered`.
+        for i in 1..active_rx_queues() {
+            ub::request_irq(state.irq.rx_nums[i], raw_irq_handler, cookie, irq_flags)?;
+            state.irq.rx_requested[i]
+                .inner
+                .store(true, Ordering::Release);
+        }
         ub::request_irq(state.irq.tx_num, raw_irq_handler, cookie, irq_flags)?;
         state.irq.tx_requested.inner.store(true, Ordering::Release);
         ub::request_irq(state.irq.link_num, raw_irq_handler, cookie, irq_flags)?;
@@ -1108,11 +1128,6 @@ fn register_irq_handler(state: &NetdevState, cookie: *mut c_void) -> Result<()> 
 /// without it, `ndo_stop` could `free_irq` an IRQ with no registered action
 /// on an unbind-while-up / double-close and trip the kernel's
 /// "trying to free already-free IRQ" WARN.
-#[inline]
-fn release_irq_registration(state: &NetdevState) -> bool {
-    state.irq.requested.inner.swap(false, Ordering::AcqRel)
-}
-
 fn free_irq_if_registered(state: &NetdevState) {
     let cookie = cookie_from_state(state);
     if state.irq.link_requested.inner.swap(false, Ordering::AcqRel) {
@@ -1121,8 +1136,15 @@ fn free_irq_if_registered(state: &NetdevState) {
     if state.irq.tx_requested.inner.swap(false, Ordering::AcqRel) {
         ub::free_irq(state.irq.tx_num, cookie);
     }
-    if release_irq_registration(state) {
-        ub::free_irq(state.irq.num, cookie);
+    // Release RX vectors high→low (extras before rx0), mirroring the request
+    // order. Each `swap` clears its flag so a vector is freed exactly once.
+    for i in (0..RX_QUEUE_COUNT).rev() {
+        if state.irq.rx_requested[i]
+            .inner
+            .swap(false, Ordering::AcqRel)
+        {
+            ub::free_irq(state.irq.rx_nums[i], cookie);
+        }
     }
 }
 
@@ -1270,7 +1292,7 @@ fn log_ndo_open_complete(state: &NetdevState, regs: &Regs<'_>) {
         "r8125_rust ndo_open complete: mode={:?} use_v2={} IRQ={} tx_irq={} link_irq={} ChipCmd=0x{:02x} ISR=0x{:08x} IMR_rb=0x{:08x} ISR_v2=0x{:08x} IMR_V2_SET_diag=0x{:08x} INT_CFG0=0x{:02x} PHYStatus=0x{:02x} tx_dma=0x{:016x} rx_dma=0x{:016x}\n",
         irq_mode,
         use_v2,
-        state.irq.num,
+        state.irq.rx_nums[0],
         state.irq.tx_num,
         state.irq.link_num,
         regs.chip_cmd(),
@@ -1390,6 +1412,12 @@ fn ndo_open(state: &NetdevState, feature_flags: u32) -> Result<()> {
         Ordering::Relaxed,
     );
     validate_rss_queue_request(state)?;
+    // Publish the runtime active RX queue count to the C bridge so ethtool
+    // (get_channels / get_rx_ring_count) and the stack
+    // (netif_set_real_num_rx_queues → RPS sysfs) report the real number. Runs
+    // under RTNL with the netdev down, before any queue is posted.
+    let ndev = state.ndev.load(Ordering::Acquire);
+    ub::set_active_rx_queues(ndev, active_rx_queues() as u32);
     let regs = state.regs();
 
     // Bus-mastering on. (DMA mask was set at probe.)
@@ -1439,9 +1467,13 @@ fn ndo_open(state: &NetdevState, feature_flags: u32) -> Result<()> {
     program_interrupt_moderation(state, &regs);
 
     // Unmask the chosen IRQ surface LAST — mirrors r8169 `rtl_irq_enable`.
-    // `rearm_irq_baseline` picks legacy `IMR` or V2 `IMR_V2_SET` based
-    // on `state.irq_mode()`.
-    crate::napi::rearm_irq_baseline(state);
+    // `rearm_irq_baseline` picks legacy `IMR` or V2 `IMR_V2_SET` based on
+    // `state.irq_mode()`. Enable every active queue's source bits so each gets
+    // its first interrupt (queue 0 also enables TX + link). For the legacy
+    // surface this writes the same baseline once.
+    for queue_id in 0..active_rx_queues() {
+        crate::napi::rearm_irq_baseline(state, queue_id as u32);
+    }
 
     // PHY step 2 — kick the state machine LAST. Per r8169 ordering this
     // runs after `ChipCmd RX|TX` enable + `IMR` programming. Carrier
@@ -1995,36 +2027,63 @@ fn ndo_start_xmit(state: &NetdevState, skb: crate::skb::DriverOwnedSkb) -> c_int
 
 // ── Raw IRQ handler ───────────────────────────────────────────────────────
 
+/// Map a firing Linux IRQ to its V2 (source-bit, target-queue):
+///   `rx_nums[i]` → (ROK bit `1<<i`, queue `i`)
+///   `tx_num`     → (TOK_Q0 bit, queue 0)  — TX completions are reaped in q0
+///   `link_num`   → (LINKCHG bit, queue 0)
+/// Inactive RX vectors are fetched but never `request_irq`'d, so they never
+/// fire; matching by IRQ number is unambiguous. `None` ⇒ not one of ours.
+#[inline]
+fn v2_vector_source(state: &NetdevState, irq: u32) -> Option<(u32, u32)> {
+    for i in 0..RX_QUEUE_COUNT {
+        if state.irq.rx_nums[i] == irq {
+            let bit = crate::layout::v2_rx_queue_bit(i as u32, regs::ISRIMR_V2_ROK_Q0);
+            return Some((bit, i as u32));
+        }
+    }
+    if irq == state.irq.tx_num {
+        return Some((regs::ISRIMR_V2_TOK_Q0, RX_QUEUE0));
+    }
+    if irq == state.irq.link_num {
+        return Some((regs::ISRIMR_V2_LINKCHG, RX_QUEUE0));
+    }
+    None
+}
+
 extern "C" fn raw_irq_handler(_irq: c_int, dev_id: *mut c_void) -> bindings::irqreturn_t {
     let state = state_from(dev_id);
     let regs = state.regs();
     let use_v2 = state.irq_mode() == IrqMode::Msi && state.use_v2_irq_surface();
-    // Branch on the probe-chosen delivery mode:
-    //   Intx or Msi without V2-capability → legacy ISR (0x3C) + IMR
-    //   (0x38), W1C ack
-    //   Msi with V2-capability → ISR_V2 (0x0D04) + IMR_V2
-    //   (0x0D00/0x0D0C), W1C ack
-    // The two windows are mutually exclusive at the chip: once
-    // `INT_CFG0_ENABLE_8125` is set, the legacy ISR stops latching
-    // sources (and vice versa), so each branch reads exactly one.
-    let status = if use_v2 { regs.isr_v2() } else { regs.isr() };
+    if use_v2 {
+        // Per-vector V2 (ISR_V2 0x0D04 / IMR_V2 0x0D00,0x0D0C): each MSI-X
+        // vector signals exactly ONE source bit (`BIT(message_id)`), so ack and
+        // mask ONLY that bit and schedule ONLY its queue's NAPI. Touching the
+        // whole surface here would steal other queues' pending interrupts. The
+        // queue's `rearm_irq_baseline(queue_id)` re-arms its own bit(s) after
+        // `napi_complete_done`, closing the loop.
+        let Some((bit, queue)) = v2_vector_source(state, _irq as u32) else {
+            return bindings::irqreturn_IRQ_NONE as bindings::irqreturn_t;
+        };
+        if regs.isr_v2() == 0xFFFF_FFFF {
+            // Device gone (surprise-removal): all-ones read.
+            return bindings::irqreturn_IRQ_NONE as bindings::irqreturn_t;
+        }
+        note_irq_fire(state);
+        regs.ack_isr_v2(bit);
+        regs.clear_imr_v2_mask(bit);
+        let ndev = state.ndev.load(Ordering::Acquire);
+        ub::bridge_napi_schedule(ndev, queue);
+        return bindings::irqreturn_IRQ_HANDLED as bindings::irqreturn_t;
+    }
+    // Legacy combined ISR (0x3C) + IMR (0x38), W1C ack — INTx (shared line) or
+    // single-vector MSI. Mask-all + schedule queue 0; unchanged from M4.
+    let status = regs.isr();
     if status == 0 || status == 0xFFFF_FFFF {
-        // 0 = not ours (or stale read after free_irq); !0 = device gone.
-        // For Intx we may legitimately see 0 on a shared line; for
-        // MSI/MSI-X 0 should be rare but is still benign to early-out.
         return bindings::irqreturn_IRQ_NONE as bindings::irqreturn_t;
     }
     note_irq_fire(state);
-    // Ack everything we saw, mask further IRQs, hand off to NAPI.
-    // NAPI's re-arm calls `rearm_irq_baseline` which selects the same
-    // window after `napi_complete_done`, closing the loop.
-    if use_v2 {
-        regs.ack_isr_v2(status);
-        regs.clear_imr_v2_mask(0xFFFF_FFFF);
-    } else {
-        regs.ack_isr(status);
-        regs.set_imr(0);
-    }
+    regs.ack_isr(status);
+    regs.set_imr(0);
     let ndev = state.ndev.load(Ordering::Acquire);
     ub::bridge_napi_schedule(ndev, RX_QUEUE0);
     bindings::irqreturn_IRQ_HANDLED as bindings::irqreturn_t
