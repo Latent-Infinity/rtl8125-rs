@@ -1,7 +1,28 @@
 # RSS / RXHASH Gap Ledger
 
-**Status: 2026-06-07.** Single-queue RXHASH is implemented and closed for the
-RFC path; full hardware RSS is now started for Realtek vendor-driver parity.
+**Update 2026-06-10 — three-way statistical comparison.** A rigorous
+multi-sample sweep (Rust vs in-tree `r8169` vs vendor `r8125`, N=5–12/point,
+median+spike-rate, per-sample peer restart) confirms **no clean driver metric
+favors C** (the only row where a C driver can look lower is the bursty TCP-retr
+spike count — zero NIC drops, reorders run to run, i.e. rig noise):
+link-bound parity on TCP/UDP/jumbo throughput, and Rust *wins* the
+differentiating axes — latency-under-load (0.60–0.61 ms vs r8169 0.69 / vendorC
+0.71), sustained `-P16` retransmits (0 vs ~44k for both C drivers), and 64B
+multi-queue UDP (rust4 1.00 = vendorC, both > r8169 0.74). Two prior "C wins"
+findings were measurement artifacts that vanished under proper sampling. Standard
++ evidence: `docs/perf/BENCHMARK_METHODOLOGY.md`,
+`docs/perf/cvr_stat_sweep_20260610/`.
+
+**Status: 2026-06-09.** Single-queue RXHASH is implemented and closed for the
+RFC path. **Full hardware multi-queue RSS (Track B) is CLOSED** —
+`rss_queues=2..4` runs at line rate on gateway + KVM with RX spread across 4
+queues, and a Rust-vs-vendor-`r8125`(RSS) comparison confirms **cold-start parity
+(6/6 both clean: 2.36 Gbit, retr=0, 0 drops) and Rust ≥ C under stress** (under
+sustained `-P16` Rust holds line rate with retr=0 while the vendor degrades/fails
+with ~12k retr + 64 serious dmesg warnings). No scenario favors C. The earlier
+0/56/95-drop figures were uncontrolled no-reload test artifacts. Default
+stays `rss_queues=0` (single-queue RFC path); multi-queue is a validated operator
+opt-in. See `docs/perf/rss_multiqueue_20260609/`.
 
 ## Baseline evidence captured
 
@@ -11,7 +32,7 @@ RFC path; full hardware RSS is now started for Realtek vendor-driver parity.
 | checksum/TSO | parity-to-better on tested profiles | parity | `docs/perf/cvr_20260606_opt/SUMMARY.md`, `docs/SESSION_RESUME.md`, `ci/check_hw_offload_features.sh` |
 | UDP TX wedge (legacy ISR) | fixed with `use_v2=false` on single-vector MSI path | reference baseline | `docs/perf/byte_budget_20260605/UDP_TX_WEDGE.md`, `docs/perf/byte_budget_20260605/RESULTS.md` |
 | RXHASH advertise | `NETIF_F_RXHASH` advertised with one RX queue and V3 hash reporting | vendor `r8125` supports RSS/RXHASH; mainline `r8169` does not | `ci/check_hw_offload_features.sh`, `docs/perf/HW_OFFLOAD_VALIDATE.md`, `src/netdev_bridge.c`, `docs/perf/cvr_20260607_v3rxhash/` |
-| queueing model | single RX queue + one TX queue in Rust; queue-aware bridge contract and one-queue Rust RX state scaffold implemented | vendor `r8125` supports multi-queue RSS | `scripts/gateway_hw_offload_validate.sh` (`queues.csv`), `docs/perf/HW_OFFLOAD_VALIDATE.md`, `docs/perf/b2_rx_state_array_smoke_20260607/` |
+| queueing model | **CLOSED** — up to 4 RX queues + RSS spread, opt-in via `rss_queues` (default 0 = off / single-queue); line rate on gateway + KVM. One TX ring (reaped by queue 0). Cold-start at vendor-C parity; Rust ≥ C under stress. `set_channels` (ethtool -L) implemented | vendor `r8125` multi-queue RSS — Rust **at-or-better** (parity cold-start; better under sustained -P16) | `docs/perf/rss_multiqueue_20260609/README.md` (Rust-vs-C comparison), `docs/perf/runs/`, `ci/check_rss_queue_contract.sh` |
 | RTL8125B V2 interrupt ownership | exact 22-vector MSI-X gate implemented; V2 owns RX0/TX0/LINK entries 0/16/21; single-vector fallback remains legacy | vendor `r8125` requires the fixed V2 message-id topology | `ci/check_irq_mode_contract.sh`, `ci/check_msix_static.sh`, `ci/check_isr_v2_paired.sh`, `docs/perf/b3_v2_msix_smoke_20260607/` |
 
 ## Hashability Gate Status
@@ -49,10 +70,16 @@ RFC path; full hardware RSS is now started for Realtek vendor-driver parity.
   (RX0 entry 0, TX Q0 entry 16, LINKCHG entry 21), with single-vector fallback
   kept on the legacy combined ISR/IMR surface.
 - Complete + Gateway-smoked: RSS register/key/indirection programming is behind
-  the off/default `rss_queues` gate. `rss_queues=1` programs a queue-0 default
-  indirection table for validation; `rss_queues>1` fails until more RX queues
-  are actually owned. Evidence: `docs/perf/rss_hw_programming_20260608/`.
-- Deferred: ethtool RSS controls/readback and full N>1 activation.
+  the off/default `rss_queues` gate. Evidence: `docs/perf/rss_hw_programming_20260608/`.
+- **Complete + gateway/KVM-validated (2026-06-09): full N>1 activation.**
+  `rss_queues=2..4` brings up per-queue rings/NAPI, per-vector V2 IRQ routing,
+  and RSS spread; validated clean at line rate (`tx_dropped_error=0`, RX across
+  4 queues, 0 faults) on both rigs. The initial multi-queue TX collapse was
+  per-CPU IOVA-rcache contention from un-pinned RX vectors, fixed by spreading
+  each MSI-X vector to a distinct CPU (`layout::irq_affinity_cpu`). Evidence:
+  `docs/perf/rss_multiqueue_20260609/`.
+- **Complete: ethtool RSS controls/readback** (`get_rxfh`/`set_rxfh`/
+  `get_rxfh_*_size`/`get_channels`). `set_channels` (ethtool `-L`) implemented: changes the runtime active RX-queue count via a stop+open reconfigure (gateway-validated 1/2/4 at line rate; 3/>max/combined rejected).
 
 **Track B value verdict (2026-06-07): defer activating N>1 — payoff does not
 materialize at 2.5GbE.** Measured Rust (Track A: 1 queue + RXHASH→RPS) vs vendor
@@ -78,6 +105,24 @@ activate N>1 (B6) only if a target deployment sees >2M pps small-packet RX from
 many peers (multi-client 2.5GbE server/LB/DNS/CDN); otherwise defer — single
 queue + RXHASH→RPS covers line rate for realistic traffic. Now an evidence-based
 choice, not an unknown.** Artifacts: `docs/perf/trackb_capacity_20260608/`.
+
+**Track B closeout (2026-06-09): N>1 implemented + vendor-C-compared, CLOSED.**
+The target deployment (gateway / load balancer) is the multi-client case the
+06-08 verdict gated on, so multi-queue was activated: per-queue rings/NAPI,
+per-vector V2 IRQ routing, RSS spread, and the per-CPU IOVA-locality fix
+(`layout::irq_affinity_cpu`). `rss_queues=4` runs at line rate with RX spread on
+both rigs. **Vendor-C comparison settled the open questions:** cold start is at
+parity (6× fresh-load → first-flow, Rust and vendor `r8125`(RSS) both 2.36 Gbit,
+retr=0, 0 drops — no gap), and under `-P16` parallel stress Rust is **better**
+than C (Rust retr=0 vs vendor ~14k; under *sustained* `-P16` Rust holds line rate
+while the vendor degrades/fails with ~12k retr + 64 serious dmesg warnings). **No
+scenario favors C.** The earlier 0/56/95-drop, 175 Kbit, and "-P8 blip" figures
+were uncontrolled no-reload test artifacts that did NOT reproduce in controlled
+fresh-load runs.
+**Default remains `rss_queues=0`** — the RFC single-queue path is unchanged.
+`set_channels` (ethtool `-L`) is implemented (gateway-validated). Artifacts:
+`docs/perf/rss_multiqueue_20260609/` (incl. the Rust-vs-C comparison), run
+manifests under `docs/perf/runs/`.
 
 ## Required proof artifacts
 

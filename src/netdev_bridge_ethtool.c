@@ -20,7 +20,7 @@
  * surface is ~25 LOC, kept in this file to leave netdev_bridge.c
  * within its 400-line review cap.
  *
- * Hard cap: 240 LOC. Enforced by ci/check_cshim_loc_caps.sh. Raised from 200
+ * Hard cap: 280 LOC. Enforced by ci/check_cshim_loc_caps.sh. Raised from 200
  * for the B5 ethtool RSS control plane (get/set_rxfh, get_channels, get_rxnfc).
  */
 
@@ -120,12 +120,17 @@ u32 r8125_bridge_rxfh_indir_default(u32 index, u32 n_rx_rings)
 
 /*
  * RSS control plane (B5). The chip uses Toeplitz hashing with the boot-stable
- * system key; at the current N=1 runtime the indirection table maps every
- * bucket to queue 0. `get_rxfh` reports exactly what `apply_rss_programming`
- * writes (same `netdev_rss_key_fill` key, all-zero table). `set_rxfh` validates
- * the indirection table through the host-tested Rust validator and rejects a
- * custom key while only one RX queue is owned. ethtool ops run under RTNL, the
- * same lock as open/stop, so changes are serialized against bring-up/teardown.
+ * system key and the kernel DEFAULT indirection spread for the active RX-queue
+ * count (`ethtool_rxfh_indir_default`, bucket i -> queue i % active_rx_queues) —
+ * exactly what `apply_rss_programming` writes to hardware. `get_rxfh` therefore
+ * reports that same default spread (NOT a hardcoded all-zero table), so
+ * `ethtool -x` matches the programmed state for any queue count. `set_rxfh`
+ * supports only that default: it validates the table through the host-tested
+ * Rust validator and then accepts it only if it equals the default spread,
+ * rejecting a custom table (-EOPNOTSUPP) rather than silently no-op'ing — a
+ * custom hash key/table is a documented follow-up. The active count is changed
+ * via `ethtool -L` (set_channels), which reprograms the default for the new
+ * count. ethtool ops run under RTNL, serialized against open/stop.
  */
 static u32 bridge_get_rxfh_key_size(struct net_device *ndev)
 {
@@ -140,8 +145,17 @@ static u32 bridge_get_rxfh_indir_size(struct net_device *ndev)
 static int bridge_get_rxfh(struct net_device *ndev,
 			   struct ethtool_rxfh_param *rxfh)
 {
+	struct r8125_bridge *b = netdev_priv(ndev);
+	u32 i;
+
+	/* Report the SAME default spread that apply_rss_programming wrote for the
+	 * active queue count, so `ethtool -x` matches hardware (was: all-zero,
+	 * which lied once >1 queue was active).
+	 */
 	if (rxfh->indir)
-		memset(rxfh->indir, 0, R8125_RSS_INDIR_SIZE * sizeof(u32));
+		for (i = 0; i < R8125_RSS_INDIR_SIZE; i++)
+			rxfh->indir[i] =
+				r8125_bridge_rxfh_indir_default(i, b->active_rx_queues);
 	if (rxfh->key)
 		netdev_rss_key_fill(rxfh->key, R8125_RSS_KEY_SIZE);
 	rxfh->hfunc = ETH_RSS_HASH_TOP;
@@ -161,14 +175,28 @@ static int bridge_set_rxfh(struct net_device *ndev,
 	    rxfh->hfunc != ETH_RSS_HASH_TOP)
 		return -EOPNOTSUPP;
 	if (rxfh->indir) {
+		u32 i;
+		/* First reject entries that don't map to an owned queue (-EINVAL,
+		 * host-tested validator).
+		 */
 		int rc = b->ops.rss_indir_check(b->priv, rxfh->indir,
 						R8125_RSS_INDIR_SIZE,
 						b->active_rx_queues);
 		if (rc)
 			return rc;
+		/* Only the kernel default spread is supported. Accept an echo of
+		 * the default; reject a custom (valid-but-different) table with
+		 * -EOPNOTSUPP rather than silently no-op'ing — the hardware always
+		 * runs the default for the active queue count. Custom indirection
+		 * is a documented follow-up.
+		 */
+		for (i = 0; i < R8125_RSS_INDIR_SIZE; i++)
+			if (rxfh->indir[i] !=
+			    r8125_bridge_rxfh_indir_default(i, b->active_rx_queues))
+				return -EOPNOTSUPP;
 	}
-	/* A custom hash key has no effect over a single RX queue; accept only
-	 * an echo of the current (boot-stable) key, reject a real change.
+	/* A custom hash key is likewise unsupported; accept only an echo of the
+	 * current (boot-stable) key, reject a real change.
 	 */
 	if (rxfh->key) {
 		netdev_rss_key_fill(boot_key, R8125_RSS_KEY_SIZE);
@@ -204,6 +232,38 @@ static u32 bridge_get_rx_ring_count(struct net_device *ndev)
 	return b->active_rx_queues;
 }
 
+/*
+ * `ethtool -L` set_channels. We expose dedicated RX channels (1..max) and a
+ * single fixed TX queue, so reject combined/tx/other changes and pass the
+ * requested RX count to Rust, which validates it (owned queues + V3/V2
+ * prerequisites) and stores the runtime override. On acceptance a running
+ * device is reconfigured (stop+open) so the new count takes effect immediately;
+ * if it is down the override applies at the next open. Runs under RTNL.
+ */
+static int bridge_set_channels(struct net_device *ndev,
+			       struct ethtool_channels *ch)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+	int rc;
+
+	if (ch->combined_count != 0 || ch->tx_count != 1 || ch->other_count != 0)
+		return -EINVAL;
+
+	rc = b->ops.set_channels(b->priv, ch->rx_count);
+	if (rc)
+		return rc;
+
+	if (netif_running(ndev)) {
+		rc = r8125_bridge_reopen(ndev);
+	} else {
+		/* Down: mirror the validated count into the C cache now (same
+		 * helper as open) so get_channels/-l/-x aren't stale until open.
+		 */
+		r8125_bridge_set_active_rx_queues(ndev, ch->rx_count);
+	}
+	return rc;
+}
+
 const struct ethtool_ops r8125_bridge_ethtool_ops = {
 	.get_drvinfo		= bridge_get_drvinfo,
 	.get_sset_count		= bridge_get_sset_count,
@@ -215,5 +275,6 @@ const struct ethtool_ops r8125_bridge_ethtool_ops = {
 	.get_rxfh		= bridge_get_rxfh,
 	.set_rxfh		= bridge_set_rxfh,
 	.get_channels		= bridge_get_channels,
+	.set_channels		= bridge_set_channels,
 	.get_rx_ring_count	= bridge_get_rx_ring_count,
 };

@@ -1,8 +1,35 @@
 # RSS / RXHASH Implementation Plan
 
 **Status: Track A (RXHASH-only) CLOSED + gateway-validated, 2026-06-07.
-Track B (full hardware RSS) STARTED for Realtek vendor-driver parity.** This plan is deliberately
-split into two tracks:
+Track B (full hardware RSS) CLOSED + gateway/KVM-validated AND vendor-C-compared,
+2026-06-09.** Track B activated multi-queue RSS (`rss_queues=2..4`) on the
+RTL8125B V2/MSI-X surface; TX runs at line rate on both rigs (2.36 Gbit gateway /
+2.32 Gbit KVM) with RX spread across 4 queues. The default stays `rss_queues=0`
+(single-queue, the proven RFC path); multi-queue is a validated operator opt-in
+for the gateway/LB deployment.
+
+**Closeout evidence (the two previously-open items are now resolved):**
+1. **Cold-start is at vendor-C parity — no gap.** 6× fresh-load → first-TCP-TX
+   for each driver: Rust `rss_queues=4` and vendor `r8125`(RSS) were *identical*
+   — 2.36 Gbit, retr=0, `tx_dropped_error=0` on all 6. The earlier
+   "0/56/95-drop" / 175 Kbit figures came from *uncontrolled* test conditions (a
+   `-P8` flow against a non-reloaded driver + interleaved single-flow
+   measurement), not cold start, and did not reproduce in any controlled run.
+2. **Rust-vs-vendor-C comparison done — no scenario favors C.** Under `-P16`
+   parallel stress (fresh load each, 5×) Rust held 2.36 Gbit with **retr=0**
+   while vendor `r8125`(RSS) showed ~14k retransmits; under *sustained* `-P16`
+   (one load, 3× back-to-back) Rust stayed solid (2.36 Gbit, retr=0, 0 drops, 0
+   warnings) while the vendor degraded/failed (836 Mbit → dead, 12k retr, 64
+   serious dmesg warnings). The earlier "-P8 marginal blip" was a no-reload test
+   artifact and did not reproduce with fresh-load methodology. Evidence:
+   `docs/perf/rss_multiqueue_20260609/README.md`. Failure cases (UDP-TX wedge,
+   rmmod-under-traffic) covered by the smoke/mq gates + prior soak docs.
+
+`set_channels` (ethtool `-L`) is now implemented + gateway-validated: it changes
+the runtime active RX-queue count (1/2/4) via a reconfigure (stop+open), rejects
+invalid counts (3, >max, combined/tx changes), and the link recovers to line
+rate with 0 drops after each change. See Phase B5. This plan is split into two
+tracks:
 
 - **RXHASH-only**: parse a hardware hash from an RSS-capable RX descriptor and
   call `skb_set_hash(...)` on the existing single RX queue. This can benefit
@@ -231,17 +258,24 @@ Execution status:
   `docs/perf/rss_hw_programming_20260608/`.
 - **B5**: complete + Gateway-smoked — ethtool RSS control plane is wired:
   `get_rxfh`/`get_rxfh_key_size`/`get_rxfh_indir_size` report the programmed
-  boot key + all-zero (single-queue) indirection table, `get_channels` reports
-  one RX/TX queue, and `get_rx_ring_count` answers the `ETHTOOL_GRXRINGS` query
-  (kernel 7.0.0 routes it to the dedicated op, not `get_rxnfc` — so this works
-  where the vendor's older `get_rxnfc`-only path does not). `set_rxfh` validates
-  the indirection table through the host-tested `layout::rxfh_indir_all_valid`
-  (rejecting entries that exceed owned queues) and refuses a custom hash key
-  while only one RX queue is owned; it runs under RTNL, serialized against
-  open/stop. Validated: `ethtool -x` readback, `ethtool -X equal 1` accepted,
-  `ethtool -X equal 2` rejected (EINVAL), custom `hkey` rejected (EOPNOTSUPP),
-  traffic healthy after. Gate: `ci/check_rss_ethtool.sh`. set_channels and
-  custom multi-queue keys remain deferred with N>1 activation.
+  boot key + **the actual kernel default indirection spread for the active
+  queue count** (bucket i → queue i % active_rx_queues — exactly what
+  `apply_rss_programming` writes; `ethtool -x` at `rss_queues=4` shows
+  `0 1 2 3 0 1 2 3 …`, satisfying "ethtool -x reports the same indir state
+  programmed into hardware"). `get_channels`/`set_channels` report/change the
+  active RX-queue count, and `get_rx_ring_count` answers `ETHTOOL_GRXRINGS`
+  (kernel 7.0.0 routes it to the dedicated op, not `get_rxnfc` — works where the
+  vendor's older `get_rxnfc`-only path does not). `set_rxfh` validates the
+  indirection table through the host-tested `layout::rxfh_indir_all_valid`
+  (rejecting out-of-range entries, -EINVAL) and then accepts **only the default
+  spread** — a custom table or custom key is rejected with -EOPNOTSUPP rather
+  than silently no-op'd (custom indirection/key is a documented follow-up). Runs
+  under RTNL, serialized against open/stop. Validated at `rss_queues=4`:
+  `ethtool -x` shows the 4-queue spread; `-X default` / `-X equal 4` accepted;
+  `-X equal 2` / `-X weight …` / custom `hkey` rejected (EOPNOTSUPP); traffic
+  healthy. Gate: `ci/check_rss_ethtool.sh`. `set_channels`
+  (ethtool `-L`) is now implemented (see Phase B5 above); custom multi-queue
+  hash keys remain deferred (single boot key is used for all queues).
 - **B6**: required before any N>1 RSS acceptance — run
   `scripts/rss_multiqueue_hazard_validate.sh` with full hardware RSS active.
   This is the explicit guard for RTL8125 RSS bug classes that host tests cannot
@@ -607,7 +641,14 @@ Add C shim ethtool ops and Rust backing state for:
 - `get_rxfh`
 - `set_rxfh`
 - `get_channels`
-- `set_channels` later, after fixed queue-count RSS is stable
+- `set_channels` — DONE (2026-06-09). Changes the runtime active RX-queue count
+  (validated to 1/2/4) via a stop+open reconfigure (`r8125_bridge_reopen`); the
+  Rust op stores a runtime override consumed by `active_rx_queues` at the next
+  open. All allocated MSI-X vectors are pinned to distinct CPUs at probe (not
+  just the active count) so a raised count keeps the B6.5 per-CPU IOVA locality.
+  Rejects 3 / >max / combined / tx changes with -EINVAL. Gateway-validated:
+  `ethtool -L rx 2|1|4` each reconfigures, relinks, and runs at 2.36 Gbit retr=0
+  with 0 `tx_dropped_error`.
 
 Acceptance:
 
@@ -650,6 +691,19 @@ Track A can advertise `receive-hashing` only if:
 - `rx_hash_missing == 0` for hashable TCP/UDP in a controlled bench run.
 
 ## Runtime Validation
+
+**Implemented + run (2026-06-10):** `scripts/cvr_stat_sweep.sh` is the canonical
+**three-way, multi-sample** sweep (rust4 / rust0 / in-tree r8169 / vendorC,
+fresh-loaded per driver, N=5–12/point, median+spike-rate, per-sample peer
+restart). Authoritative results + raw artifacts: `docs/perf/cvr_stat_sweep_20260610/`.
+Method standard: `docs/perf/BENCHMARK_METHODOLOGY.md`. Result: **link-bound
+parity on TCP/UDP/jumbo throughput; Rust WINS latency-under-load, sustained-`-P16`
+retransmits (0 vs ~44k for both C drivers), and 64B multi-queue UDP — no clean
+driver metric favors C** (the lone bursty TCP-retr spike row is rig noise: zero
+NIC drops, reorders run to run). (The earlier single-sample two-way run,
+`docs/perf/cvr_sweep_20260609/` via `scripts/trackb_cvr_sweep.sh`, is superseded:
+its "TCP RX 10-flow retransmits" gap was a sampling artifact.) The sweep covers
+the dimensions below.
 
 Extend the Gateway benchmark to compare Rust vs C across:
 
@@ -697,8 +751,17 @@ Acceptance:
 9. Multi-ring Rust state, still RSS-disabled. Done.
 10. 22-vector MSI-X/V2 interrupt ownership. Done.
 11. RSS register programming behind a module parameter. Done.
-12. Ethtool RSS ops.
-13. Advertise/enable full hardware RSS only after validation passes.
+12. Ethtool RSS ops (get_rxfh/set_rxfh/get_rxfh_*_size/get_channels +
+    set_channels). Done — `set_channels` (ethtool `-L`) changes the runtime
+    active RX-queue count via a stop+open reconfigure; gateway-validated (1/2/4
+    accepted at line rate / 0 drops, 3/>max/combined rejected).
+13. Activate + validate full hardware multi-queue RSS. **Done** — activation
+    (per-ring foundation, per-vector V2 IRQ routing, RSS spread, hazard
+    validation, DMA-locality fix) runs at line rate on gateway + KVM, and a
+    Rust-vs-vendor-C comparison confirms cold-start parity (6/6 both clean) and
+    Rust ≥ C under stress (sustained `-P16`: Rust line rate / retr=0 vs vendor
+    degrade+fail). No scenario favors C. Default stays `rss_queues=0`. Evidence:
+    `docs/perf/rss_multiqueue_20260609/`.
 
 This order preserves the stable driver path and prevents repeating the
 single-vector V2/TX-completion failure while still leaving a low-risk
@@ -737,3 +800,20 @@ Track A validation evidence:
 - B4/B5:
   - key/indir programming and RSS topology are reflected through `ethtool -x/-X`
     and read back matches.
+- B6 (multi-queue activation + validation), 2026-06-09 — IN PROGRESS:
+  - RX spreads across all 4 queues under IP-diverse pktgen (~1.78M pps, 0 faults).
+  - `rss_queues=4` TX runs at line rate on BOTH rigs (gateway 2.36 Gbit /
+    KVM 2.32 Gbit), `rx_*_error=0`, 0 dmesg faults.
+  - The initial multi-queue TX *collapse* (62k+ drops, sustained) is fixed: it
+    was per-CPU IOVA-rcache contention from un-pinned RX vectors, cured by
+    spreading each active MSI-X vector to a distinct CPU (host-tested
+    `layout::irq_affinity_cpu`). The interim "any-queue TX reaper" try-lock was
+    reverted (it was the source of the worst drops); queue-0/tx0 reaping suffices
+    once DMA stays per-CPU.
+  - OPEN: an intermittent **cold-start** `tx_dropped_error` residual remains
+    (0/56/95 across fresh-load gate runs; ≈0.001%, no throughput/retr impact),
+    suspected per-queue IOVA-cache warming that a single warm-up flow doesn't
+    cover. To be fixed or qualified against vendor C before close.
+  - Default `rss_queues=0` (single-queue RFC path) unregressed and IOMMU-clean.
+  - Evidence: `docs/perf/rss_multiqueue_20260609/README.md`, run manifests under
+    `docs/perf/runs/`.

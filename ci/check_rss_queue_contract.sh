@@ -63,7 +63,7 @@ fi
 
 if grep -Fq 'pub(crate) const RX_QUEUE_COUNT: usize = 4;' "$NETDEV" &&
    grep -Fq 'crate::layout::active_rx_queues(' "$NETDEV" &&
-   grep -Fq 'for queue_id in 0..active_rx_queues()' "$NETDEV" &&
+   grep -Fq 'for queue_id in 0..active_rx_queues(state)' "$NETDEV" &&
    grep -Fq 'ub::rx_pool_create(ndev, queue_id, RING_LEN)' "$NETDEV" &&
    grep -Fq 'ub::rx_alloc(ndev, queue_id)' "$NETDEV" &&
    grep -Fq 'ub::rx_free(ndev, queue_id, slot.cpu)' "$NETDEV" &&

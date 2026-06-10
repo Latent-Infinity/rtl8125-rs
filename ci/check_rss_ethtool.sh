@@ -3,11 +3,13 @@
 #
 # B5 ethtool RSS control-plane contract.
 #
-# The driver exposes RSS key/indirection/channels via ethtool. At the current
-# N=1 runtime: get_rxfh reports the boot-stable key + all-zero indirection (what
-# apply_rss_programming writes), set_rxfh validates the indirection table through
-# the host-tested Rust validator and refuses a custom key, and get_channels
-# reports a single RX queue. The C size macros MUST equal the Rust source of
+# The driver exposes RSS key/indirection/channels via ethtool. get_rxfh reports
+# the boot-stable key + the kernel default indirection spread for the active
+# RX-queue count (exactly what apply_rss_programming writes); set_rxfh validates
+# the table through the host-tested Rust validator and accepts only that default
+# (rejecting custom tables + custom keys with -EOPNOTSUPP, never a silent
+# no-op); get_channels/set_channels report and change the active RX-queue count.
+# The C size macros MUST equal the Rust source of
 # truth so the kernel buffers match what hardware was programmed with.
 
 set -uo pipefail
@@ -40,10 +42,24 @@ if grep -qE '\.get_rxfh_key_size\s*=' "$ETH" &&
 	grep -qE '\.get_rxfh\s*=' "$ETH" &&
 	grep -qE '\.set_rxfh\s*=' "$ETH" &&
 	grep -qE '\.get_channels\s*=' "$ETH" &&
+	grep -qE '\.set_channels\s*=\s*bridge_set_channels' "$ETH" &&
 	grep -qE '\.get_rx_ring_count\s*=' "$ETH"; then
-	grn "ethtool_ops exposes get/set rxfh + sizes + channels + rx_ring_count"
+	grn "ethtool_ops exposes get/set rxfh + sizes + get/set_channels + rx_ring_count"
 else
-	red "ethtool_ops is missing get/set_rxfh, sizes, get_channels, or get_rx_ring_count"
+	red "ethtool_ops is missing get/set_rxfh, sizes, get_channels, set_channels, or get_rx_ring_count"
+fi
+
+# set_channels must keep the C-side active queue cache coherent even when the
+# interface is down. Otherwise `ethtool -L rx 4` succeeds while down, but
+# immediate `ethtool -l/-x` still reports the old queue count until the next
+# open.
+channels_body=$(awk '/static int bridge_set_channels\(/,/^}/' "$ETH")
+if grep -qE 'netif_running\(ndev\)' <<<"$channels_body" &&
+	grep -qE 'r8125_bridge_reopen\(ndev\)' <<<"$channels_body" &&
+	grep -qE 'r8125_bridge_set_active_rx_queues\(ndev, ch->rx_count\)' <<<"$channels_body"; then
+	grn "set_channels updates active_rx_queues immediately for down interfaces"
+else
+	red "set_channels must update active_rx_queues on the down-interface path"
 fi
 
 # get_rx_ring_count answers the RX-ring-count query (ethtool -x/-X precondition
@@ -54,24 +70,29 @@ else
 	red "get_rx_ring_count must report the RX ring count (else ethtool -x/-X fail)"
 fi
 
-# 3. get_rxfh reports the programmed key (boot key) + zero indirection + Toeplitz.
+# 3. get_rxfh reports the programmed key (boot key) + the ACTUAL default spread
+#    for the active queue count (NOT a hardcoded all-zero table) + Toeplitz.
 get_body=$(awk '/static int bridge_get_rxfh\(/,/^}/' "$ETH")
 if grep -q 'netdev_rss_key_fill' <<<"$get_body" &&
 	grep -q 'ETH_RSS_HASH_TOP' <<<"$get_body" &&
-	grep -qE 'memset\(rxfh->indir' <<<"$get_body"; then
-	grn "get_rxfh reports boot key + zero indirection + Toeplitz hfunc"
+	grep -qE 'r8125_bridge_rxfh_indir_default\(i, b->active_rx_queues\)' <<<"$get_body" &&
+	! grep -qE 'memset\(rxfh->indir' <<<"$get_body"; then
+	grn "get_rxfh reports boot key + the default spread for active_rx_queues + Toeplitz"
 else
-	red "get_rxfh must fill the boot key, zero the indirection table, and report Toeplitz"
+	red "get_rxfh must fill the boot key + the default spread (rxfh_indir_default), not a zero table"
 fi
 
-# 4. set_rxfh rejects rss_context, validates indirection via Rust, guards key.
+# 4. set_rxfh rejects rss_context, validates indir via Rust, AND rejects any
+#    non-default indirection table (-EOPNOTSUPP) instead of silently no-op'ing.
 set_body=$(awk '/static int bridge_set_rxfh\(/,/^}/' "$ETH")
 if grep -qE 'rss_context' <<<"$set_body" &&
 	grep -qE 'ops\.rss_indir_check\(' <<<"$set_body" &&
-	grep -qE 'ETH_RSS_HASH_NO_CHANGE' <<<"$set_body"; then
-	grn "set_rxfh rejects contexts, validates indirection via Rust, guards hfunc"
+	grep -qE 'ETH_RSS_HASH_NO_CHANGE' <<<"$set_body" &&
+	grep -qE 'r8125_bridge_rxfh_indir_default\(i, b->active_rx_queues\)' <<<"$set_body" &&
+	grep -qE 'return -EOPNOTSUPP' <<<"$set_body"; then
+	grn "set_rxfh rejects contexts, validates indir, and rejects non-default tables (no silent no-op)"
 else
-	red "set_rxfh must reject rss_context, validate indir via ops.rss_indir_check, and guard hfunc"
+	red "set_rxfh must reject rss_context, validate indir, and reject non-default tables with -EOPNOTSUPP"
 fi
 
 # 5. vtable rss_indir_check exists on BOTH sides and Rust uses the tested validator.

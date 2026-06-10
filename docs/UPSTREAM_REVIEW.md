@@ -24,7 +24,8 @@ below was assembled from the netdev FAQ, `Documentation/process/`,
 | **`devm_*` / lifetime-safe resource acquisition** | done | Rust `Devres<pci::Bar>`, `kernel::pci::Bar`, RAII guards for IRQ + DMA frags (task #61) |
 | **Clean rmmod path; no leaks on probe failure** | done | `pci.rs` unbind sequencing documented; 100-cycle rmmod-under-traffic stress green (task #69); 20-cycle KVM stress green |
 | **NAPI contract (budget, completion, IRQ masking)** | done | `napi.rs` module docstring lists the M5 section 7 contract; `ci/check_napi_contract.sh` enforces statically |
-| **ethtool baseline (`get_link`, `get_drvinfo`, stats)** | Fixed this pass | `get_link` + custom stats present; **`get_drvinfo` added in this pass** so `ethtool -i enp5s0` returns driver name / bus info |
+| **ethtool baseline (`get_link`, `get_drvinfo`, stats)** | done | `get_link`, `get_drvinfo`, `-S` stats; **plus** the RSS control plane (`get/set_rxfh`, `get_rxfh_*_size`, `get_channels`, `set_channels`, `get_rx_ring_count`). **Gaps (see HW-feature row below):** `get/set_link_ksettings` + `nway_reset`, `get/set_coalesce`, `get/set_wol`, `get/set_ringparam`, `get/set_pauseparam` |
+| **HW-feature surface for a NIC RFC** | partial — gaps tracked | Present: csum/TSO/SG/VLAN/RXHASH/jumbo offloads, multi-queue RSS. **Missing before posting (chip supports all): `link_ksettings`+`nway_reset` (basic `ethtool <if>` — high), `pm_ops` suspend/resume (high, see `docs/M5_PM_GAP.md`), WoL `get/set_wol` (high), `get/set_coalesce` (INT_MITI already programmed), `get/set_ringparam`, `get/set_pauseparam`; EEE + PTP/`get_ts_info` deferrable.** |
 | **Driver-level PM ops (`suspend` / `resume`)** | Deferred | No `pm_ops` set on `pci_driver`; system-suspend across the driver is untested. Documented in `docs/M5_PM_GAP.md`; tracked for a follow-up patch |
 | **PCI hot-plug `remove` ordering** | done | `R8125Driver::remove` sequencing documented at `src/pci.rs:132`; tested by 100-cycle stress |
 | **MAINTAINERS entry** | Drafted this pass | **Added `MAINTAINERS` stanza in this pass** with the current repository author identity; the human submitter must confirm or replace it before posting |
@@ -74,8 +75,16 @@ below was assembled from the netdev FAQ, `Documentation/process/`,
    collect Reviewed-by during the review cycle.
 6. **A second hardware-revision test (RTL8125A / RTL8126).** Not in our
    procurement plan; document supported chips explicitly in the RST.
-7. **Multi-queue + RSS.** Documented as not-yet (`docs/M6_MULTIQ_NA.md`)
-   and that's fine for first submission.
+7. **EEE / PTP-hwtstamp.** Chip supports them (vendor params), not yet wired;
+   reasonable to defer past the first RFC (note in the RST).
+
+> **Update 2026-06-09 — multi-queue + RSS is now DONE, not deferred.** Track A
+> (RXHASH) and Track B (full hardware multi-queue RSS: per-queue rings/NAPI,
+> V2/MSI-X routing, RSS key+indirection, `ethtool -x/-X/-l/-L`/`set_channels`)
+> are implemented and hardware-validated at vendor-C parity-or-better (default
+> stays single-queue `rss_queues=0`). See `docs/RSS_RXHASH_IMPLEMENTATION_PLAN.md`,
+> `docs/perf/rss_multiqueue_20260609/`, `docs/perf/cvr_sweep_20260609/`. The old
+> `docs/M6_MULTIQ_NA.md` is superseded (its "N/A on 8125B" premise was wrong).
 
 ## Architectural concerns the maintainer will raise
 

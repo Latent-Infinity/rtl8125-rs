@@ -38,6 +38,9 @@ echo
 echo "== build/test orchestration contract =="
 bash "$CI/check_orchestration_contract.sh" || rc=1
 echo
+echo "== statistical sweep harness (stats self-test) =="
+bash "$CI/check_sweep_stats.sh" || rc=1
+echo
 echo "== build wrapper / BTF path =="
 bash "$CI/check_build_makefile.sh" || rc=1
 echo

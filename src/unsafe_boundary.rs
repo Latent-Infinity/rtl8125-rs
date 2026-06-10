@@ -176,6 +176,10 @@ pub(crate) struct BridgeOps {
         len: c_uint,
         queue_count: c_uint,
     ) -> c_int,
+    /// ethtool `set_channels` — set the runtime active RX-queue count. The C
+    /// bridge validates tx/combined and reconfigures (stop+open) to apply.
+    /// Returns 0 (accepted) or `-EINVAL`.
+    pub set_channels: extern "C" fn(cookie: *mut c_void, rx_count: c_uint) -> c_int,
 }
 
 // Bindgen emits `pci_dev` / `net_device` / `sk_buff` as opaque

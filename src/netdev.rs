@@ -128,14 +128,12 @@ pub(crate) const RX_QUEUE_COUNT: usize = 4;
 /// single-queue path); multi-queue activation is gated in
 /// [`validate_rss_queue_request`].
 #[inline]
-pub(crate) fn active_rx_queues() -> usize {
+pub(crate) fn active_rx_queues(state: &NetdevState) -> usize {
     // Multi-queue RX is fully wired (per-queue rings/NAPI, per-vector IRQ
-    // routing, RSS spread), so honor the validated `rss_queues` request clamped
-    // to the compile-time maximum.
-    crate::layout::active_rx_queues(
-        *crate::module_parameters::rss_queues.value(),
-        RX_QUEUE_COUNT,
-    )
+    // routing, RSS spread), so honor the effective `rss_queues` request (the
+    // ethtool set_channels runtime override, else the module param) clamped to
+    // the compile-time maximum.
+    crate::layout::active_rx_queues(requested_rss_queues(state), RX_QUEUE_COUNT)
 }
 
 // RXHASH feature gate for descriptor hash reporting. Hardware RSS queue
@@ -478,7 +476,7 @@ pub(crate) struct IrqState {
     /// Per-RX-queue IRQ numbers. `rx_nums[i]` is the MSI-X entry-`i` vector
     /// that signals RX queue `i`'s ROK under V2. The single-vector MSI/MSI-X and
     /// INTx fallback uses only `rx_nums[0]` (the combined interrupt); the rest
-    /// stay 0. Only `active_rx_queues()` of them are requested at open.
+    /// stay 0. Only `active_rx_queues(state)` of them are requested at open.
     pub(crate) rx_nums: [u32; RX_QUEUE_COUNT],
     /// IRQ number for V2 TX Q0 (MSI-X entry 16). Zero when V2 is not active.
     pub(crate) tx_num: u32,
@@ -597,6 +595,13 @@ pub(crate) struct NetdevState {
     /// not expose a valid `skb->hash` to the stack.
     // NOT-PADDED: written at open/set_features only; read from NAPI poll.
     pub(crate) rx_hash_enabled: AtomicBool,
+
+    /// ethtool `set_channels` runtime RX-queue-count override. `0` = use the
+    /// `rss_queues` module param; non-zero overrides it (validated to
+    /// `[1, RX_QUEUE_COUNT]`). Read by `requested_rss_queues`/`active_rx_queues`
+    /// on every open so `ethtool -L` takes effect on the next reconfigure.
+    // NOT-PADDED: written under RTNL in set_channels; read at open.
+    pub(crate) requested_rx_queues: AtomicUsize,
 
     /// TX descriptor ring + producer/consumer indices + shadow.
     pub(crate) tx: TxRingState,
@@ -747,6 +752,32 @@ extern "C" fn rust_rss_indir_check(
     }
 }
 
+/// ethtool `set_channels` — set the runtime active RX-queue count. The C bridge
+/// has already rejected tx/combined changes and passed the requested RX count.
+/// Validates it against the owned queues and the V3/V2 prerequisites for >1,
+/// stores the runtime override (consumed by `requested_rss_queues` on the next
+/// open), and returns 0 so the C bridge reopens to apply it; `-EINVAL` rejects
+/// without disturbing the running config. Runs under RTNL.
+extern "C" fn rust_set_channels(cookie: *mut c_void, rx_count: core::ffi::c_uint) -> c_int {
+    let state = state_from(cookie);
+    let rx = rx_count as usize;
+    // Pure count rule (host-tested): in [1, RX_QUEUE_COUNT] and a representable
+    // RTL8125 RSS count (1/2/4). Rejects 3 / 0 / >max.
+    if !crate::layout::set_channels_count_valid(rx, RX_QUEUE_COUNT) {
+        return EINVAL.to_errno();
+    }
+    if rx > 1 {
+        // Multi-queue hardware prerequisites mirror `validate_rss_queue_request`:
+        // V3 RX descriptors and the V2 MSI-X surface. Rejecting here keeps the
+        // live single-queue config intact.
+        if state.rx_queue0().format == RxDescFormat::Legacy || !state.use_v2_irq_surface() {
+            return EINVAL.to_errno();
+        }
+    }
+    state.requested_rx_queues.store(rx, Ordering::Release);
+    0
+}
+
 pub(crate) const M4_FULL_OPS: BridgeOps = BridgeOps {
     open: rust_open,
     stop: rust_stop,
@@ -755,6 +786,7 @@ pub(crate) const M4_FULL_OPS: BridgeOps = BridgeOps {
     change_mtu: rust_change_mtu,
     set_features: rust_set_features,
     rss_indir_check: rust_rss_indir_check,
+    set_channels: rust_set_channels,
 };
 
 // Skeleton vtable retained as a load-test fallback. Flip `ACTIVE_OPS`
@@ -794,6 +826,10 @@ extern "C" fn skel_rss_indir_check(
 ) -> c_int {
     0
 }
+#[allow(dead_code)]
+extern "C" fn skel_set_channels(_cookie: *mut c_void, _rx_count: core::ffi::c_uint) -> c_int {
+    0
+}
 
 #[allow(dead_code)]
 pub(crate) const M4_SKELETON_OPS: BridgeOps = BridgeOps {
@@ -804,6 +840,7 @@ pub(crate) const M4_SKELETON_OPS: BridgeOps = BridgeOps {
     change_mtu: skel_change_mtu,
     set_features: skel_set_features,
     rss_indir_check: skel_rss_indir_check,
+    set_channels: skel_set_channels,
 };
 
 /// Active vtable. M4-full is the production path; M4-skeleton is kept
@@ -870,15 +907,23 @@ fn rxhash_enabled(feature_flags: u32) -> bool {
 }
 
 #[inline]
-fn requested_rss_queues() -> u8 {
-    *crate::module_parameters::rss_queues.value()
+fn requested_rss_queues(state: &NetdevState) -> u8 {
+    // ethtool set_channels writes a runtime override (`requested_rx_queues`);
+    // 0 means "fall back to the load-time module param". This lets `ethtool -L`
+    // change the RX queue count without a module reload.
+    let ov = state.requested_rx_queues.load(Ordering::Relaxed);
+    if ov != 0 {
+        ov as u8
+    } else {
+        *crate::module_parameters::rss_queues.value()
+    }
 }
 
 // Pure register/threshold math lives in `crate::layout` (host-unit-tested).
 use crate::layout::{rss_q_num_ctrl, tx_budget_shadow_len};
 
 fn validate_rss_queue_request(state: &NetdevState) -> Result<()> {
-    let requested = requested_rss_queues();
+    let requested = requested_rss_queues(state);
     if requested == 0 {
         return Ok(());
     }
@@ -927,8 +972,8 @@ fn program_rss_key_and_indir(regs: &Regs<'_>, queue_count: u8) {
 
 fn apply_rss_programming(state: &NetdevState) {
     let regs = state.regs();
-    let requested = requested_rss_queues();
-    let queue_count = active_rx_queues() as u8;
+    let requested = requested_rss_queues(state);
+    let queue_count = active_rx_queues(state) as u8;
 
     if state.rx_hash_enabled.load(Ordering::Acquire) || requested != 0 {
         regs.set_q_num_ctrl_8125(rss_q_num_ctrl(queue_count));
@@ -966,7 +1011,12 @@ fn apply_netdev_features(state: &NetdevState, feature_flags: u32) {
 #[inline]
 fn program_dma_rings(state: &NetdevState, regs: &Regs<'_>, feature_flags: u32) {
     regs.set_tx_ring_base(state.tx.dma);
-    for (queue_id, rx) in state.rx_queues.iter().take(active_rx_queues()).enumerate() {
+    for (queue_id, rx) in state
+        .rx_queues
+        .iter()
+        .take(active_rx_queues(state))
+        .enumerate()
+    {
         regs.set_rx_ring_base_queue(queue_id, rx.dma);
     }
     let mut rcr = rx_feature_rcr(regs::RCR_M4_BASELINE, feature_flags);
@@ -1008,7 +1058,7 @@ fn allocate_rx_queue_pool(state: &NetdevState, queue_id: u32) -> Result<()> {
 }
 
 fn allocate_rx_pool(state: &NetdevState) -> Result<()> {
-    for queue_id in 0..active_rx_queues() {
+    for queue_id in 0..active_rx_queues(state) {
         allocate_rx_queue_pool(state, queue_id as u32)?;
     }
     Ok(())
@@ -1045,7 +1095,7 @@ fn pre_post_rx_queue_descriptors(rx: &RxQueueState) {
 }
 
 fn pre_post_rx_descriptors(state: &NetdevState) {
-    for rx in &state.rx_queues[..active_rx_queues()] {
+    for rx in &state.rx_queues[..active_rx_queues(state)] {
         pre_post_rx_queue_descriptors(rx);
     }
 }
@@ -1104,7 +1154,7 @@ fn register_irq_handler(state: &NetdevState, cookie: *mut c_void) -> Result<()> 
         // (entry i), routed to queue i's NAPI by `raw_irq_handler`. On a
         // mid-loop failure the already-registered vectors are released by the
         // IrqGuard rollback via `free_irq_if_registered`.
-        for i in 1..active_rx_queues() {
+        for i in 1..active_rx_queues(state) {
             ub::request_irq(state.irq.rx_nums[i], raw_irq_handler, cookie, irq_flags)?;
             state.irq.rx_requested[i]
                 .inner
@@ -1417,7 +1467,7 @@ fn ndo_open(state: &NetdevState, feature_flags: u32) -> Result<()> {
     // (netif_set_real_num_rx_queues → RPS sysfs) report the real number. Runs
     // under RTNL with the netdev down, before any queue is posted.
     let ndev = state.ndev.load(Ordering::Acquire);
-    ub::set_active_rx_queues(ndev, active_rx_queues() as u32);
+    ub::set_active_rx_queues(ndev, active_rx_queues(state) as u32);
     let regs = state.regs();
 
     // Bus-mastering on. (DMA mask was set at probe.)
@@ -1471,7 +1521,7 @@ fn ndo_open(state: &NetdevState, feature_flags: u32) -> Result<()> {
     // `state.irq_mode()`. Enable every active queue's source bits so each gets
     // its first interrupt (queue 0 also enables TX + link). For the legacy
     // surface this writes the same baseline once.
-    for queue_id in 0..active_rx_queues() {
+    for queue_id in 0..active_rx_queues(state) {
         crate::napi::rearm_irq_baseline(state, queue_id as u32);
     }
 

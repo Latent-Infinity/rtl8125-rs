@@ -209,6 +209,17 @@ pub(crate) const fn rss_queue_request_supported(rss_queues: u8, max: usize) -> b
     r == 0 || (r <= max && r.is_power_of_two())
 }
 
+/// ethtool `set_channels` (`-L`) RX-queue-count rule (pure part). A valid count
+/// is `[1, max]` AND a representable RTL8125 RSS queue count (power-of-two:
+/// 1/2/4). Unlike the module-param check, `0` is NOT valid here — ethtool always
+/// needs at least one RX queue. The V2/V3 *hardware* prerequisites for `>1` are
+/// checked at the call site (they need live device state); this is the count
+/// rule, host-unit-tested so the accept/reject set can't drift.
+#[inline]
+pub(crate) const fn set_channels_count_valid(rx: usize, max: usize) -> bool {
+    rx >= 1 && rx <= max && rss_queue_request_supported(rx as u8, max)
+}
+
 /// V2 IMR/ISR source bit for RX queue `queue_id`. The chip maps RX queue N to
 /// MSI-X message-id N and ISR/IMR bit `1<<N` (vendor `RTL_W32(ISR_V2,
 /// BIT(message_id))`), so the bit is `rok_q0 << queue_id` where `rok_q0` is
@@ -641,5 +652,23 @@ mod tests {
         for i in 0..16 {
             assert_eq!(irq_affinity_cpu(i, 2, 8), irq_affinity_cpu(i, 2, 8));
         }
+    }
+
+    // -- set_channels_count_valid (ethtool -L) ------------------------------
+
+    #[test]
+    fn set_channels_accepts_representable_counts() {
+        // max=4 (RX_QUEUE_COUNT): 1, 2, 4 are valid RSS counts.
+        assert!(set_channels_count_valid(1, 4));
+        assert!(set_channels_count_valid(2, 4));
+        assert!(set_channels_count_valid(4, 4));
+    }
+
+    #[test]
+    fn set_channels_rejects_nonpow2_zero_and_over_max() {
+        assert!(!set_channels_count_valid(0, 4)); // 0 RX queues is invalid for -L
+        assert!(!set_channels_count_valid(3, 4)); // not a power of two
+        assert!(!set_channels_count_valid(5, 4)); // exceeds max
+        assert!(!set_channels_count_valid(8, 4)); // pow2 but > max
     }
 }

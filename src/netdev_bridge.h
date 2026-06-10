@@ -169,6 +169,18 @@ struct r8125_bridge_ops {
 	 */
 	int (*rss_indir_check)(void *priv, const u32 *indir, unsigned int len,
 			       unsigned int queue_count);
+
+	/*
+	 * set_channels(priv, rx_count) — ethtool set_channels (-L)
+	 * ───────────────────────────
+	 * Pre   : RTNL held. C has already rejected tx/combined changes; rx_count
+	 *         is the requested active RX-queue count.
+	 * Post  : Rust validates rx_count against owned queues + the V3/V2
+	 *         prerequisites and, on success, stores it as the runtime override
+	 *         consumed at the next open. Returns 0 (accepted; C then reopens to
+	 *         apply) or -EINVAL (rejected; the live config is untouched).
+	 */
+	int (*set_channels)(void *priv, unsigned int rx_count);
 };
 
 #define R8125_BRIDGE_FEATURE_RXCSUM	0x00000001U
@@ -297,6 +309,14 @@ void r8125_bridge_napi_complete_done(struct net_device *ndev,
  * to [1, R8125_BRIDGE_RX_QUEUE_COUNT].
  */
 void r8125_bridge_set_active_rx_queues(struct net_device *ndev, unsigned int n);
+
+/*
+ * Reconfigure a running netdev (ethtool set_channels): stop then re-open so the
+ * new runtime RX-queue count is applied (re-IRQ, re-NAPI, RSS reprogram,
+ * netif_set_real_num_rx_queues). Called under RTNL from the ethtool op. Returns
+ * 0 or a negative errno from the re-open (leaving the netdev down on failure).
+ */
+int r8125_bridge_reopen(struct net_device *ndev);
 
 /* Link-state helpers — Rust calls these after detecting carrier change. */
 void r8125_bridge_carrier_on(struct net_device *ndev);

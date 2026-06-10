@@ -43,7 +43,7 @@ use kernel::{
     device::Core, devres::Devres, error::code::ENODEV, pci, prelude::*, sync::aref::ARef,
 };
 
-use core::sync::atomic::{AtomicBool, AtomicPtr};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize};
 
 use crate::hw;
 use crate::mmio::{self, Regs};
@@ -430,13 +430,18 @@ impl pci::Driver for R8125Driver {
                             );
                         }
                     };
-                    // Spread order MUST match the request_irq order in
-                    // `register_irq_handler` so each active vector gets its own
-                    // CPU: rx0..rx_{active-1}, then tx0, then link (V2 only).
+                    // Pin EVERY allocated vector (all RX queues, then tx0, then
+                    // link) to its own CPU, not just the currently-active count.
+                    // ethtool set_channels can raise the active RX-queue count at
+                    // runtime; pinning all of them up front means a newly-activated
+                    // queue already has its dedicated-CPU affinity (the B6.5
+                    // per-CPU IOVA-locality fix must hold for every queue the
+                    // device can ever activate). Deterministic indices: rx_i→i,
+                    // tx0→RX_QUEUE_COUNT, link→RX_QUEUE_COUNT+1. Idle (unrequested)
+                    // vectors are pinned but never fire.
                     pin_irq("rx0", irq_num);
                     if use_v2 {
-                        let active = crate::netdev::active_rx_queues();
-                        for &rx_irq in rx_irq_nums.iter().take(active).skip(1) {
+                        for &rx_irq in rx_irq_nums.iter().skip(1) {
                             pin_irq("rx", rx_irq);
                         }
                         pin_irq("tx0", tx_irq_num);
@@ -478,6 +483,7 @@ impl pci::Driver for R8125Driver {
                             debug_counters: AtomicBool::new(false),
                             bql_enabled: AtomicBool::new(false),
                             rx_hash_enabled: AtomicBool::new(false),
+                            requested_rx_queues: AtomicUsize::new(0),
                             tx <- crate::netdev::TxRingState::new(
                                 tx_ring.desc_ptr_mut(),
                                 tx_ring.dma_handle(),

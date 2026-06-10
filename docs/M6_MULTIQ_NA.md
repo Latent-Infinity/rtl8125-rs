@@ -1,76 +1,54 @@
-# M6 sub-feature #2 — Multi-queue / RSS: **N/A on 8125B**
+# M6 sub-feature #2 — Multi-queue / RSS
 
-**Decision (2026-05-26): skip the multi-queue work on this chip.**
+> **SUPERSEDED (2026-06-09). The original "N/A on 8125B" decision below was
+> WRONG and is retained only for history.** The validated RTL8125B (XID 0x641,
+> MAC_VER_63) **does** support 4 RX queues + RSS, and the driver now implements
+> and hardware-validates full multi-queue RSS (Track B). See
+> `docs/RSS_RXHASH_IMPLEMENTATION_PLAN.md`, `docs/perf/rss_multiqueue_20260609/`,
+> and `docs/perf/cvr_sweep_20260609/`.
 
-The plan §7 M6 lists "Multiple TX queues + RSS" as the second M6
-sub-feature. After surveying Realtek's vendor driver source for the
-8125B, multi-queue is **not exposed by the hardware** on this chip
-revision. This document captures the evidence and the rationale for
-deferring the work.
+## Correction — what the original analysis got wrong
 
-## Evidence
+The 2026-05-26 note concluded multi-queue was unsupported by reading the vendor
+per-chip queue-count switch and assuming `CFG_METHOD_4/5` (8125B) fell into the
+`default: HwSuppNumRxQueues = 1` case. That reading was incorrect for this
+stepping: the validated 8125B reports **`HwSuppNumRxQueues = 4`** and
+`HwSuppIndirTblEntries = 128`, and the V2/MSI-X interrupt surface (22 vectors)
+drives the per-queue rings. Confirmed empirically on hardware, not from
+source-reading:
 
-`references/realtek-r8125-official/src/r8125_n.c:15054-15078` —
-the per-chip queue-count switch:
+- RX spreads across all 4 RX-queue IRQs under an IP-diverse pktgen flood
+  (~1.78M pps, 0 faults).
+- `ethtool -l` reports 4 RX queues; `ethtool -L rx {1,2,4}` reconfigures them at
+  runtime; `ethtool -x` shows the 128-entry indirection table.
+- `rss_queues=4` runs at line rate (2.36 Gbit gateway / 2.32 Gbit KVM), 0
+  `tx_dropped_error`, at-or-better than the vendor C r8125(RSS) driver across the
+  runtime-validation sweep.
 
-```c
-switch (tp->mcfg) {
-    ...
-case CFG_METHOD_13:        // (8125D / similar)
-    tp->HwSuppNumTxQueues = 2;
-    tp->HwSuppNumRxQueues = 4;
-    break;
-default:                   // *includes* CFG_METHOD_4/5 (8125B,
-                           //  MAC_VER_63, XID 0x641 — our target)
-    tp->HwSuppNumTxQueues = 1;
-    tp->HwSuppNumRxQueues = 1;
-    break;
-}
-```
+## Current state (replaces the original "vacuously satisfied" gates)
 
-The validated MS-A2 RTL8125B (XID 0x641, `RTL_GIGA_MAC_VER_63`) falls
-under the default case. The chip itself reports **1 TX queue + 1 RX
-queue**. Attempting to enable additional queues would either:
+- **`ethtool -L`** changes the active RX-queue count (1/2/4) via a stop+open
+  reconfigure; invalid counts (3, >max, combined/tx) are rejected.
+- **`ethtool -X`/`-x`** program/read the RSS key + indirection table.
+- **RSS disable**: the default `rss_queues=0` keeps the proven single-queue RFC
+  path (RSS_CTRL cleared); multi-queue is a validated operator opt-in.
+- TX remains a single ring (reaped by queue 0); the V2 TX-completion vector is
+  entry 16 (see `docs/M6_MSIX_DESIGN.md`).
 
-1. Silently no-op — the chip's queue-routing registers don't drive
-   additional descriptor rings.
-2. Misroute frames — without per-queue hardware support, software
-   striping doesn't help (no RSS hash table to populate).
+## Why the default stays single-queue
 
-r8169 mainline (`r8169_main.c`) also runs single-queue on 8125B
-(no multi-queue netif allocation path); it shares this constraint.
+Multi-queue is opt-in (`rss_queues`), not the default: at 2.5 GbE one core +
+RXHASH→RPS already absorbs realistic line-rate traffic, and the measured
+multi-queue capacity gain only materializes for >2M pps small-packet RX from
+many peers (multi-client server/LB). The gateway/LB deployment is that case, so
+the feature is implemented and validated — but the RFC single-queue path is
+unchanged. Evidence: `docs/perf/DRIVER_GAP_LEDGER.md` (Track B closeout).
 
-## What this means for the M6 gate
+---
 
-The plan §7 M6 lists per-feature gates that include:
-- `ethtool -L` can configure queue counts
-- Per-queue stats visible in `ethtool -S`
-- Disabling RSS at runtime restores correctness
-
-These gates are **vacuously satisfied** on 8125B:
-- `ethtool -L` would only accept `tx 1 rx 1` (the only valid count);
-  we already advertise that via `netif_alloc_etherdev_mq(1, 1)` in
-  the cshim.
-- Per-queue stats: we have one queue, so existing aggregate stats =
-  per-queue stats.
-- RSS disable: there's nothing to disable; chip-side `RSS_CTRL_8125`
-  is already programmed to 0 in `hw_start_8125b` (the M4-perf
-  chip-init parity work).
-
-## Recommendation
-
-**Do not attempt multi-queue work for 8125B.** Mark this M6
-sub-feature as N/A in the close-out report. Future support for 8125D
-or 8126 (different chip revs that *do* support multi-queue) would
-re-open this scope under a new chip-version dispatch entry.
-
-If the operator obtains an 8125D / 8126 / similar multi-queue stepping
-later, the design for that should:
-
-1. Add a new `ChipInfo` row in `src/hw.rs::KNOWN` with the new XID.
-2. Add a per-chip-version `n_tx_queues` / `n_rx_queues` field.
-3. Rework `NetdevState` to hold N rings (currently 1) — substantial.
-4. Add RSS hash table programming via `RSS_KEY_8125` / `RSS_INDIR_TBL_8125`.
-5. Wire `ethtool -L`/`-X` through the cshim.
-
-This is M7+ scope on the chip-rev expansion path, not core 8125B work.
+_Original 2026-05-26 note (incorrect — kept for history):_ the per-chip switch
+in `references/realtek-r8125-official/src/r8125_n.c` was read as placing
+CFG_METHOD_4/5 in the single-queue default case; this was mistaken for the
+validated XID 0x641 stepping, which reports 4 RX queues. Future 8125D/8126
+steppings would extend the queue count further under their own chip-version
+dispatch.

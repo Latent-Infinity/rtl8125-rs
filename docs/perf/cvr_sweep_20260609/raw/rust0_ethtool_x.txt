@@ -1,0 +1,27 @@
+
+RX flow hash indirection table for enp3s0 with 1 RX ring(s):
+    0:      0     0     0     0     0     0     0     0
+    8:      0     0     0     0     0     0     0     0
+   16:      0     0     0     0     0     0     0     0
+   24:      0     0     0     0     0     0     0     0
+   32:      0     0     0     0     0     0     0     0
+   40:      0     0     0     0     0     0     0     0
+   48:      0     0     0     0     0     0     0     0
+   56:      0     0     0     0     0     0     0     0
+   64:      0     0     0     0     0     0     0     0
+   72:      0     0     0     0     0     0     0     0
+   80:      0     0     0     0     0     0     0     0
+   88:      0     0     0     0     0     0     0     0
+   96:      0     0     0     0     0     0     0     0
+  104:      0     0     0     0     0     0     0     0
+  112:      0     0     0     0     0     0     0     0
+  120:      0     0     0     0     0     0     0     0
+RSS hash key:
+38:15:14:98:32:ed:20:74:ec:ee:35:0a:cd:7e:e4:09:06:af:6a:99:de:cb:25:71:f2:42:04:c6:fc:c4:4a:c2:90:4e:b4:45:02:0d:75:01
+RSS hash function:
+    toeplitz: on
+    xor: off
+    crc32: off
+RSS input transformation:
+    symmetric-xor: off
+    symmetric-or-xor: off

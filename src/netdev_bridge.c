@@ -8,7 +8,7 @@
  * has no stable Rust API today: net_device + net_device_ops + NAPI +
  * sk_buff plumbing.
  *
- * Hard cap: 600 LOC including comments. Candidate G/L/M additions and the
+ * Hard cap: 615 LOC including comments. Candidate G/L/M additions and the
  * per-MTU zero-copy RX path fit after dead RX helpers moved out; queue-id
  * plumbing and the multi-queue NAPI lifecycle helpers raised the cap from
  * 540. See cshim/README.md.
@@ -493,6 +493,19 @@ void r8125_bridge_set_active_rx_queues(struct net_device *ndev, unsigned int n)
 		n = R8125_BRIDGE_RX_QUEUE_COUNT;
 	b->active_rx_queues = n;
 	WARN_ON_ONCE(netif_set_real_num_rx_queues(ndev, n));
+}
+
+/*
+ * Reconfigure a running netdev for ethtool set_channels: a full stop + open so
+ * the Rust open path re-reads the (now-overridden) RX-queue count and re-wires
+ * IRQs/NAPI/RSS for it. Same down/up the kernel runs on `ip link set down/up`;
+ * called under RTNL. On open failure the netdev is left down and the errno is
+ * propagated (ethtool reports it).
+ */
+int r8125_bridge_reopen(struct net_device *ndev)
+{
+	bridge_ndo_stop(ndev);
+	return bridge_ndo_open(ndev);
 }
 
 void r8125_bridge_carrier_on(struct net_device *ndev)
