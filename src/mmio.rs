@@ -61,13 +61,14 @@ impl<'a> Regs<'a> {
         self.bar.write8(value, regs::CHIP_CMD);
     }
 
-    /// Read the MAC address from `IDR0..IDR5` (MMIO 0x00..0x05) as one
-    /// 32-bit and one 16-bit access. After M2's hardware reset the chip
-    /// repopulates these registers from on-chip storage; r8169 reads the
-    /// same offsets at probe time.
+    /// Read the factory MAC from the 8125 BACKUP registers (0x19E0/0x19E4).
+    /// The legacy IDR0 window (0x00) is cleared by a soft reset, but BACKUP
+    /// retains the EEPROM-loaded address — this is the authoritative source the
+    /// vendor driver reads (`rtl8125_get_mac_address`). Reading IDR0 instead
+    /// returns zeros after any reset, which would force a bogus random MAC.
     pub(crate) fn mac_address(&self) -> [u8; 6] {
-        let low = self.bar.read32(regs::MAC_ADDR_LOW);
-        let high = self.bar.read16(regs::MAC_ADDR_HIGH);
+        let low = self.bar.read32(regs::BACKUP_ADDR0_8125);
+        let high = self.bar.read16(regs::BACKUP_ADDR1_8125);
         [
             low as u8,
             (low >> 8) as u8,
@@ -76,6 +77,24 @@ impl<'a> Regs<'a> {
             high as u8,
             (high >> 8) as u8,
         ]
+    }
+
+    /// Program `addr` into the chip's RX-filter MAC registers (IDR0/IDR4),
+    /// bracketed by the Cfg9346 unlock/lock the chip requires for these writes.
+    /// Mirrors the vendor `rtl8125_rar_set`. MUST be called at open (and on a MAC
+    /// change) so the hardware unicast filter matches `dev_addr` — otherwise the
+    /// chip silently drops unicast frames after a reset clears IDR0, or after a
+    /// random-MAC fallback / `ip link set address`.
+    pub(crate) fn set_mac_address(&self, addr: &[u8; 6]) {
+        let low = u32::from(addr[0])
+            | (u32::from(addr[1]) << 8)
+            | (u32::from(addr[2]) << 16)
+            | (u32::from(addr[3]) << 24);
+        let high = u32::from(addr[4]) | (u32::from(addr[5]) << 8);
+        self.bar.write8(regs::CFG9346_UNLOCK, regs::CFG9346);
+        self.bar.write32(low, regs::MAC_ADDR_LOW);
+        self.bar.write32(high, regs::MAC_ADDR_HIGH);
+        self.bar.write8(regs::CFG9346_LOCK, regs::CFG9346);
     }
 
     // ── M4 hot-path accessors ─────────────────────────────────────────────
@@ -118,6 +137,36 @@ impl<'a> Regs<'a> {
     /// Read the Receive Configuration Register.
     pub(crate) fn rcr(&self) -> u32 {
         self.bar.read32(regs::RCR)
+    }
+
+    /// Trigger a hardware tally-counter DMA dump into the coherent buffer at
+    /// `handle` (8-byte aligned), then poll for completion. Returns true if the
+    /// dump finished, false on timeout. The C bridge owns the buffer alloc and
+    /// reads the dumped struct; this only drives the MMIO handshake. Mirrors
+    /// vendor `rtl8125_dump_tally_counter`.
+    pub(crate) fn dump_tally(&self, handle: u64) -> bool {
+        let low = (handle as u32) & !0x7;
+        self.bar
+            .write32((handle >> 32) as u32, regs::COUNTER_ADDR_HIGH);
+        self.bar.write32(low, regs::COUNTER_ADDR_LOW);
+        self.bar
+            .write32(low | regs::COUNTER_DUMP, regs::COUNTER_ADDR_LOW);
+        let step = Delta::from_micros(10);
+        for _ in 0..200 {
+            udelay(step);
+            if self.bar.read32(regs::COUNTER_ADDR_LOW) & regs::COUNTER_DUMP == 0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Write the 64-bit multicast hash filter (MAR0/MAR4). `low` goes to 0x08,
+    /// `high` to 0x0C. Callers pass the values already in hardware word order
+    /// (see `layout::mar_words`).
+    pub(crate) fn set_mar(&self, low: u32, high: u32) {
+        self.bar.write32(low, regs::MAR0);
+        self.bar.write32(high, regs::MAR4);
     }
 
     /// Write CPlusCmd.

@@ -139,3 +139,43 @@ Use this file as the canonical exception log:
 - **Don't re-measure an unchanged baseline every run.** The C driver is fixed;
   the bench now pins a C reference and runs rust-only (`RUN_C=0`) unless the
   kernel/rig changes (~2× faster matrices).
+
+## 2026-06-11 — upstream-review misses: make "obvious" details executable
+
+- **Readback must match programmed state, not just be plausible.** We initially
+  programmed multi-queue RSS with the kernel default indirection spread, while
+  `get_rxfh` still reported the old all-zero single-queue table. The code ran,
+  but `ethtool -x` lied about hardware state. New rule: every control-plane
+  setter/programmer needs a readback audit row: "what writes hardware?" and
+  "what does the user-facing query report immediately after?" The CI gate must
+  assert the same source of truth is used on both sides.
+- **Validate both running and down administrative states.** `ethtool -L` was
+  correct on a running interface because stop/open refreshed the C-side active
+  queue cache, but the down-interface path could have accepted a new count while
+  `ethtool -l/-x` still reported the old one until the next open. New rule:
+  any netdev reconfiguration op must be reviewed in both states:
+  `ip link set up; change; query` and `ip link set down; change; query; up; query`.
+  If one path updates cached state through a side effect, the other path must
+  update that cache explicitly or share the same helper.
+- **A static gate must cover the entire contract, not just the original
+  milestone.** `check_rss_ethtool.sh` checked the B5-era RSS surface, but after
+  `set_channels` was added the gate still did not assert that the op was wired
+  or that the down-interface cache update existed. New rule: when a feature
+  grows, update the gate's description and failure conditions in the same patch;
+  comments saying "full surface" are stale unless the grep/test set proves it.
+- **Evidence parsers are production code.** A sweep parser recorded the literal
+  string `receiver` in the retransmit column, and single samples of bursty TCP
+  retransmits created false "C beats Rust" alarms. New rule: benchmark harnesses
+  need unit-testable pure helpers for parsing/statistics, schema checks that
+  reject non-numeric metric columns, and enough samples to report median/min/max
+  plus spike-rate for bursty metrics.
+- **Prefer unsupported over silent no-op.** `set_rxfh` originally validated an
+  indirection table but did not store or program it, which could make a valid
+  custom table look accepted while hardware kept the default spread. New rule:
+  until a setter is fully implemented, accept only exact echoes of the current
+  supported state and return `-EOPNOTSUPP` for valid-but-unsupported changes.
+- **Docs must be audited as claims, not prose.** Stale wording like
+  `rss_queues` "default 1" survived after the actual default was `0/off`.
+  New rule: before upstream-review or soak signoff, run a claim audit over docs:
+  defaults, supported values, completed/deferred status, evidence paths, and
+  any "no scenario/no metric" statements must match code and raw artifacts.

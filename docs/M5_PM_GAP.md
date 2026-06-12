@@ -92,3 +92,36 @@ path is:
 
 This is honest about what's achievable today without forking the
 kernel-Rust PCI abstractions.
+
+## 2026-06-12 — refined plan for the pm_ops attempt (gap-closure Phase 2)
+
+Re-confirmed against the running `7.0.0-kasan` kernel tree
+(`~/kbuild/linux-7.0.0/rust/kernel/pci.rs`): `Adapter::register` still wires only
+`probe`/`remove`/`id_table`; `.driver.pm` stays NULL. So pm_ops is **not
+implementable in driver-only code** — it needs the kernel-Rust API extension
+(Option 1), which is a *kernel-tree* change, not part of the driver submission:
+
+1. Patch `rust/kernel/pci.rs`: add optional `suspend`/`resume` (default no-op)
+   to the `pci::Driver` trait; build a `static dev_pm_ops` and set
+   `pdrv->driver.pm` in `register`. (The cshim hack — Option 2 — is rejected:
+   it races the adapter's ownership of `.driver.pm`; the plan forbids fragile PM
+   workarounds.)
+2. Driver side: `suspend` = netif_device_detach + stop TX + phy_stop + mask IRQ +
+   quiesce chip + (WoL: arm PCI wake); `resume` = restore + set bus master +
+   rar_set + reopen-if-was-up.
+3. **Build/boot cost:** changing the kernel rust core requires a **full kernel
+   rebuild + reboot** of each rig (gateway, and the KVM guest for vfio coverage).
+
+**Testing the headless gateway is now unblocked:** use `rtcwake -m mem -s N`
+(suspend-to-RAM with an RTC auto-wake after N seconds) so the bare-metal box
+resumes itself — a remote `systemctl suspend` would otherwise leave it
+unreachable (no working WoL yet). The KVM guest can use `virsh dompmsuspend
+--target mem` / `dompmwakeup` from the host (vfio-passthrough S3 to be verified).
+
+**WoL is coupled:** `set_wol` programs the chip Config3/Config5 + magic-packet-V3
+OCP sequence, but its actual wake only takes effect through the pm `suspend`
+path arming PCI wake — so WoL lands with pm_ops, not before.
+
+**Scope:** this is the "split the upstream API work" effort the plan calls for —
+a kernel-Rust patch + 2 kernel rebuilds + a suspend/resume validation cycle —
+best done as its own focused pass, not mixed into the ethtool feature commits.

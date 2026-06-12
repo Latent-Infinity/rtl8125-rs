@@ -34,6 +34,15 @@ pub(crate) const MAC_ADDR_LOW: usize = 0x00;
 /// IDR4 — high 16 bits of the MAC address.
 pub(crate) const MAC_ADDR_HIGH: usize = 0x04;
 
+/// 8125 BACKUP MAC registers (0x19E0/0x19E4). The chip loads the factory MAC
+/// from EEPROM into these AND into IDR0 at power-on, but a soft reset clears
+/// IDR0 while BACKUP persists — so BACKUP is the authoritative source the vendor
+/// driver reads (`rtl8125_get_mac_address` reads MAC0 then overwrites from
+/// BACKUP). We read BACKUP and write the result back into IDR0/IDR4 (the RX
+/// filter) via `rar_set`.
+pub(crate) const BACKUP_ADDR0_8125: usize = 0x19E0;
+pub(crate) const BACKUP_ADDR1_8125: usize = 0x19E4;
+
 // ── TX/RX ring base addresses (TNPDS, RDSAR) ─────────────────────────────
 /// `TNPDS` — TX Normal Priority Descriptors. 64-bit DMA base address of the
 /// TX descriptor ring; we write the low 32 bits then the high 32 bits.
@@ -318,6 +327,21 @@ pub(crate) const TXCFG_DMA_BURST_UNLIMITED: u32 = 7;
 pub(crate) const TXCFG_IFG_SHORTEST: u32 = 3;
 pub(crate) const TXCFG_M4_BASELINE: u32 =
     (TXCFG_DMA_BURST_UNLIMITED << TXCFG_DMA_SHIFT) | (TXCFG_IFG_SHORTEST << TXCFG_IFG_SHIFT);
+
+// ── Hardware tally counter dump (CounterAddr at 0x10/0x14) ───────────────
+// `ndo_get_stats64` triggers a DMA dump of the on-die statistics block to a
+// driver-provided coherent buffer: write the buffer's 64-bit DMA address, set
+// the dump bit in the low word, poll it clear. Mirrors vendor
+// `rtl8125_dump_tally_counter`.
+pub(crate) const COUNTER_ADDR_LOW: usize = 0x10;
+pub(crate) const COUNTER_ADDR_HIGH: usize = 0x14;
+pub(crate) const COUNTER_DUMP: u32 = 0x8;
+
+// ── MAR — Multicast hash filter (MAR0..MAR7 at 0x08, two 32-bit words) ────
+// `ndo_set_rx_mode` programs the 64-bit multicast hash here (ether_crc>>26 bit
+// per joined group), written as two 32-bit words at 0x08 and 0x0C.
+pub(crate) const MAR0: usize = 0x08;
+pub(crate) const MAR4: usize = 0x0C;
 
 // ── RCR — Receive Configuration Register (32-bit) ────────────────────────
 pub(crate) const RCR: usize = 0x44;

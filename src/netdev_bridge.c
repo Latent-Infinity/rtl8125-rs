@@ -8,10 +8,15 @@
  * has no stable Rust API today: net_device + net_device_ops + NAPI +
  * sk_buff plumbing.
  *
- * Hard cap: 615 LOC including comments. Candidate G/L/M additions and the
+ * Hard cap: 800 LOC including comments. Candidate G/L/M additions and the
  * per-MTU zero-copy RX path fit after dead RX helpers moved out; queue-id
  * plumbing and the multi-queue NAPI lifecycle helpers raised the cap from
- * 540. See cshim/README.md.
+ * 540, then 615. Raised to 700 for the upstream robustness features: random-MAC
+ * fallback for an invalid hardware MAC, the ndo_tx_timeout watchdog + deferred
+ * reset_work recovery, and ndo_get_stats64 surfacing the drop counters. Raised
+ * to 760 for ndo_set_rx_mode, then 800 for the hardware tally-dump path, per
+ * docs/UPSTREAM_GAP_CLOSURE_PLAN.md.
+ * See cshim/README.md.
  *
  * Every ndo callback below is a thin delegation to the Rust vtable.
  * Kernel object setup stays here; packet-side counter increments live
@@ -25,8 +30,10 @@
 #include <linux/dma-mapping.h>
 #include <linux/etherdevice.h>
 #include <linux/interrupt.h>
+#include <linux/rtnetlink.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
+#include <linux/workqueue.h>
 #include <asm/barrier.h>
 
 /*
@@ -184,6 +191,115 @@ static int bridge_napi_poll(struct napi_struct *napi, int budget)
 	return b->ops.poll(b->priv, rxq->queue_id, budget);
 }
 
+/*
+ * Deferred chip reset. ndo_tx_timeout fires in the netdev-watchdog timer
+ * (atomic) context where we cannot sleep, so it only schedules this work, which
+ * does the real recovery (full stop+open via r8125_bridge_reopen) under RTNL.
+ */
+static void bridge_reset_work(struct work_struct *work)
+{
+	struct r8125_bridge *b = container_of(work, struct r8125_bridge, reset_work);
+	struct net_device *ndev = b->ndev;
+
+	rtnl_lock();
+	if (netif_running(ndev)) {
+		netdev_warn(ndev, "recovering link after TX watchdog timeout\n");
+		r8125_bridge_reopen(ndev);
+	}
+	rtnl_unlock();
+}
+
+/*
+ * TX watchdog. The stack calls this when a TX queue has not made progress for
+ * dev->watchdog_timeo. Schedule a reset rather than reset inline (atomic
+ * context). Without this a wedged TX ring would never recover on its own.
+ */
+static void bridge_ndo_tx_timeout(struct net_device *ndev, unsigned int txqueue)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+
+	netdev_warn(ndev, "TX watchdog timeout on queue %u; scheduling reset\n",
+		    txqueue);
+	schedule_work(&b->reset_work);
+}
+
+/*
+ * ndo_get_stats64. The core maintains rx/tx packets+bytes in per-CPU tstats
+ * (NETDEV_PCPU_STAT_TSTATS); fold the section 6.3 disposition drop counters into
+ * the standard rx_dropped/tx_dropped so `ip -s link` / SNMP see them too, not
+ * only `ethtool -S`. Also folds chip tally error counters when the hardware dump
+ * succeeds.
+ */
+static void bridge_ndo_get_stats64(struct net_device *ndev,
+				   struct rtnl_link_stats64 *stats)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+	struct r8125_bridge_counters c;
+
+	dev_get_tstats64(ndev, stats);
+	r8125_bridge_counters_snapshot(ndev, &c);
+	stats->rx_dropped += c.rx_dropped_error;
+	stats->tx_dropped += c.tx_dropped_error;
+
+	/* Hardware tally: dump the on-die counters and fold the error totals the
+	 * software §6.3 counters can't see (RX FIFO-overflow misses, chip-level
+	 * rx/tx errors). tally_dump returns 0 on success.
+	 */
+	if (b->tally_vaddr && !b->ops.tally_dump(b->priv, b->tally_dma)) {
+		u32 rx_missed;
+
+		/* The chip has just DMA-written the coherent tally buffer. The MMIO
+		 * completion poll tells us the dump finished; pair it with a DMA read
+		 * barrier before consuming the buffer contents on weakly ordered CPUs.
+		 */
+		dma_rmb();
+		rx_missed = le16_to_cpu(b->tally_vaddr->rx_missed);
+		stats->rx_missed_errors += rx_missed;
+		stats->rx_errors += le32_to_cpu(b->tally_vaddr->rx_errors);
+		stats->tx_errors += le64_to_cpu(b->tally_vaddr->tx_errors);
+	}
+}
+
+/*
+ * ndo_set_rx_mode — compute the RX accept filter + 64-bit multicast hash from
+ * the netdev flags and mc list, then hand them to Rust to program RCR + MAR.
+ * Mirrors the vendor rtl8125_hw_set_rx_packet_filter (ether_crc>>26 hash). The
+ * multicast hash words are passed in natural order; Rust applies the hardware
+ * byte/word swap. Falls back to allmulti past R8125_MC_HASH_MAX groups.
+ */
+static void bridge_ndo_set_rx_mode(struct net_device *ndev)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+	unsigned int accept;
+	u32 mc0 = 0, mc1 = 0;
+
+	if (ndev->flags & IFF_PROMISC) {
+		accept = R8125_RX_ACCEPT_BROADCAST | R8125_RX_ACCEPT_MULTICAST |
+			 R8125_RX_ACCEPT_MYPHYS | R8125_RX_ACCEPT_ALLPHYS;
+		mc0 = mc1 = 0xffffffff;
+	} else if ((ndev->flags & IFF_ALLMULTI) ||
+		   netdev_mc_count(ndev) > R8125_MC_HASH_MAX) {
+		accept = R8125_RX_ACCEPT_BROADCAST | R8125_RX_ACCEPT_MULTICAST |
+			 R8125_RX_ACCEPT_MYPHYS;
+		mc0 = mc1 = 0xffffffff;
+	} else {
+		struct netdev_hw_addr *ha;
+
+		accept = R8125_RX_ACCEPT_BROADCAST | R8125_RX_ACCEPT_MYPHYS;
+		netdev_for_each_mc_addr(ha, ndev) {
+			int bit = ether_crc(ETH_ALEN, ha->addr) >> 26; /* 0..63 */
+
+			if (bit < 32)
+				mc0 |= 1u << bit;
+			else
+				mc1 |= 1u << (bit - 32);
+			accept |= R8125_RX_ACCEPT_MULTICAST;
+		}
+	}
+
+	b->ops.set_rx_mode(b->priv, accept, mc0, mc1);
+}
+
 static const struct net_device_ops bridge_ops = {
 	.ndo_open		= bridge_ndo_open,
 	.ndo_stop		= bridge_ndo_stop,
@@ -193,6 +309,9 @@ static const struct net_device_ops bridge_ops = {
 	.ndo_set_features	= bridge_ndo_set_features,
 	.ndo_set_mac_address	= eth_mac_addr,
 	.ndo_validate_addr	= eth_validate_addr,
+	.ndo_tx_timeout		= bridge_ndo_tx_timeout,
+	.ndo_get_stats64	= bridge_ndo_get_stats64,
+	.ndo_set_rx_mode	= bridge_ndo_set_rx_mode,
 };
 
 /* ── Lifecycle ─────────────────────────────────────────────────────── */
@@ -219,7 +338,21 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	ndev->netdev_ops = &bridge_ops;
 	ndev->ethtool_ops = &r8125_bridge_ethtool_ops;
 	ndev->needs_free_netdev = false; /* we free explicitly */
-	eth_hw_addr_set(ndev, mac);
+	/* The chip repopulates IDR0..IDR5 from on-chip storage after reset, but a
+	 * fresh/uninitialised chip (or one left zeroed by a prior reset) can hand
+	 * back an all-zero or otherwise invalid address. The stack refuses to bring
+	 * up an interface with an invalid MAC (EADDRNOTAVAIL on `ip link set up`),
+	 * so fall back to a random address like r8169 does, rather than registering
+	 * an unusable device.
+	 */
+	if (is_valid_ether_addr(mac)) {
+		eth_hw_addr_set(ndev, mac);
+	} else {
+		eth_hw_addr_random(ndev);
+		dev_warn(&pdev->dev,
+			 "invalid hardware MAC %pM; using random %pM\n",
+			 mac, ndev->dev_addr);
+	}
 
 	/* M6 #2: jumbo support up to 9000 bytes. RX slot geometry now
 	 * comes from per-MTU sizing in netdev_bridge_rx_pool.c, and `ndo_open`
@@ -229,6 +362,11 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	 */
 	ndev->min_mtu = ETH_MIN_MTU;
 	ndev->max_mtu = 9000;
+
+	/* Arm the TX watchdog so a wedged TX queue is detected and recovered
+	 * (bridge_ndo_tx_timeout -> reset_work -> r8125_bridge_reopen).
+	 */
+	ndev->watchdog_timeo = 5 * HZ;
 
 	/* Candidate G (RX_OPTIMIZATION_CANDIDATES.md §G): per-CPU
 	 * netstats. With `NETDEV_PCPU_STAT_TSTATS` the kernel uses
@@ -285,11 +423,18 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	 * opt-in raises it. All MAX NAPI instances are created regardless.
 	 */
 	b->active_rx_queues = 1;
+	INIT_WORK(&b->reset_work, bridge_reset_work);
 
 	if (r8125_bridge_counters_alloc(b)) {
 		free_netdev(ndev);
 		return NULL;
 	}
+
+	/* Coherent buffer for the hardware tally-counter dump. Non-fatal: if it
+	 * fails, ndo_get_stats64 simply skips the hardware error counters.
+	 */
+	b->tally_vaddr = dma_alloc_coherent(&pdev->dev, sizeof(*b->tally_vaddr),
+					    &b->tally_dma, GFP_KERNEL);
 
 	for (i = 0; i < R8125_BRIDGE_RX_QUEUE_COUNT; i++) {
 		b->rxq[i].bridge = b;
@@ -300,10 +445,20 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	return ndev;
 }
 
+static void bridge_tally_free(struct r8125_bridge *b)
+{
+	if (b->tally_vaddr)
+		dma_free_coherent(&b->pdev->dev, sizeof(*b->tally_vaddr),
+				  b->tally_vaddr, b->tally_dma);
+	b->tally_vaddr = NULL;
+}
+
 void r8125_bridge_free(struct net_device *ndev)
 {
 	struct r8125_bridge *b = netdev_priv(ndev);
 
+	cancel_work_sync(&b->reset_work);
+	bridge_tally_free(b);
 	bridge_napi_del_all(b);
 	r8125_bridge_counters_free(b);
 	free_netdev(ndev);
@@ -326,12 +481,18 @@ void r8125_bridge_unregister_and_free(struct net_device *ndev)
 	 * the mii_bus pointer.
 	 */
 	unregister_netdev(ndev);
+	/* After unregister no watchdog can schedule reset_work; flush any in
+	 * flight before freeing. Called without RTNL held, so the work's
+	 * rtnl_lock cannot deadlock us.
+	 */
+	cancel_work_sync(&b->reset_work);
 	if (b->mii_bus) {
 		mdiobus_unregister(b->mii_bus);
 		mdiobus_free(b->mii_bus);
 		b->mii_bus = NULL;
 		b->phydev = NULL;
 	}
+	bridge_tally_free(b);
 	bridge_napi_del_all(b);
 	r8125_bridge_counters_free(b);
 	free_netdev(ndev);
@@ -483,6 +644,15 @@ void r8125_bridge_napi_complete_done(struct net_device *ndev,
  * netif_set_real_num_rx_queues (RPS sysfs). Called by Rust ndo_open under RTNL
  * with the netdev down. Clamped to [1, R8125_BRIDGE_RX_QUEUE_COUNT].
  */
+/* Copy the netdev's current dev_addr out so the Rust open path can program it
+ * into the chip RX filter (rar_set). dev_addr is whatever the alloc path settled
+ * on: the chip MAC, or a random fallback for an invalid one.
+ */
+void r8125_bridge_dev_addr(struct net_device *ndev, unsigned char out[ETH_ALEN])
+{
+	memcpy(out, ndev->dev_addr, ETH_ALEN);
+}
+
 void r8125_bridge_set_active_rx_queues(struct net_device *ndev, unsigned int n)
 {
 	struct r8125_bridge *b = netdev_priv(ndev);

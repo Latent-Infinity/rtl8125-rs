@@ -1,0 +1,11 @@
+# evidence-surface capture
+iface: enp3s0   prefix: ssh gateway sudo ip netns exec dut
+captured: 2026-06-11T23:12:52Z
+
+## op responsiveness (Operation not supported => gap)
+  ethtool_link_ksettings     present
+  ethtool_a_pause            NOT SUPPORTED
+  ethtool_c_coalesce         NOT SUPPORTED
+  ethtool_g_ring             NOT SUPPORTED
+  ethtool_eee                NOT SUPPORTED
+  ethtool_tsinfo             present

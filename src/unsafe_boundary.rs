@@ -180,6 +180,15 @@ pub(crate) struct BridgeOps {
     /// bridge validates tx/combined and reconfigures (stop+open) to apply.
     /// Returns 0 (accepted) or `-EINVAL`.
     pub set_channels: extern "C" fn(cookie: *mut c_void, rx_count: c_uint) -> c_int,
+    /// `ndo_set_rx_mode` — program the RX accept filter + multicast hash. The C
+    /// bridge computes `accept` (RCR accept bits) and the two natural-order
+    /// multicast hash words from `ndev->flags` + the mc list; Rust merges the
+    /// accept bits into the live RCR and writes MAR0/MAR4.
+    pub set_rx_mode: extern "C" fn(cookie: *mut c_void, accept: c_uint, mc0: c_uint, mc1: c_uint),
+    /// `ndo_get_stats64` hardware-tally dump. The C bridge owns the coherent
+    /// buffer and passes its DMA address; Rust drives the MMIO dump handshake
+    /// and returns 0 on success, -1 on timeout. C then reads the dumped struct.
+    pub tally_dump: extern "C" fn(cookie: *mut c_void, dma_addr: u64) -> c_int,
 }
 
 // Bindgen emits `pci_dev` / `net_device` / `sk_buff` as opaque
@@ -207,6 +216,7 @@ extern "C" {
         work_done: c_int,
     );
     fn r8125_bridge_set_active_rx_queues(ndev: *mut bindings::net_device, n: c_uint);
+    fn r8125_bridge_dev_addr(ndev: *mut bindings::net_device, out: *mut u8);
     fn r8125_bridge_irq_pin_cpu(irq: u32, cpu: c_int) -> c_int;
     fn r8125_bridge_num_online_cpus() -> c_uint;
     fn r8125_bridge_node_base_cpu(pdev: *mut bindings::pci_dev) -> c_int;
@@ -850,6 +860,18 @@ pub(crate) fn bridge_napi_complete_done(
 pub(crate) fn set_active_rx_queues(ndev: *mut bindings::net_device, n: u32) {
     // SAFETY: see fn-level contract.
     unsafe { r8125_bridge_set_active_rx_queues(ndev, n as c_uint) };
+}
+
+/// Read the netdev's current `dev_addr` (6 bytes) so the open path can program
+/// it into the chip RX filter.
+///
+/// # SAFETY: `ndev` is the registered net_device; the C side copies exactly
+/// `ETH_ALEN` (6) bytes into `out`, which is a 6-byte stack array here.
+pub(crate) fn bridge_dev_addr(ndev: *mut bindings::net_device) -> [u8; 6] {
+    let mut out = [0u8; 6];
+    // SAFETY: see fn-level contract; `out` is 6 bytes, matching ETH_ALEN.
+    unsafe { r8125_bridge_dev_addr(ndev, out.as_mut_ptr()) };
+    out
 }
 
 /// Suggest IRQ CPU affinity for the chip's MSI-X / MSI / INTx vector.

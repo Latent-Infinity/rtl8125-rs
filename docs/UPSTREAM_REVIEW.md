@@ -61,6 +61,9 @@ below was assembled from the netdev FAQ, `Documentation/process/`,
    with `suspend_late` / `resume_early` callbacks that tear down the
    chip via `ndo_stop` shape and bring it back up via `ndo_open`.
 
+Detailed sequencing for PM, link settings, receive-mode filtering, and the
+remaining ethtool surfaces is tracked in `docs/UPSTREAM_GAP_CLOSURE_PLAN.md`.
+
 ### Soft blockers (should fix before RFC, but maintainer might accept "in flight")
 
 3. **Sparse + smatch clean on cshim.** CI gates exist now; remaining work is

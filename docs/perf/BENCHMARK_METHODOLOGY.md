@@ -49,6 +49,12 @@ Canonical harness: **`scripts/cvr_stat_sweep.sh`** (supersedes the single-sample
    `tx_dropped` (delta before→after each run). If the metric moves but every NIC
    counter delta is `+0`, the loss is **not in the driver** — it is the sender,
    the peer, or TCP. Do not "fix" the driver for it.
+   - **Current stats surface:** `ndo_get_stats64` now folds the driver's own
+     drop counters into `rx_dropped`/`tx_dropped` and triggers the chip's
+     hardware tally dump for `rx_missed_errors` / chip-level `rx_errors` /
+     `tx_errors`. Still corroborate with `ethtool -S rx_dropped_error` and
+     offered-vs-achieved pps; one counter family alone is not enough to classify
+     overload, peer loss, or sender-side retransmit spikes.
 
 7. **Like-for-like queue counts.** Do not compare `rust0` (1 RX queue) against
    vendor C (4 queues) and call the difference a driver gap. Compare equal

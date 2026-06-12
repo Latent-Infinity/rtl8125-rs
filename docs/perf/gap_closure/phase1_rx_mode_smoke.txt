@@ -1,0 +1,23 @@
+=== ndo_set_rx_mode hardware smoke (gateway, kasan) ===
+carrier=1
+=== promisc toggle (no error, no reopen, carrier stays up) ===
+  promisc on rc=0 flags=0x1103
+  carrier after promisc on=1
+  promisc off rc=0
+=== multicast/IPv6 ND in promisc-OFF (proves MAR hash programmed) ===
+  peer link-local: <none>
+  (no IPv6 LL; trying IPv4 all-hosts multicast)
+ping: connect: Network is unreachable
+=== explicit mcast group join (ip maddr) then list ===
+4
+=== ndo_set_rx_mode reached? (mc count) + splats ===
+  mc_count visible via /proc? skip
+  splats=0
+(end)
+
+=== multicast receive in promisc-off (MAR proof) ===
+promisc state (expect off, flags without 0x100): 0x1003
+SENT 10
+DUT(promisc-off) result: RECEIVED 5
+splats=0
+(end)

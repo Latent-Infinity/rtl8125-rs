@@ -41,6 +41,12 @@ echo
 echo "== statistical sweep harness (stats self-test) =="
 bash "$CI/check_sweep_stats.sh" || rc=1
 echo
+echo "== netdev robustness contract (MAC fallback / tx_timeout / get_stats64) =="
+bash "$CI/check_netdev_robustness.sh" || rc=1
+echo
+echo "== netdev/ethtool surface inventory (upstream gap-closure tracking) =="
+bash "$CI/check_surface_inventory.sh" || rc=1
+echo
 echo "== build wrapper / BTF path =="
 bash "$CI/check_build_makefile.sh" || rc=1
 echo

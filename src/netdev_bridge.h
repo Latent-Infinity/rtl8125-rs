@@ -181,7 +181,70 @@ struct r8125_bridge_ops {
 	 *         apply) or -EINVAL (rejected; the live config is untouched).
 	 */
 	int (*set_channels)(void *priv, unsigned int rx_count);
+
+	/*
+	 * set_rx_mode(priv, accept, mc0, mc1) — ndo_set_rx_mode programming
+	 * ──────────────────────────────────
+	 * Pre   : RTNL held. C computed `accept` (RCR accept bits: a subset of
+	 *         R8125_RX_ACCEPT_*) and the two natural-order 32-bit multicast
+	 *         hash words from ndev->flags + the mc list.
+	 * Post  : Rust merges `accept` into the live RCR (preserving descriptor /
+	 *         feature bits) and writes the MAR0/MAR4 multicast hash filter.
+	 */
+	void (*set_rx_mode)(void *priv, unsigned int accept,
+			    unsigned int mc0, unsigned int mc1);
+
+	/*
+	 * tally_dump(priv, dma_addr) — ndo_get_stats64 hardware-counter dump
+	 * ──────────────────────────
+	 * Pre   : RTNL/stats context. C owns the coherent buffer at `dma_addr`
+	 *         (sizeof(struct r8125_tally)) and reads it after the call.
+	 * Post  : Rust drives the chip's DMA dump handshake into that buffer.
+	 *         Returns 0 on success, negative on timeout (C then leaves the
+	 *         hardware-error stats unchanged).
+	 */
+	int (*tally_dump)(void *priv, u64 dma_addr);
 };
+
+/*
+ * On-die statistics block the chip DMAs on a tally dump (ndo_get_stats64). Only
+ * the leading fields are consumed; the chip writes the full block, so the tail
+ * pad MUST keep the struct >= the hardware dump size. Field offsets/order match
+ * the RTL8125 counter block (vendor `struct rtl8125_counters`).
+ */
+struct r8125_tally {
+	__le64 tx_packets;	/* 0x00 */
+	__le64 rx_packets;	/* 0x08 */
+	__le64 tx_errors;	/* 0x10 */
+	__le32 rx_errors;	/* 0x18 */
+	__le16 rx_missed;	/* 0x1c — RX FIFO-overflow misses */
+	__le16 align_errors;	/* 0x1e */
+	u8 _rest[224];		/* pad to 256B >= full hardware dump */
+};
+
+/*
+ * RX accept-filter bits (RTL8125 RxConfig low byte) the C ndo_set_rx_mode
+ * computes and hands to Rust. Values match src/regs.rs RCR_ACCEPT_*.
+ */
+#define R8125_RX_ACCEPT_ALLPHYS		0x01
+#define R8125_RX_ACCEPT_MYPHYS		0x02
+#define R8125_RX_ACCEPT_MULTICAST	0x04
+#define R8125_RX_ACCEPT_BROADCAST	0x08
+#define R8125_RX_ACCEPT_RUNT		0x10
+#define R8125_RX_ACCEPT_ERR		0x20
+
+/* Max multicast groups we program individually before falling back to allmulti
+ * (64-bit hash; above this the hash saturates, so allmulti is equivalent and
+ * cheaper than walking a huge list).
+ */
+#define R8125_MC_HASH_MAX		64
+
+/* TX/RX descriptor ring depth, reported by ethtool -g (get_ringparam). MUST
+ * equal Rust `ring::RING_LEN` (asserted by ci/check_surface_inventory.sh).
+ * Resize (set_ringparam) is intentionally unsupported for the first RFC, so
+ * `ethtool -G` returns -EOPNOTSUPP.
+ */
+#define R8125_BRIDGE_RING_LEN		256
 
 #define R8125_BRIDGE_FEATURE_RXCSUM	0x00000001U
 #define R8125_BRIDGE_FEATURE_RXVLAN	0x00000002U
@@ -309,6 +372,11 @@ void r8125_bridge_napi_complete_done(struct net_device *ndev,
  * to [1, R8125_BRIDGE_RX_QUEUE_COUNT].
  */
 void r8125_bridge_set_active_rx_queues(struct net_device *ndev, unsigned int n);
+
+/* Copy ndev->dev_addr out (6 bytes) so the Rust open path can program the chip
+ * RX filter (rar_set) from the address the alloc path settled on.
+ */
+void r8125_bridge_dev_addr(struct net_device *ndev, unsigned char out[ETH_ALEN]);
 
 /*
  * Reconfigure a running netdev (ethtool set_channels): stop then re-open so the

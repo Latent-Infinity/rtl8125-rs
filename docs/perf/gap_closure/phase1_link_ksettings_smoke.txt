@@ -1,0 +1,23 @@
+=== ethtool <iface> (link ksettings: expect Speed/Duplex/Autoneg/modes) ===
+	Supported ports: [ TP	 MII ]
+	Supported link modes:   10baseT/Half 10baseT/Full
+	Supported pause frame use: Symmetric Receive-only
+	Supports auto-negotiation: Yes
+	Supported FEC modes: Not reported
+	Advertised auto-negotiation: Yes
+	Advertised FEC modes: Not reported
+	Link partner advertised auto-negotiation: Yes
+	Link partner advertised FEC modes: Not reported
+	Speed: 2500Mb/s
+=== ethtool -r (nway_reset) ===
+  rc=0
+  carrier after reneg=1
+=== ethtool -s autoneg on (set-to-current round-trip) ===
+  rc=0
+=== invalid: speed 99999 duplex half autoneg off (expect clean fail) ===
+netlink error: link settings update failed
+netlink error: Invalid argument
+  rc=75 (nonzero=good)
+=== splats ===
+0
+(end)

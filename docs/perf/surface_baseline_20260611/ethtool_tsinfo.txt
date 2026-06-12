@@ -1,0 +1,7 @@
+Time stamping parameters for enp3s0:
+Capabilities:
+	software-receive
+	software-system-clock
+PTP Hardware Clock: none
+Hardware Transmit Timestamp Modes: none
+Hardware Receive Filter Modes: none

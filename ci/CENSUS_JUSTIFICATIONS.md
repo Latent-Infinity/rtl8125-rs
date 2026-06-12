@@ -3,6 +3,20 @@
 Per plan §9.4, every census bump (rejected by `ci/run_checks.sh`) needs a
 short rationale here. Append; never delete.
 
+## 2026-06-11 — MAC RX-filter programming bump 75 → 76
+
+Net +1 `unsafe { ... }` block in `src/unsafe_boundary.rs` for the vendor-accurate
+MAC handling (read BACKUP_ADDR + rar_set the chip RX filter at open, so the
+hardware unicast filter matches `dev_addr` — fixes "link up but no RX" after a
+reset clears IDR0 or after a random-MAC fallback; mirrors `rtl8125_rar_set`).
+
+- ADDED `bridge_dev_addr(ndev) -> [u8; 6]` — wraps `r8125_bridge_dev_addr`,
+  which `memcpy`s exactly `ETH_ALEN` (6) bytes of `ndev->dev_addr` into the
+  caller's buffer. SAFETY: `ndev` is the registered `net_device` alive across the
+  call; the destination is a fixed 6-byte stack array matching ETH_ALEN. No
+  ownership transfer, no MMIO, no skb. The MMIO write of the address
+  (`Regs::set_mac_address`) is in safe `mmio.rs` via the typed `Bar` accessors.
+
 ## 2026-05-25 — M4-traffic bump 43 → 46
 
 Net +3 `unsafe { ... }` blocks in `src/unsafe_boundary.rs`: four new wrappers

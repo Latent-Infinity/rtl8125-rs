@@ -778,6 +778,38 @@ extern "C" fn rust_set_channels(cookie: *mut c_void, rx_count: core::ffi::c_uint
     0
 }
 
+/// `ndo_set_rx_mode` register programming. The C bridge computes `accept` (RCR
+/// accept bits) and the two natural-order multicast hash words from the netdev
+/// flags + mc list; here we merge the accept bits into the live RCR (preserving
+/// V3/feature bits via the host-tested `rx_mode_rcr`) and write the MAR words in
+/// hardware order (`mar_words`). Runs under RTNL. Writing RCR/MAR is a plain
+/// config update; if the device is down it is reapplied at the next open (the
+/// stack calls ndo_set_rx_mode right after ndo_open).
+extern "C" fn rust_set_rx_mode(
+    cookie: *mut c_void,
+    accept: core::ffi::c_uint,
+    mc0: core::ffi::c_uint,
+    mc1: core::ffi::c_uint,
+) {
+    let state = state_from(cookie);
+    let regs = state.regs();
+    regs.set_rcr(crate::layout::rx_mode_rcr(regs.rcr(), accept));
+    let (m0, m4) = crate::layout::mar_words(mc0, mc1);
+    regs.set_mar(m0, m4);
+}
+
+/// `ndo_get_stats64` hardware-tally dump. The C bridge owns the coherent buffer
+/// (alloc/read/free) and the struct layout; Rust only drives the MMIO dump
+/// handshake into the supplied DMA address. Returns 0 on success, -1 on timeout.
+extern "C" fn rust_tally_dump(cookie: *mut c_void, dma_addr: u64) -> c_int {
+    let state = state_from(cookie);
+    if state.regs().dump_tally(dma_addr) {
+        0
+    } else {
+        -1
+    }
+}
+
 pub(crate) const M4_FULL_OPS: BridgeOps = BridgeOps {
     open: rust_open,
     stop: rust_stop,
@@ -787,6 +819,8 @@ pub(crate) const M4_FULL_OPS: BridgeOps = BridgeOps {
     set_features: rust_set_features,
     rss_indir_check: rust_rss_indir_check,
     set_channels: rust_set_channels,
+    set_rx_mode: rust_set_rx_mode,
+    tally_dump: rust_tally_dump,
 };
 
 // Skeleton vtable retained as a load-test fallback. Flip `ACTIVE_OPS`
@@ -830,6 +864,19 @@ extern "C" fn skel_rss_indir_check(
 extern "C" fn skel_set_channels(_cookie: *mut c_void, _rx_count: core::ffi::c_uint) -> c_int {
     0
 }
+#[allow(dead_code)]
+extern "C" fn skel_set_rx_mode(
+    _cookie: *mut c_void,
+    _accept: core::ffi::c_uint,
+    _mc0: core::ffi::c_uint,
+    _mc1: core::ffi::c_uint,
+) {
+}
+
+#[allow(dead_code)]
+extern "C" fn skel_tally_dump(_cookie: *mut c_void, _dma_addr: u64) -> c_int {
+    -1
+}
 
 #[allow(dead_code)]
 pub(crate) const M4_SKELETON_OPS: BridgeOps = BridgeOps {
@@ -841,6 +888,8 @@ pub(crate) const M4_SKELETON_OPS: BridgeOps = BridgeOps {
     set_features: skel_set_features,
     rss_indir_check: skel_rss_indir_check,
     set_channels: skel_set_channels,
+    set_rx_mode: skel_set_rx_mode,
+    tally_dump: skel_tally_dump,
 };
 
 /// Active vtable. M4-full is the production path; M4-skeleton is kept
@@ -1507,6 +1556,13 @@ fn ndo_open(state: &NetdevState, feature_flags: u32) -> Result<()> {
     // enabled below. `buf_len` is the pool's device-writable length, ≤
     // RX_MAX_SIZE_JUMBO (0x3FFF), so it fits the 16-bit register.
     regs.set_rx_max_size(state.rx_queue0().buf_len.inner.load(Ordering::Relaxed) as u16);
+
+    // Program the chip's RX-filter MAC (IDR0/IDR4) from dev_addr. hw_start's
+    // reset clears IDR0, so without this the chip would drop all unicast frames
+    // addressed to our MAC; it also makes the random-MAC fallback and any future
+    // `ip link set address` actually take effect in hardware. Mirrors the vendor
+    // rtl8125_rar_set call after hw init.
+    regs.set_mac_address(&ub::bridge_dev_addr(ndev));
 
     // `hw_start_8125b` force-clears RSS_CTRL/Q_NUM as a safe baseline. Program
     // the requested hash/RSS state after that clear and before RX/TX engines run.

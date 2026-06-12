@@ -220,6 +220,30 @@ pub(crate) const fn set_channels_count_valid(rx: usize, max: usize) -> bool {
     rx >= 1 && rx <= max && rss_queue_request_supported(rx as u8, max)
 }
 
+/// RCR accept-filter bits owned by `ndo_set_rx_mode` (AllPhys|MyPhys|Multicast|
+/// Broadcast|Runt|AcceptErr = bits 0..5). `rx_mode_rcr` rewrites exactly these,
+/// preserving every other RCR bit (V3 descriptor enable, DMA burst, FIFO
+/// threshold, chip bits). Mirrors the RTL8125 RxConfig low byte.
+pub(crate) const RX_ACCEPT_MASK: u32 = 0x3F;
+
+/// Merge an `accept` flag set into the live RCR: clear the accept bits, set the
+/// requested ones, leave all other bits untouched. Pure + host-tested so the
+/// `ndo_set_rx_mode` register update can't clobber feature/descriptor bits.
+#[inline]
+pub(crate) const fn rx_mode_rcr(current: u32, accept: u32) -> u32 {
+    (current & !RX_ACCEPT_MASK) | (accept & RX_ACCEPT_MASK)
+}
+
+/// Convert the two natural-order multicast hash words into the MAR0/MAR4 the
+/// RTL8125 expects: each word byte-swapped AND the two words swapped
+/// (`MAR0 = swab32(mc1)`, `MAR4 = swab32(mc0)`), matching the vendor
+/// `rtl8125_hw_set_rx_packet_filter`. Pure + host-tested (hardware endianness
+/// quirk lives here, not in the C callback).
+#[inline]
+pub(crate) const fn mar_words(mc0: u32, mc1: u32) -> (u32, u32) {
+    (mc1.swap_bytes(), mc0.swap_bytes())
+}
+
 /// V2 IMR/ISR source bit for RX queue `queue_id`. The chip maps RX queue N to
 /// MSI-X message-id N and ISR/IMR bit `1<<N` (vendor `RTL_W32(ISR_V2,
 /// BIT(message_id))`), so the bit is `rok_q0 << queue_id` where `rok_q0` is
@@ -670,5 +694,45 @@ mod tests {
         assert!(!set_channels_count_valid(3, 4)); // not a power of two
         assert!(!set_channels_count_valid(5, 4)); // exceeds max
         assert!(!set_channels_count_valid(8, 4)); // pow2 but > max
+    }
+
+    // -- rx_mode (ndo_set_rx_mode) ------------------------------------------
+
+    #[test]
+    fn rx_mode_rcr_replaces_accept_bits_preserves_rest() {
+        // V3 desc enable (bit 24) + a high feature bit must survive; only the
+        // low accept byte is rewritten.
+        let current = (1 << 24) | (1 << 11) | RX_ACCEPT_MASK; // all accept bits set
+                                                              // New policy: broadcast(0x08)+myphys(0x02) only.
+        let got = rx_mode_rcr(current, 0x08 | 0x02);
+        assert_eq!(got & RX_ACCEPT_MASK, 0x0A); // exactly the requested accept bits
+        assert_eq!(got & !RX_ACCEPT_MASK, (1 << 24) | (1 << 11)); // rest preserved
+    }
+
+    #[test]
+    fn rx_mode_rcr_promisc_sets_all_accept() {
+        let got = rx_mode_rcr(0, RX_ACCEPT_MASK);
+        assert_eq!(got & RX_ACCEPT_MASK, RX_ACCEPT_MASK);
+    }
+
+    #[test]
+    fn rx_mode_rcr_ignores_bits_outside_mask_in_accept() {
+        // Caller accidentally passes a high bit in `accept`; it must not leak.
+        let got = rx_mode_rcr(0, 0x08 | (1 << 24));
+        assert_eq!(got, 0x08);
+    }
+
+    #[test]
+    fn mar_words_swabs_and_swaps() {
+        // MAR0 = swab32(mc1), MAR4 = swab32(mc0).
+        let (m0, m4) = mar_words(0x11223344, 0xaabbccdd);
+        assert_eq!(m0, 0xddccbbaa); // swab32(0xaabbccdd)
+        assert_eq!(m4, 0x44332211); // swab32(0x11223344)
+    }
+
+    #[test]
+    fn mar_words_all_ones_unchanged() {
+        assert_eq!(mar_words(0xffffffff, 0xffffffff), (0xffffffff, 0xffffffff));
+        assert_eq!(mar_words(0, 0), (0, 0));
     }
 }

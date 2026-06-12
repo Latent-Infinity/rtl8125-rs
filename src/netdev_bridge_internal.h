@@ -11,6 +11,7 @@
 #include <linux/pci.h>
 #include <linux/percpu.h>
 #include <linux/phy.h>
+#include <linux/workqueue.h>
 
 /* §6.3 disposition counters live in per-CPU storage so the hot-path
  * `this_cpu_inc()` is a single decorated INC instruction with no cache-
@@ -63,6 +64,19 @@ struct r8125_bridge {
 	struct phy_device *phydev;
 	struct r8125_bridge_mdio_ops mdio_ops;
 	bool phy_connected;
+
+	/* ndo_tx_timeout runs in the netdev-watchdog timer (atomic) context, so
+	 * the actual chip reset (stop+open, which sleeps) is deferred to this work
+	 * item and run under RTNL. Mirrors r8169/vendor reset_work.
+	 */
+	struct work_struct reset_work;
+
+	/* Coherent buffer for the hardware tally-counter dump (ndo_get_stats64).
+	 * Allocated once at probe, reused per stats call, freed at teardown.
+	 * tally_vaddr is NULL if the allocation failed (tally stats then skipped).
+	 */
+	struct r8125_tally *tally_vaddr;
+	dma_addr_t tally_dma;
 
 	u64 __percpu *tx_received;
 	u64 __percpu *tx_consumed;

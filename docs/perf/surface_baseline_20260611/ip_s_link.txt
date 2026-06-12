@@ -1,0 +1,10 @@
+21: enp3s0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP mode DEFAULT group default qlen 256
+    link/ether de:d2:93:d0:75:18 brd ff:ff:ff:ff:ff:ff
+    RX:  bytes packets errors dropped  missed   mcast
+             0       0      0       0       0       0
+    RX errors:  length    crc   frame    fifo overrun
+                     0      0       0       0       0
+    TX:  bytes packets errors dropped carrier collsns
+           726       9      0       0       0       0
+    TX errors: aborted   fifo  window heartbt transns
+                     0      0       0       0       2

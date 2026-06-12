@@ -20,8 +20,10 @@
  * surface is ~25 LOC, kept in this file to leave netdev_bridge.c
  * within its 400-line review cap.
  *
- * Hard cap: 280 LOC. Enforced by ci/check_cshim_loc_caps.sh. Raised from 200
- * for the B5 ethtool RSS control plane (get/set_rxfh, get_channels, get_rxnfc).
+ * Hard cap: 400 LOC. Enforced by ci/check_cshim_loc_caps.sh. Raised from 200
+ * for the B5 ethtool RSS control plane (get/set_rxfh, get_channels, get_rxnfc),
+ * then to 340 for the P0 phylib link control plane, then 400 for pause/ring params
+ * nway_reset) per docs/UPSTREAM_GAP_CLOSURE_PLAN.md.
  */
 
 #include "netdev_bridge_internal.h"
@@ -264,6 +266,86 @@ static int bridge_set_channels(struct net_device *ndev,
 	return rc;
 }
 
+/*
+ * Link settings + autoneg reset. The integrated PHY is owned by phylib (attached
+ * via phy_connect_direct, which sets ndev->phydev), so these delegate straight
+ * to the phylib helpers — we do NOT reimplement Realtek PHY logic here. phylib
+ * itself returns -ENODEV when no PHY is attached; the explicit guard documents
+ * that contract at the boundary. Runs under RTNL.
+ */
+static int bridge_get_link_ksettings(struct net_device *ndev,
+				     struct ethtool_link_ksettings *cmd)
+{
+	if (!ndev->phydev)
+		return -ENODEV;
+	return phy_ethtool_get_link_ksettings(ndev, cmd);
+}
+
+static int bridge_set_link_ksettings(struct net_device *ndev,
+				     const struct ethtool_link_ksettings *cmd)
+{
+	if (!ndev->phydev)
+		return -ENODEV;
+	return phy_ethtool_set_link_ksettings(ndev, cmd);
+}
+
+static int bridge_nway_reset(struct net_device *ndev)
+{
+	if (!ndev->phydev)
+		return -ENODEV;
+	return phy_ethtool_nway_reset(ndev);
+}
+
+/*
+ * Pause (flow control) parameters. The PHY advertises pause capability and
+ * phylib owns the MAC<->PHY pause negotiation, so delegate straight to it.
+ * get is void (phylib fills zeros when no PHY); set returns -ENODEV without one.
+ */
+static void bridge_get_pauseparam(struct net_device *ndev,
+				  struct ethtool_pauseparam *pause)
+{
+	struct phy_device *phydev = ndev->phydev;
+	bool tx = false, rx = false;
+
+	if (!phydev)
+		return;
+	pause->autoneg = phydev->autoneg;
+	phy_get_pause(phydev, &tx, &rx);
+	pause->tx_pause = tx;
+	pause->rx_pause = rx;
+}
+
+static int bridge_set_pauseparam(struct net_device *ndev,
+				 struct ethtool_pauseparam *pause)
+{
+	struct phy_device *phydev = ndev->phydev;
+
+	if (!phydev)
+		return -ENODEV;
+	if (!phy_validate_pause(phydev, pause))
+		return -EINVAL;
+	phy_set_asym_pause(phydev, pause->rx_pause, pause->tx_pause);
+	return 0;
+}
+
+/*
+ * Ring parameters. Report the fixed descriptor ring depth (R8125_BRIDGE_RING_LEN
+ * == Rust ring::RING_LEN). Resize is intentionally not implemented for the first
+ * RFC, so no .set_ringparam is wired and `ethtool -G` returns -EOPNOTSUPP — a
+ * clean unsupported, never a silent no-op (live resize needs RX page-pool / NAPI
+ * / DMA-ring / BQL rollback tests we have not landed).
+ */
+static void bridge_get_ringparam(struct net_device *ndev,
+				 struct ethtool_ringparam *ring,
+				 struct kernel_ethtool_ringparam *kring,
+				 struct netlink_ext_ack *extack)
+{
+	ring->rx_max_pending = R8125_BRIDGE_RING_LEN;
+	ring->tx_max_pending = R8125_BRIDGE_RING_LEN;
+	ring->rx_pending = R8125_BRIDGE_RING_LEN;
+	ring->tx_pending = R8125_BRIDGE_RING_LEN;
+}
+
 const struct ethtool_ops r8125_bridge_ethtool_ops = {
 	.get_drvinfo		= bridge_get_drvinfo,
 	.get_sset_count		= bridge_get_sset_count,
@@ -277,4 +359,10 @@ const struct ethtool_ops r8125_bridge_ethtool_ops = {
 	.get_channels		= bridge_get_channels,
 	.set_channels		= bridge_set_channels,
 	.get_rx_ring_count	= bridge_get_rx_ring_count,
+	.get_link_ksettings	= bridge_get_link_ksettings,
+	.set_link_ksettings	= bridge_set_link_ksettings,
+	.nway_reset		= bridge_nway_reset,
+	.get_pauseparam		= bridge_get_pauseparam,
+	.set_pauseparam		= bridge_set_pauseparam,
+	.get_ringparam		= bridge_get_ringparam,
 };

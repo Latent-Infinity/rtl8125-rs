@@ -17,12 +17,49 @@ WATCH="$ROOT/scripts/soak_watch.sh"
 PERF="$ROOT/scripts/perf_characterize.sh"
 BYTE_BUDGET="$ROOT/scripts/gateway_tx_byte_budget_sweep.sh"
 HW_OFFLOAD="$ROOT/scripts/gateway_hw_offload_validate.sh"
+KASAN_SOAK="$ROOT/scripts/gateway_kasan_soak.sh"
+CAMPAIGN="$ROOT/scripts/gateway_kasan_soak_campaign.sh"
+KVM_SOAK="$ROOT/scripts/kvm_kasan_soak.sh"
+KVM_CAMPAIGN="$ROOT/scripts/kvm_kasan_soak_campaign.sh"
 
 if bash -n "$ACTIVE" && bash -n "$WATCH" && bash -n "$PERF" \
-   && bash -n "$BYTE_BUDGET" && bash -n "$HW_OFFLOAD"; then
+   && bash -n "$BYTE_BUDGET" && bash -n "$HW_OFFLOAD" \
+   && bash -n "$KASAN_SOAK" && bash -n "$CAMPAIGN" \
+   && bash -n "$KVM_SOAK" && bash -n "$KVM_CAMPAIGN"; then
 	grn "soak/perf harness scripts parse under bash"
 else
 	red "soak/perf harness scripts must be valid bash"
+fi
+
+# Hardened KASAN soak: strict pass criteria must be present (a wedge/leak must
+# FAIL, not silently pass). These guard the harness against regressing to a
+# tx_delta>0-style trivial pass.
+if grep -q 'STALL' "$KASAN_SOAK" \
+   && grep -q 'kmemleak' "$KASAN_SOAK" \
+   && grep -q 'HW_ERR_GROWTH' "$KASAN_SOAK" \
+   && grep -q 'LOW_TPUT' "$KASAN_SOAK" \
+   && grep -q 'timeseries.csv' "$KASAN_SOAK"; then
+	grn "KASAN soak enforces stall + kmemleak + hw-error + throughput-floor and emits a CSV"
+else
+	red "KASAN soak must gate on stall/kmemleak/hw-error/throughput-floor and emit a time-series CSV"
+fi
+
+# tx_dropped/rx_dropped (drops) must NOT auto-fail — they grow legitimately on
+# the link-flap churn and queue-stop; only TRUE error counters fail the soak.
+if grep -q 'recorded but never fail' "$KASAN_SOAK" \
+   && grep -q 'for j in 0 2 3 4 5' "$KASAN_SOAK"; then
+	grn "KASAN soak separates true hw errors (fail) from policy drops (record only)"
+else
+	red "KASAN soak must not fail on tx_dropped/rx_dropped (link-flap/queue-stop drops)"
+fi
+
+# Campaign covers the upstream default + all valid multi-queue RSS sizes.
+if grep -q 'run_phase 0' "$CAMPAIGN" \
+   && grep -q 'run_phase 2' "$CAMPAIGN" \
+   && grep -q 'run_phase 4' "$CAMPAIGN"; then
+	grn "soak campaign covers rss_queues 0 (default) + 2 + 4 (all valid sizes)"
+else
+	red "soak campaign must cover rss_queues 0, 2, and 4"
 fi
 
 if grep -q 'IPERF_CYCLE_SECS' "$ACTIVE" \

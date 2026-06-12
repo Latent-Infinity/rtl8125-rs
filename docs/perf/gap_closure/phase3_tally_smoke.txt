@@ -1,0 +1,17 @@
+=== run traffic (generate counters) ===
+done
+=== ip -s -s link (triggers get_stats64 -> tally dump) x3 ===
+  RX bytes/pkts/err/drop/missed:        5778486   82554      0       0       0       0
+  RX bytes/pkts/err/drop/missed:        5778486   82554      0       0       0       0
+  RX bytes/pkts/err/drop/missed:        5778486   82554      0       0       0       0
+=== full RX error line ===
+    RX:  bytes packets errors dropped  missed   mcast
+       5778486   82554      0       0       0       0
+    RX errors:  length    crc   frame    fifo overrun
+                     0      0       0       0       0
+=== DMA-API / KASAN splats from the dump ===
+0
+=== teardown (frees tally buffer under DMA-API debug) ===
+rmmod OK
+post-rmmod splats: 0
+(end)
