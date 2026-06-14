@@ -169,7 +169,7 @@ echo 0000:03:00.0 | sudo tee /sys/bus/pci/drivers/r8169/bind
   `module_param` macro doesn't create the sysfs read-back files
   (it processes the insmod arg correctly but doesn't expose). The
   param IS in effect, just not introspectable from userspace. See
-  `docs/M5_CLOSEOUT.md` for the discovery.
+  `docs/HARDENING_CLOSEOUT.md` for the discovery.
 
 ## Sources (for the BIOS path above)
 

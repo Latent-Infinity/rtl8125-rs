@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# M5 NAPI contract enforcement (plan §7 M5).
+# NAPI contract enforcement.
 #
 # The kernel NAPI core has invariants every poll function must honour
 # to avoid IRQ races, queue-state deadlocks, and exactly-once TX
@@ -76,7 +76,7 @@ fi
 
 # -- 3. IRQ re-arm colocated with napi_complete_done ------------------------
 # Accept either a direct `set_imr(INTR_M4_BASELINE)` call or a call to
-# a helper named like `rearm_irq*` (the M6 #1 surface-aware helper
+# a helper named like `rearm_irq*` (the surface-aware helper
 # wraps the V2 vs legacy branch in one site). Either way the re-arm
 # must land within 3 lines of complete_done.
 if echo "$poll_body" | awk '

@@ -24,7 +24,7 @@ reference for an upstream-pathway argument, because:
 - A user installing a stock distro kernel today gets `r8169`,
   not `r8125`. "Parity with `r8169`" is the practical bar for
   a replacement crate to clear.
-- Any maintainer reading `docs/M7_PRE_RFC_DOSSIER.md` will see
+- Any maintainer reading `docs/PRE_RFC_DOSSIER.md` will see
   the comparison against the in-tree driver as the more
   rigorous one.
 
@@ -302,7 +302,7 @@ Raw: `docs/perf/captures/20260529_225241/2b_ping.txt` (KVM-local).
 ## What this file is evidence for
 
 When the M7 pre-RFC dossier
-([`M7_PRE_RFC_DOSSIER.md`](../M7_PRE_RFC_DOSSIER.md)) says
+([`PRE_RFC_DOSSIER.md`](../PRE_RFC_DOSSIER.md)) says
 
 > reaches 2.35 Gbit/s line-rate single-stream TCP at MTU 1500
 > (parity with in-tree r8169 on the same chip / same wire)
@@ -318,6 +318,6 @@ is "parity, no regression."
 - [`gateway_baseline.md`](gateway_baseline.md) — pre-M6 Gateway floor
 - [`m6_msix_before_after.md`](m6_msix_before_after.md) — INTx→MSI-X
 - [`m6_jumbo_before_after.md`](m6_jumbo_before_after.md) — MTU 1500→9000
-- [`../M7_PRE_RFC_DOSSIER.md`](../M7_PRE_RFC_DOSSIER.md) — outbound
+- [`../PRE_RFC_DOSSIER.md`](../PRE_RFC_DOSSIER.md) — outbound
   consultation that cites these numbers
 - `docs/baseline/iperf3/iperf3_r8169_*.json` — raw r8169 archive

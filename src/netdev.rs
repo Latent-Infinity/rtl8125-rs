@@ -212,7 +212,7 @@ fn stop_tx_queue_with_recheck(state: &NetdevState, head: usize) {
 }
 
 // RX buffer geometry is no longer a fixed compile-time size. With per-MTU
-// zero-copy buffers (M6 #2 v3) the page_pool sizes each buffer from
+// zero-copy buffers the page_pool sizes each buffer from
 // dev->mtu at ndo_open and returns the device-writable length, cached in
 // `RxQueueState::buf_len`. See `src/netdev_bridge_rx_pool.c`.
 
@@ -291,7 +291,7 @@ impl IrqMode {
 /// `NetdevState` for the cache-padding rationale.
 pub(crate) struct TxRingState {
     /// DMA + CPU pointers for the TX descriptor ring (N + 1 slots; slot N
-    /// is the tail canary from M3).
+    /// is the tail canary).
     pub(crate) desc: *mut Descriptor,
     pub(crate) dma: u64,
 
@@ -389,7 +389,7 @@ pub(crate) struct RxQueueState {
     pub(crate) desc: *mut RxDescriptor,
     pub(crate) dma: u64,
 
-    /// Per-slot streaming-DMA RX buffers (M6 #2 v3). Geometry comes from
+    /// Per-slot streaming-DMA RX buffers. Geometry comes from
     /// `RxQueueState::buf_len` at `ndo_open`, so each MTU class gets the
     /// smallest page geometry that safely holds a full frame for that MTU.
     /// `ndo_open` populates every slot via `ub::rx_alloc`, and `ndo_stop`
@@ -407,8 +407,8 @@ pub(crate) struct RxQueueState {
     pub(crate) slot_dma: [AtomicU64; RING_LEN],
 
     /// Device-writable bytes per RX buffer for the current open, set by
-    /// `r8125_bridge_rx_pool_create` from the MTU-derived geometry (M6 #2
-    /// v3 per-MTU sizing). Drives the descriptor LEN field (chip's view of
+    /// `r8125_bridge_rx_pool_create` from the MTU-derived geometry
+    /// (per-MTU sizing). Drives the descriptor LEN field (chip's view of
     /// "how many bytes it may DMA") and the frame-length clamp in the NAPI
     /// RX loop. Zero while the device is down. Already ≤ `DESC_LEN_MASK`.
     pub(crate) buf_len: CachePadded<AtomicU32>,
@@ -561,7 +561,7 @@ impl PhyState {
 pub(crate) struct NetdevState {
     /// Reference-counted device handle. Holds the device live for the
     /// full lifetime of this NetdevState (which is the bound period).
-    #[allow(dead_code)] // held for refcount; future M5 work may consume it
+    #[allow(dead_code)] // held for refcount; future work may consume it
     pub(crate) pdev: ARef<pci::Device>,
 
     /// Stable pointer to the mapped BAR. Valid for the lifetime of the
@@ -706,8 +706,8 @@ extern "C" fn rust_poll(cookie: *mut c_void, queue_id: u32, budget: c_int) -> c_
 
 extern "C" fn rust_change_mtu(cookie: *mut c_void, new_mtu: c_int) -> c_int {
     // Range-check is done by the kernel against ndev->{min,max}_mtu (cshim
-    // populates those at alloc). With per-MTU zero-copy RX buffers (M6 #2
-    // v3) the live RX pool is sized for the CURRENT MTU, so a change while
+    // populates those at alloc). With per-MTU zero-copy RX buffers the
+    // live RX pool is sized for the CURRENT MTU, so a change while
     // up must re-create it:
     //   - down: accept; the net core writes dev->mtu after we return 0 and
     //     the next ndo_open sizes the pool to it.
@@ -892,14 +892,14 @@ pub(crate) const M4_SKELETON_OPS: BridgeOps = BridgeOps {
     tally_dump: skel_tally_dump,
 };
 
-/// Active vtable. M4-full is the production path; M4-skeleton is kept
-/// available for the no-traffic load-test fallback. See the comment
+/// Active vtable. `M4_FULL_OPS` is the production path; `M4_SKELETON_OPS`
+/// is kept available for the no-traffic load-test fallback. See the comment
 /// block above for why this flip is now safe.
 pub(crate) const ACTIVE_OPS: BridgeOps = M4_FULL_OPS;
 
 /// Release all RX slots and leave the pool in the empty-sentinel
 /// state. Used by `ndo_stop` and by every `ndo_open` rollback path after
-/// the M6 #2 RX-pool allocation point.
+/// the RX-pool allocation point.
 fn free_rx_queue_slots(state: &NetdevState, queue_id: u32) {
     let Some(rx) = state.rx_queue(queue_id) else {
         return;
@@ -1078,7 +1078,7 @@ fn program_dma_rings(state: &NetdevState, regs: &Regs<'_>, feature_flags: u32) {
     regs.set_cpluscmd(rx_feature_cpluscmd(feature_flags));
 }
 
-/// Allocate one streaming-DMA page chunk per RX slot (M6 #2).
+/// Allocate one streaming-DMA page chunk per RX slot.
 /// On any per-slot failure unwinds every successful allocation before
 /// returning so the next `ndo_open` retry sees a fresh state. Pre-posting
 /// the descriptor only happens AFTER alloc succeeds so the chip never
@@ -1117,7 +1117,7 @@ fn allocate_rx_pool(state: &NetdevState) -> Result<()> {
 /// The last (hardware-visible) slot also gets the EOR marker so the
 /// chip wraps RxHead back to index 0. The descriptor LEN field tells the
 /// chip how many bytes it may DMA into the buffer — with per-MTU sizing
-/// (M6 #2 v3) that's the pool's device-writable `buf_len`, NOT the 16 KiB
+/// that's the pool's device-writable `buf_len`, NOT the 16 KiB
 /// jumbo max, so a 4 KiB MTU-1500 buffer can never be overrun by a giant
 /// frame. `buf_len` is already ≤ `DESC_LEN_MASK` (the cshim caps it).
 fn pre_post_rx_queue_descriptors(rx: &RxQueueState) {
@@ -1338,7 +1338,7 @@ fn quiesce_chip(regs: &Regs<'_>) {
 /// skb the chip didn't complete before we masked it. Each slot's
 /// per-fragment `is_frag` flag picks `dma_unmap_page` vs
 /// `dma_unmap_single`; the (last-frag-only) skb pointer is freed via
-/// `skb_free_error` so the §6.3 disposition counter records a TX error.
+/// `skb_free_error` so the disposition counter records a TX error.
 fn reap_inflight_tx_shadow(state: &NetdevState) {
     let ndev = state.ndev.load(Ordering::Acquire);
     let bql_was_active = bql_active(state);
@@ -1363,7 +1363,7 @@ fn reap_inflight_tx_shadow(state: &NetdevState) {
                 bql_pkts += 1;
             }
             // Reclaim the disposition obligation from the shadow and
-            // route the skb through the §6.3 error counter.
+            // route the skb through the error counter.
             skb.free_with_error();
         }
     }
@@ -1551,7 +1551,7 @@ fn ndo_open(state: &NetdevState, feature_flags: u32) -> Result<()> {
     }
 
     // Override the jumbo-default RxMaxSize from hw_start with the per-MTU
-    // value (M6 #2 v3): the chip must not accept a frame larger than the
+    // value: the chip must not accept a frame larger than the
     // pool's buffers hold. Set after hw_start, before the RX engine is
     // enabled below. `buf_len` is the pool's device-writable length, ≤
     // RX_MAX_SIZE_JUMBO (0x3FFF), so it fits the 16-bit register.
@@ -1584,8 +1584,8 @@ fn ndo_open(state: &NetdevState, feature_flags: u32) -> Result<()> {
     // PHY step 2 — kick the state machine LAST. Per r8169 ordering this
     // runs after `ChipCmd RX|TX` enable + `IMR` programming. Carrier
     // flips on automatically inside `bridge_phylink_handler` when the
-    // PHY reports link-up; the unconditional `carrier_on` we used at
-    // M4-skeleton is dropped.
+    // PHY reports link-up; the earlier unconditional `carrier_on` is
+    // dropped.
     if let Err(e) = ub::bridge_phy_kick_state_machine(ndev) {
         // Roll back the chip-side work + PHY connection. The IRQ + RX
         // pool guards drop on the way out and finish the rollback.
@@ -1665,7 +1665,7 @@ fn ndo_stop(state: &NetdevState) {
         }
     }
 
-    // M6 #2 — release every RX slot's page chunk + DMA mapping. The
+    // Release every RX slot's page chunk + DMA mapping. The
     // chip already had its descriptors zeroed above, so it can't DMA
     // into a freed slot. `rx_free` short-circuits on the empty
     // sentinel, which is what we leave behind for the next `ndo_open`.
@@ -1676,7 +1676,7 @@ fn ndo_stop(state: &NetdevState) {
 
 /// TSO/CSUM offload bit computation plus post-mutation fragment count. The skb
 /// is BORROWED — caller retains ownership and is responsible for
-/// `free_with_error` on an error outcome so the §6.3 `tx_dropped_error` counter
+/// `free_with_error` on an error outcome so the `tx_dropped_error` counter
 /// increments at the right level.
 ///
 /// May mutate the skb (`skb_cow_head` + `tcp_v6_gso_csum_prep` for IPv6
@@ -1693,7 +1693,7 @@ fn compute_offload_bits(skb: &crate::skb::DriverOwnedSkb) -> Result<(u32, u32, u
 /// keep at least one slot empty so `tx_head == tx_tail` can only mean
 /// "ring empty" (not "ring full").
 ///
-/// On exhaustion: bumps the §6.3 `tx_busy_exception` counter, asks the
+/// On exhaustion: bumps the `tx_busy_exception` counter, asks the
 /// kernel to retry via `bridge_tx_stop_queue` (with the SMP-race
 /// recheck), and returns `None`. Caller returns `NETDEV_TX_BUSY`. On
 /// success returns `Some(tail)` so the caller can reuse the snapshot
@@ -1731,7 +1731,7 @@ fn map_skb_linear(
 ///   1. `dma_unmap_single`s the linear head we already mapped
 ///   2. `dma_unmap_page`s every fragment shadow slot 0 .. `frags_published`
 ///   3. Clears each pre-staged fragment descriptor and shadow slot
-///   4. Frees the skb via `skb_free_error` (counters the §6.3 drop)
+///   4. Frees the skb via `skb_free_error` (counters the drop)
 ///
 /// The success path calls `release(self)` after all fragments + the
 /// FirstFrag descriptor are committed — `Drop` then short-circuits.
@@ -2182,7 +2182,7 @@ extern "C" fn raw_irq_handler(_irq: c_int, dev_id: *mut c_void) -> bindings::irq
         return bindings::irqreturn_IRQ_HANDLED as bindings::irqreturn_t;
     }
     // Legacy combined ISR (0x3C) + IMR (0x38), W1C ack — INTx (shared line) or
-    // single-vector MSI. Mask-all + schedule queue 0; unchanged from M4.
+    // single-vector MSI. Mask-all + schedule queue 0.
     let status = regs.isr();
     if status == 0 || status == 0xFFFF_FFFF {
         return bindings::irqreturn_IRQ_NONE as bindings::irqreturn_t;
@@ -2230,7 +2230,15 @@ pub(crate) struct NetdevHandle {
 }
 
 impl NetdevHandle {
-    /// Allocate + register a net_device for `pdev`, with the M4-full
+    /// The registered `net_device` pointer (null after teardown). Used by the
+    /// pci::Driver suspend/resume callbacks to drive the cshim PM path. Gated on
+    /// `r8125_pci_pm` (its only caller) so a stock build raises no dead-code warn.
+    #[cfg(r8125_pci_pm)]
+    pub(crate) fn ndev(&self) -> *mut bindings::net_device {
+        self.ndev.load(Ordering::Acquire)
+    }
+
+    /// Allocate + register a net_device for `pdev`, with the full
     /// vtable and a `Box<NetdevState>` as the cookie.
     pub(crate) fn new_with_state(
         pdev: &pci::Device<kernel::device::Core>,
@@ -2253,7 +2261,7 @@ impl NetdevHandle {
             return Err(e);
         }
 
-        // M4-traffic: register MDIO bus + phy_device so ndo_open can call
+        // Register MDIO bus + phy_device so ndo_open can call
         // bridge_phy_start. Failure here means the discovered PHY has no
         // driver (realtek.ko missing) or MDIO bus allocation failed —
         // either way we can't bring traffic up, so unwind the netdev.
@@ -2271,8 +2279,13 @@ impl NetdevHandle {
         }
         dev_info!(
             pdev,
-            "r8125_rust netdev registered: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (M4-full)\n",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            "r8125_rust netdev registered: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5]
         );
         Ok(Self {
             ndev: AtomicPtr::new(ndev),

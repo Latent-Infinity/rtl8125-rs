@@ -1,6 +1,6 @@
 # Upstream gap closure plan
 
-Status: draft for review, 2026-06-11.
+Status: draft for review, updated 2026-06-13.
 
 This plan converts the Vendor C / mainline r8169 / Rust driver gap analysis into
 reviewable implementation work. The goal is not to clone every vendor feature.
@@ -11,23 +11,45 @@ and testable.
 ## Scope
 
 P0 items are expected before upstream review. P1 items should be done before a
-serious RFC unless a soak result forces a different priority. P2 items are
-explicit defers: real gaps, but not blockers for the first review cycle.
+serious RFC unless a soak result forces a different priority. P2 items are real
+feature gaps that are not first-review blockers only if the cover letter and
+driver docs call them out explicitly. Anything marked SHIP must be closed before
+we treat the Rust driver as production-ready on the Gateway.
 
 | Priority | Gap | Rationale |
 |---|---|---|
-| P0 | `pm_ops` suspend/resume | Upstream PCI driver expectation; currently documented as a hard blocker. |
+| P0 | `pm_ops` suspend/resume | Upstream PCI driver expectation; implemented behind the kernel Rust PCI PM extension, but default-build story and resume error propagation must be resolved. |
 | P0 | `get/set_link_ksettings` + `nway_reset` | Basic `ethtool <iface>` control; phylib already owns the PHY. |
 | P0 | `ndo_set_rx_mode` | Required for multicast, allmulti, promiscuous mode, bridges, IPv6, mDNS, and captures. |
 | ~~P1~~ DEFER | `get/set_coalesce` | **Reclassified to DEFER (2026-06-12).** Mainline `r8169` returns `-EOPNOTSUPP` for the 8125 (`rtl_get_coalesce`: `if (rtl_is_8125(tp)) return -EOPNOTSUPP`): the 8125 INT_MITI **V2** timer unit (0xA00 table) is uncharacterized upstream, and the legacy IntrMitigate/CPlusCmd scale does not apply to it. A hardware IRQ-rate characterization was inconclusive (NAPI busy-polls under load and masks the timer). Exposing a self-invented µs scale would be a guess; matching mainline's explicit `-EOPNOTSUPP` is the honest, reviewer-safe choice. The INT_MITI timers stay tunable via the `rx/tx_coalesce_timer` module params. Revisit if the V2 timer unit is characterized. |
-| P1 | WoL `get/set_wol` | Standard NIC power feature; depends on PM policy and PCI wake handling. |
-| P1 | `get/set_ringparam` | Operator visibility/control for queue depths; may initially be read-only plus clear unsupported resize. |
-| P1 | `get/set_pauseparam` | PHY already advertises asym pause support; expose control through ethtool. |
-| P1 | hardware tally stats | `ndo_get_stats64` exists, but hardware error counters are still missing. |
-| P2 | EEE | Useful, but can be deferred if documented. |
-| P2 | PTP / hwtstamp / `get_ts_info` | Vendor supports it conditionally; no current soak dependency. |
-| P2 | custom RSS key/table + `rxnfc` hash opts | Rust supports default RSS correctly; custom policy is a follow-up. |
-| P2 | regs/eeprom/msglevel/netpoll/RXALL/RXFCS | Diagnostic or vendor-specific surfaces; not first-RFC blockers. |
+| P0/SHIP | Magic-packet WoL end-to-end | Standard NIC power feature. Do not advertise `get/set_wol` unless suspend leaves the PHY/MAC wake path armed and an external magic packet wakes the Gateway. |
+| P1 | `get_ringparam` + fixed-depth readback | Operator visibility for queue depths; live resize is a separate SHIP gap. |
+| P1 | `get/set_pauseparam` | PHY already advertises asym pause support; expose control through ethtool and revalidate carrier recovery after toggles. |
+| P1 | hardware tally stats | `ndo_get_stats64` should fold hardware error counters; ethtool private stats should stay internally consistent. |
+| P1 | `ndo_eth_ioctl` | Mainline r8169 exposes standard PHY MII ioctl handling; add the compatible phylib surface. |
+| P1 | `ndo_features_check` | Mainline r8169 rejects/adjusts offloads for packets the hardware cannot safely checksum/segment; add the same compatibility guard. |
+| P1 | `get_ts_info` | Even while hardware PTP is deferred, report the kernel-supported timestamping capabilities instead of leaving the surface absent. |
+| P1 | richer MAC/control/pause stats | Match the useful r8169 ethtool stats surfaces where kernel APIs are available, especially pause/MAC error visibility. |
+| P2/SHIP | EEE | Vendor and r8169 support EEE; close before production shipping unless soak proves it must remain disabled for stability and docs say so. |
+| P2/SHIP | PTP / hwtstamp | Vendor supports hardware timestamping conditionally. At minimum, `get_ts_info` lands in P1; PHC/hwtstamp can be staged after the standard control plane. |
+| P2/SHIP | custom RSS key/table + `rxnfc` hash opts | Rust supports default RSS correctly; add custom indirection/key readback and rxnfc policy before claiming vendor feature parity. |
+| P2/SHIP | regs/eeprom/msglevel | Diagnostic compatibility surfaces from vendor/r8169. Implement read-only, truthful variants where hardware support is known. |
+| P2/SHIP | netpoll | Needed for netconsole-style deployments; can remain deferred for first RFC but not for a complete production feature set. |
+| P2/SHIP | live ring resize | `get_ringparam` is not enough for feature parity; add down-only resize first, then consider running resize only with rollback coverage. |
+| P2/SHIP | broader WoL modes | Magic packet comes first. Add PHY/link, unicast, multicast, and broadcast wake modes only after the wake path is proven. |
+| P2 | RXALL/RXFCS | Vendor diagnostic toggles; avoid exposing until there is a clear upstream use case. |
+
+## Current pre-ship blockers
+
+- PM resume must propagate `bridge_ndo_open()` failures instead of reattaching
+  the netdev unconditionally.
+- WoL must stay hidden or documented as unfinished until the suspend path keeps
+  the receive wake path alive and an external magic packet wake is captured.
+- Pause/ring validation evidence must prove carrier recovery and post-toggle
+  traffic, not just ethtool readback.
+- The feature inventory gate must match this table: implemented surfaces are
+  `PRESENT`, missing pre-ship surfaces are `PLANNED`, and only explicit first-RFC
+  defers remain `DEFER`.
 
 ## Phase 0 - Baseline and guardrails
 
@@ -114,7 +136,7 @@ Review notes:
 
 ## Phase 2 - P0 PM path
 
-The current `docs/M5_PM_GAP.md` documents the kernel-Rust PCI PM API gap. For
+The current `docs/PM_GAP.md` documents the kernel-Rust PCI PM API gap. For
 upstream review, we need one of two paths.
 
 Preferred implementation:
@@ -155,52 +177,59 @@ Review notes:
 
 ## Phase 3 - P1 ethtool operator controls
 
-### Coalesce
+### Coalesce remains deferred
 
 Implementation:
 
-1. Add `get_coalesce` / `set_coalesce`.
-2. Store configured RX/TX moderation values in driver state instead of reading
-   only module parameters at open.
-3. Program INT_MITI live when the device is running; cache for next open when
-   down.
-4. Map user-facing units carefully. If hardware units are not microseconds, use
-   the closest stable conversion and document rounding.
+1. Do not add `get_coalesce` / `set_coalesce` for RTL8125 until the INT_MITI V2
+   timer unit is characterized.
+2. Keep the current module parameters as the only tuning surface.
+3. Keep the CI inventory row marked `DEFER|coalesce` so an accidental callback
+   addition fails review until the semantics are justified.
 
 Tests:
 
-- Static gate proves callbacks are wired.
-- Set while down, read back, then open and verify register readback.
-- Set while running and verify no traffic drop, WARN, or stale readback.
-- Boundary tests: zero, current default, max accepted, above max rejected.
+- Static gate proves callbacks are absent and documented.
+- Hardware characterization evidence must exist before this row can move back
+  to `PLANNED`.
+- Any future implementation must demonstrate a stable user-facing unit and live
+  programming behavior across idle, NAPI busy, and saturated traffic cases.
 
-### WoL
+### Magic-packet WoL
 
 Implementation:
 
-1. Add `get_wol` / `set_wol`.
+1. Keep `get_wol` / `set_wol` unwired until end-to-end wake works, or document
+   the surface as experimental and disabled by default.
 2. Track enabled wake sources in driver state.
-3. Integrate with PM suspend path and PCI wake enablement.
-4. Start with magic-packet WoL only unless the chip-specific pattern filters are
-   already proven.
+3. Split normal suspend from WoL suspend:
+   - normal suspend may fully stop the PHY/MAC.
+   - WoL suspend must leave the receive wake path armed.
+4. Integrate chip wake registers, PCI wake enablement, and PHY state in one
+   suspend transaction with rollback on failure.
+5. Start with magic-packet WoL only. Broader wake modes are tracked in the
+   production backlog after magic wake is proven.
 
 Tests:
 
 - `ethtool -s <iface> wol g` persists in `get_wol`.
 - Suspend with WoL disabled does not arm wake.
 - Suspend with WoL enabled arms PCI wake.
-- Magic packet wakes the Gateway, if test infrastructure is available.
+- External magic packet wakes the Gateway.
+- After wake, carrier, traffic, and `ethtool -S` remain usable without module
+  reload.
 
 ### Ring parameters
 
 Implementation:
 
-1. Add `get_ringparam` immediately.
-2. For `set_ringparam`, choose one of:
-   - return `-EOPNOTSUPP` with stable readback if dynamic resize is out of
-     scope for the first RFC, or
-   - implement down-only resize with full stop/open reallocation.
-3. Do not implement live resize until RX page-pool, NAPI, DMA rings, and BQL
+1. Keep `get_ringparam` wired to the actual Rust ring depth.
+2. Keep `set_ringparam` unsupported for the first RFC if resize is not ready.
+3. Add down-only resize before production shipping:
+   - validate requested depths.
+   - require the device to be administratively down.
+   - reallocate RX/TX rings and page-pool state as one rollback-safe operation.
+4. Do not implement running resize until RX page-pool, NAPI, DMA rings, and BQL
    accounting all have explicit rollback tests.
 
 Tests:
@@ -223,6 +252,8 @@ Tests:
 - `ethtool -a` readback matches phylib state.
 - Set-to-current succeeds.
 - Toggle rx/tx pause, renegotiate, verify no link loss beyond expected reneg.
+- Validation evidence proves carrier recovers and traffic passes after each
+  toggle. A smoke log ending with `carrier=0` is not acceptable evidence.
 
 ### Hardware tally stats
 
@@ -242,24 +273,212 @@ Tests:
 - Static gate proves `ndo_get_stats64` still folds software drops.
 - Hardware smoke confirms `ip -s link` and `ethtool -S` remain internally
   consistent after traffic and after reset/reopen.
+- If kernel ethtool MAC/control/pause stats callbacks are available for the
+  target baseline, expose the same counters there rather than only as private
+  strings.
 
-## Phase 4 - P2 defers with explicit documentation
+## Phase 4 - Mainline r8169 compatibility surfaces
 
-These should be documented in the driver RST and upstream cover letter rather
-than implemented before the first RFC:
+These are not vendor embellishments. They are standard compatibility surfaces
+that reduce reviewer friction because mainline `r8169` already exposes or relies
+on them.
 
-- EEE: defer unless soak reveals a link-stability issue tied to EEE.
-- PTP/hwtstamp: defer until the basic control plane is accepted.
-- Custom RSS key/table and `rxnfc`: current default RSS behavior is correct;
-  custom policy can be a follow-up.
-- regs/eeprom/msglevel: diagnostic convenience, not core behavior.
-- netpoll: useful for netconsole, not a first-RFC blocker.
-- RXALL/RXFCS: vendor diagnostic toggles; avoid exposing until there is a clear
-  upstream use case.
+### `ndo_features_check`
+
+Implementation:
+
+1. Compare mainline `r8169` feature checks against the Rust transmit feature
+   contract.
+2. Reject or mask checksum/segmentation offloads for packets the 8125 path
+   cannot safely handle, especially long transport headers, encapsulation, and
+   short/partial checksum edge cases.
+3. Keep the function side-effect free. It should return the adjusted feature
+   mask and leave policy decisions to the networking stack.
+
+Tests:
+
+- Host tests for pure feature-mask decisions.
+- Traffic smoke for normal TCP/UDP checksum offload after the callback lands.
+- Negative packet-shape tests where feasible through kernel selftests or a
+  focused packet generator.
+
+### `ndo_eth_ioctl`
+
+Implementation:
+
+1. Wire `.ndo_eth_ioctl` to the standard phylib MII ioctl helper for a running
+   PHY.
+2. Return stable errors when the PHY is absent or the device is not in a state
+   where the helper is valid.
+3. Do not add private Realtek ioctls.
+
+Tests:
+
+- MII read ioctl succeeds while the interface is running.
+- Unsupported ioctls fail without WARN/BUG.
+- Down-interface behavior is deterministic and documented.
+
+### `get_ts_info`
+
+Implementation:
+
+1. Add ethtool `get_ts_info` before hardware PTP support.
+2. If there is no PHC yet, report the generic software timestamping capability
+   truthfully rather than implying hardware timestamp support.
+3. When hardware PTP lands, extend this callback instead of replacing it.
+
+Tests:
+
+- `ethtool -T <iface>` reports a coherent timestamping matrix.
+- No hardware timestamp flags are advertised until hwtstamp is implemented and
+  validated.
+
+### Richer MAC/control/pause stats
+
+Implementation:
+
+1. Compare r8169 MAC, control, and pause stats with the current Rust
+   `ethtool -S` and `ndo_get_stats64` output.
+2. Prefer standard ethtool stats callbacks when available in the target kernel.
+3. Keep private string stats for driver-specific software counters only.
+
+Tests:
+
+- Counter names and values remain stable across open/close.
+- Pause counters move when pause frames are generated in a controlled test, or
+  are omitted if the hardware cannot report them truthfully.
+
+## Phase 5 - Production feature parity backlog
+
+The following gaps may be documented as first-RFC defers, but the production
+plan is to close them unless validation proves the feature is unsafe on this
+hardware.
+
+### EEE
+
+Implementation:
+
+1. Add phylib-backed `get_eee` / `set_eee`.
+2. Keep MAC EEE configuration synchronized with PHY advertisement.
+3. Disable by default only if Gateway soak shows link instability that cannot be
+   mitigated.
+
+Tests:
+
+- `ethtool --show-eee` and `--set-eee` round trip.
+- Link renegotiation completes without persistent carrier loss.
+- Long idle and traffic-resume soak covers EEE enabled and disabled.
+
+### PTP / hwtstamp
+
+Implementation:
+
+1. Inventory vendor C timestamp registers and mainline expectations.
+2. Add hardware timestamp configuration only after `get_ts_info` exists.
+3. Expose PHC and `SIOCSHWTSTAMP`/`SIOCGHWTSTAMP` behavior only when timestamp
+   readout, rollover handling, and reset restore are proven.
+
+Tests:
+
+- `ethtool -T` advertises hardware support only after implementation.
+- `hwstamp_ctl` or equivalent validates RX/TX timestamp enable/disable.
+- Reset, suspend/resume, and link renegotiation preserve or restore timestamp
+  state.
+
+### Custom RSS key/table and `rxnfc`
+
+Implementation:
+
+1. Keep default RSS behavior as the baseline.
+2. Add persistent storage and validation for custom RSS key and indirection
+   table values.
+3. Program table/key live when safe; otherwise cache while down and reject
+   unsupported running changes explicitly.
+4. Add `rxnfc` hash option handling only for fields the hardware can actually
+   classify.
+
+Tests:
+
+- `ethtool -x`/`-X` readback matches the active table/key.
+- Invalid queue indices, table lengths, and key lengths fail without changing
+  current state.
+- Per-flow distribution smoke confirms packets land on expected queues.
+
+### Register, EEPROM, and msglevel diagnostics
+
+Implementation:
+
+1. Add `get_regs` with a documented register version and a bounded, stable dump
+   layout.
+2. Add EEPROM access only if the chip exposes a real EEPROM/OTP path that can be
+   read safely from Linux. Prefer read-only until write semantics are reviewed.
+3. Add `get_msglevel` / `set_msglevel` only if the Rust logging sites have a
+   meaningful mapping. Do not expose a knob that does nothing.
+
+Tests:
+
+- `ethtool -d` does not race reset/remove and never reads outside the approved
+  register window.
+- `ethtool -e` succeeds only on supported hardware and fails clearly otherwise.
+- msglevel changes affect only documented log categories.
+
+### Netpoll
+
+Implementation:
+
+1. Add netpoll only after the IRQ/NAPI path has a reviewed polling entry point.
+2. Keep the callback minimal and avoid sleeping or taking locks that netpoll
+   cannot tolerate.
+
+Tests:
+
+- Netconsole smoke receives logs over the driver.
+- Normal traffic and panic-path polling do not deadlock.
+
+### Broader WoL modes
+
+Implementation:
+
+1. Add PHY/link, unicast, multicast, and broadcast wake modes only after
+   magic-packet wake is stable.
+2. Map each advertised `wolopts` bit to a proven chip wake source.
+3. Reject unsupported wake modes instead of accepting and ignoring them.
+
+Tests:
+
+- Each advertised wake source wakes the Gateway from system suspend.
+- Disabled wake sources do not produce false wakes.
+
+### Live ring resize
+
+Implementation:
+
+1. Implement down-only resize first.
+2. Add live resize only if stop/reopen disruption is unacceptable and rollback
+   coverage is strong enough.
+3. Coordinate NAPI disablement, IRQ masking, DMA unmap, page-pool destruction,
+   BQL state, and queue wakeup ordering in one reviewed sequence.
+
+Tests:
+
+- Invalid sizes leave active rings untouched.
+- Down-only resize survives repeated open/close and suspend/resume.
+- Live resize, if added, passes traffic under load without leaks, WARNs, or
+  permanent queue stop.
+
+### RXALL/RXFCS
+
+Implementation:
+
+1. Keep these vendor diagnostic toggles deferred unless an upstream use case is
+   identified.
+2. If implemented, ensure the receive path and skb metadata correctly represent
+   frames with FCS or bad checksums.
 
 Acceptance:
 
-- `docs/UPSTREAM_REVIEW.md` says which items are intentionally deferred.
+- `docs/UPSTREAM_REVIEW.md` says which items are intentionally deferred for the
+  first RFC and which remain production parity work.
 - User-facing docs do not imply unsupported features are present.
 - Unsupported ethtool operations fail explicitly, not as silent no-ops.
 
@@ -271,12 +490,19 @@ Suggested commit series:
 2. `net: r8125-rust: add phylib link ethtool operations`
 3. `net: r8125-rust: program receive mode filters`
 4. `net: r8125-rust: add PM suspend and resume hooks`
-5. `net: r8125-rust: expose interrupt coalescing via ethtool`
-6. `net: r8125-rust: add WoL control`
-7. `net: r8125-rust: report ring parameters`
-8. `net: r8125-rust: expose pause parameters`
-9. `net: r8125-rust: fold hardware tally counters into stats64`
-10. `docs: mark remaining vendor-only features deferred`
+5. `net: r8125-rust: report fixed ring parameters`
+6. `net: r8125-rust: expose pause parameters`
+7. `net: r8125-rust: fold hardware tally counters into stats64`
+8. `net: r8125-rust: add features-check offload guard`
+9. `net: r8125-rust: add standard PHY ioctl handling`
+10. `net: r8125-rust: report timestamp capabilities`
+11. `net: r8125-rust: expose MAC control and pause stats`
+12. `net: r8125-rust: complete magic-packet WoL suspend path`
+13. `net: r8125-rust: add EEE ethtool support`
+14. `net: r8125-rust: add custom RSS table key and rxnfc policy`
+15. `net: r8125-rust: add diagnostic register dump`
+16. `net: r8125-rust: support down-only ring resize`
+17. `docs: document remaining intentional defers`
 
 Each behavior commit should include its static CI gate and at least one hardware
 smoke command in the commit message or linked evidence file.
@@ -293,3 +519,8 @@ smoke command in the commit message or linked evidence file.
 - Are all hardware writes owned by Rust or by a tiny C helper with a clear ABI?
 - Are PM and WoL tested independently before being tested together?
 - Does the final feature matrix match actual `ethtool` behavior?
+- Does `ci/check_surface_inventory.sh` match this plan for every present,
+  planned, and intentionally deferred surface?
+- Is the default build behavior documented separately from the `PCI_PM=1`
+  kernel-extension build behavior?
+- Are first-RFC defers clearly distinguished from production shipping gaps?

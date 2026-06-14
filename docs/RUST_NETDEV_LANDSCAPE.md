@@ -1,7 +1,7 @@
 # Rust netdev upstream landscape — research for M7 pre-RFC
 
 **Status (2026-05-29):** desk-research summary backing the outbound
-checklist in [`M7_PRE_RFC_DOSSIER.md`](M7_PRE_RFC_DOSSIER.md). The
+checklist in [`PRE_RFC_DOSSIER.md`](PRE_RFC_DOSSIER.md). The
 question this file answers: *what netdev-Rust work is on-list right
 now that our pre-RFC consultation needs to be aware of, and does it
 change what we propose?*
@@ -196,7 +196,7 @@ they're micro — the dossier still scans correctly without them.
 
 ## Outbound-blocker checklist status
 
-From `M7_PRE_RFC_DOSSIER.md` §"Reading list before posting":
+From `PRE_RFC_DOSSIER.md` §"Reading list before posting":
 
 - [x] **Survey lore.kernel.org for net_device/skb/napi Rust threads in 2025-2026** — done (this file). Result: no active series.
 - [x] **Read FUJITA Tomonori's `rust/kernel/net/phy.rs` review thread** — covered above via LWN; we have the pattern.
@@ -210,9 +210,9 @@ Item 5 is purely time.
 
 ## Cross-references
 
-- [`M7_PRE_RFC_DOSSIER.md`](M7_PRE_RFC_DOSSIER.md) — the outbound
+- [`PRE_RFC_DOSSIER.md`](PRE_RFC_DOSSIER.md) — the outbound
   consultation this research backs.
-- [`M7_PREP.md`](M7_PREP.md) — internal three-exit decision matrix.
+- [`PREP.md`](PREP.md) — internal three-exit decision matrix.
 - `rust.docs.kernel.org/kernel/net/` — live mainline state.
 - LWN coverage: [#934517](https://lwn.net/Articles/934517/),
   [#937781](https://lwn.net/Articles/937781/),

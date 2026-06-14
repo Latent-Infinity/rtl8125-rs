@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# Unified driver for the M5 ASPM idle gate. Runs two 24-hour soaks
+# Unified driver for the ASPM idle gate. Runs two 24-hour soaks
 # back-to-back:
 #
 #   1. force_aspm=0 (production) — chip idle WITHOUT ASPM L1.x.
@@ -82,7 +82,7 @@ EXIT2=$?
 echo "Phase 2 exit: $EXIT2" | tee -a "$LOG"
 
 if [[ "$EXIT2" -eq 0 ]]; then
-	grn "BOTH PHASES PASSED — M5 ASPM gate cleared" | tee -a "$LOG"
+	grn "BOTH PHASES PASSED — ASPM idle gate cleared" | tee -a "$LOG"
 else
 	red "Phase 2 FAILED — chip cannot survive 24h ASPM-on idle" | tee -a "$LOG"
 	red "  This indicates the historical L1.x lockup is still present" | tee -a "$LOG"

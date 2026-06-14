@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# Static gate for the zero-copy RX page_pool lifecycle (M6 #2 v3).
-# See docs/M6_JUMBO_DESIGN.md and src/netdev_bridge_rx_pool.c.
+# Static gate for the zero-copy RX page_pool lifecycle.
+# See docs/JUMBO_DESIGN.md and src/netdev_bridge_rx_pool.c.
 #
 # The RX buffers are owned by a `page_pool`. Leak-safety now means:
 #   - every page_pool_create has a matching page_pool_destroy,

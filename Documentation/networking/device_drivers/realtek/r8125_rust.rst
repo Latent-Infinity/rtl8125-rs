@@ -121,7 +121,7 @@ Limitations
     NIC is untested. Suspend/resume support is planned for a follow-up
     series.
   - **Single RX / single TX queue.** Multi-queue is documented as
-    not-yet (the M6 design notes the additional surface area required
+    not-yet (the design notes cover the additional surface area required
     in the cshim).
   - **No XDP.** The cshim does not export ``XDP_REDIRECT``-shaped
     helpers; an XDP RX path requires either an upstream safe-Rust

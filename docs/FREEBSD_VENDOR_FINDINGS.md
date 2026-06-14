@@ -36,7 +36,7 @@ BSD vendor sets `max_jumbo_frame_size = Jumbo_Frame_9k` for MACFG_83
 By contrast, r8169 mainline (`r8169_main.c:5553`) uses `JUMBO_16K`
 (~16380 bytes) for the entire MAC_VER_61..LAST range.
 
-**Implication for `docs/M6_JUMBO_DESIGN.md`**: our recommendation to
+**Implication for `docs/JUMBO_DESIGN.md`**: our recommendation to
 advertise JUMBO_9K initially (and treat JUMBO_16K as operator-opt-in)
 matches BSD vendor's conservative posture exactly. Not r8169
 mainline's aggressive 16K. **Keep the 9K initial cap in the M6

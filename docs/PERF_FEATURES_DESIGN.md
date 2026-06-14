@@ -11,9 +11,9 @@ chip, leaving two real M6 sub-features:
 
 | # | Plan §7 M6 sub-feature | Status on 8125B | Owner doc |
 |---|---|---|---|
-| 1 | MSI-X (replace legacy IRQ) | **scoped** | `docs/M6_MSIX_DESIGN.md` |
+| 1 | MSI-X (replace legacy IRQ) | **scoped** | `docs/MSIX_DESIGN.md` |
 | 2 | Multiple RX queues + RSS | **DONE (Track B, 2026-06-09)** — 4 RX queues, RSS, ethtool -L/-x/-X; opt-in via `rss_queues` | `docs/RSS_RXHASH_IMPLEMENTATION_PLAN.md` |
-| 3 | Jumbo frames (MTU 9000) | **scoped** | `docs/M6_JUMBO_DESIGN.md` |
+| 3 | Jumbo frames (MTU 9000) | **scoped** | `docs/JUMBO_DESIGN.md` |
 | 4 | RX/TX checksum offload | done in M4-perf (task #48) | — |
 | 5 | TSO/GSO | done in M4-perf (task #49) | — |
 
@@ -27,13 +27,13 @@ The original "why the collapse" rationale below was **wrong**: it claimed
 reports **4 RX queues + a 128-entry RSS indirection table**, and Track B now
 implements + hardware-validates full multi-queue RSS (default stays
 single-queue `rss_queues=0`; multi-queue is an opt-in). See
-`docs/M6_MULTIQ_NA.md` (superseded notice) and
+`docs/MULTIQUEUE_RSS.md` (superseded notice) and
 `docs/RSS_RXHASH_IMPLEMENTATION_PLAN.md`.
 
 CSUM and TSO landed early in M4-perf because they don't require new
 chip-init beyond what M4 already needs (descriptor opts bits).
 
-_Original (incorrect) rationale, kept for history:_ `docs/M6_MULTIQ_NA.md`
+_Original (incorrect) rationale, kept for history:_ `docs/MULTIQUEUE_RSS.md`
 was read as confirming 8125B exposes only 1 TX + 1 RX queue — that
 source-reading was mistaken for this stepping.
 

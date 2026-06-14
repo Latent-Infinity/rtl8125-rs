@@ -1,11 +1,11 @@
-# syzkaller config sketch for r8125_rust — plan §7 M5 fuzz gate.
+# syzkaller config sketch for r8125_rust — fuzz gate.
 #
 # Full syzkaller run is operator-time work; this file documents the
 # config the operator should use. syzkaller is launched against a
 # guest with the validated debug kernel (KASAN + lockdep + kmemleak
 # + DMA_API_DEBUG) and the r8125_rust module loaded.
 #
-# Scope caveat (plan §7 M5):
+# Scope caveat:
 #   "KCOV does not collect soft/hard interrupt coverage by default,
 #    so NAPI and IRQ paths are not fully covered by syzkaller alone."
 # This is fine — the packet-mutation harness covers the data path,
@@ -54,7 +54,7 @@
 }
 
 # Recommended run length: 4 hours.
-# Pass criteria (plan §7 M5):
+# Pass criteria:
 #   - No KASAN / UBSAN / lockdep / kmemleak reports during the run
 #   - No kernel panics
 #   - No `BUG:` lines in the harvested console log

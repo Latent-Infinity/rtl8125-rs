@@ -8,14 +8,16 @@
  * has no stable Rust API today: net_device + net_device_ops + NAPI +
  * sk_buff plumbing.
  *
- * Hard cap: 800 LOC including comments. Candidate G/L/M additions and the
- * per-MTU zero-copy RX path fit after dead RX helpers moved out; queue-id
- * plumbing and the multi-queue NAPI lifecycle helpers raised the cap from
- * 540, then 615. Raised to 700 for the upstream robustness features: random-MAC
- * fallback for an invalid hardware MAC, the ndo_tx_timeout watchdog + deferred
- * reset_work recovery, and ndo_get_stats64 surfacing the drop counters. Raised
- * to 760 for ndo_set_rx_mode, then 800 for the hardware tally-dump path, per
- * docs/UPSTREAM_GAP_CLOSURE_PLAN.md.
+ * Hard cap: 820 LOC including comments. The per-CPU netstats, IRQ-affinity,
+ * and TX-queue-len additions plus the per-MTU zero-copy RX path fit after dead
+ * RX helpers moved out; queue-id plumbing and the multi-queue NAPI lifecycle
+ * helpers raised the cap from 540, then 615. Raised to 700 for the upstream
+ * robustness features: random-MAC fallback for an invalid hardware MAC, the
+ * ndo_tx_timeout watchdog + deferred reset_work recovery, and ndo_get_stats64
+ * surfacing the drop counters. Raised to 760 for ndo_set_rx_mode, then 800 for
+ * the hardware tally-dump path, then 820 for the system-sleep PM
+ * detach/reattach helpers (r8125_bridge_pm_suspend / _resume, reached only via
+ * the r8125_pci_pm-gated Rust callbacks).
  * See cshim/README.md.
  *
  * Every ndo callback below is a thin delegation to the Rust vtable.
@@ -123,7 +125,7 @@ static netdev_tx_t bridge_ndo_start_xmit(struct sk_buff *skb,
 {
 	struct r8125_bridge *b = netdev_priv(ndev);
 
-	/* All §6.3 counter side-effects happen inside the Rust path via
+	/* All counter side-effects happen inside the Rust path via
 	 * the skb helpers below — bridge_ndo_start_xmit itself is a pure
 	 * delegation.
 	 */
@@ -225,7 +227,7 @@ static void bridge_ndo_tx_timeout(struct net_device *ndev, unsigned int txqueue)
 
 /*
  * ndo_get_stats64. The core maintains rx/tx packets+bytes in per-CPU tstats
- * (NETDEV_PCPU_STAT_TSTATS); fold the section 6.3 disposition drop counters into
+ * (NETDEV_PCPU_STAT_TSTATS); fold the disposition drop counters into
  * the standard rx_dropped/tx_dropped so `ip -s link` / SNMP see them too, not
  * only `ethtool -S`. Also folds chip tally error counters when the hardware dump
  * succeeds.
@@ -242,8 +244,8 @@ static void bridge_ndo_get_stats64(struct net_device *ndev,
 	stats->tx_dropped += c.tx_dropped_error;
 
 	/* Hardware tally: dump the on-die counters and fold the error totals the
-	 * software §6.3 counters can't see (RX FIFO-overflow misses, chip-level
-	 * rx/tx errors). tally_dump returns 0 on success.
+	 * software disposition counters can't see (RX FIFO-overflow misses,
+	 * chip-level rx/tx errors). tally_dump returns 0 on success.
 	 */
 	if (b->tally_vaddr && !b->ops.tally_dump(b->priv, b->tally_dma)) {
 		u32 rx_missed;
@@ -354,7 +356,7 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 			 mac, ndev->dev_addr);
 	}
 
-	/* M6 #2: jumbo support up to 9000 bytes. RX slot geometry now
+	/* Jumbo support up to 9000 bytes. RX slot geometry now
 	 * comes from per-MTU sizing in netdev_bridge_rx_pool.c, and `ndo_open`
 	 * creates a new page_pool sized for the current MTU.
 	 * We keep the 9000 MTU cap (industry-common) unless operators opt
@@ -368,8 +370,8 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	 */
 	ndev->watchdog_timeo = 5 * HZ;
 
-	/* Candidate G (RX_OPTIMIZATION_CANDIDATES.md §G): per-CPU
-	 * netstats. With `NETDEV_PCPU_STAT_TSTATS` the kernel uses
+	/* Per-CPU netstats (RX_OPTIMIZATION_CANDIDATES.md §G).
+	 * With `NETDEV_PCPU_STAT_TSTATS` the kernel uses
 	 * `dev_get_tstats64` to sum per-CPU rx_packets/rx_bytes/
 	 * tx_packets/tx_bytes; the hot path calls
 	 * `dev_sw_netstats_{rx,tx}_add` which is a single per-CPU
@@ -379,8 +381,8 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	 */
 	ndev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS;
 
-	/* Candidate M (RX_OPTIMIZATION_CANDIDATES.md §M): drop the
-	 * default 1000-deep TX queue to 256. At 2.35 Gbps line rate a
+	/* Drop the default 1000-deep TX queue to 256
+	 * (RX_OPTIMIZATION_CANDIDATES.md §M). At 2.35 Gbps line rate a
 	 * 1000-packet backlog is ~3.4 ms of bufferbloat — bad for the
 	 * heterogeneous-load-balancer tail-latency goal. 256 caps the
 	 * worst-case TX queueing delay at ~870 us while still leaving
@@ -499,13 +501,13 @@ void r8125_bridge_unregister_and_free(struct net_device *ndev)
 }
 
 /*
- * `r8125_bridge_irq_pin_cpu` — Candidate L
+ * `r8125_bridge_irq_pin_cpu` — IRQ CPU affinity hint
  * (RX_OPTIMIZATION_CANDIDATES.md §L).
  *
  * Suggest to the kernel + `irqbalance` that this MSI-X vector
  * should be serviced on a specific CPU. Reduces tail latency from
  * softirq cross-CPU migration AND keeps the per-CPU NAPI page-frag
- * cache warm (helps Candidate B's `napi_alloc_skb` fast path).
+ * cache warm (helps the `napi_alloc_skb` fast path).
  *
  * The kernel-internal hint can be overridden by an explicit
  * `/proc/irq/N/smp_affinity` write or by `irqbalance` if it
@@ -678,6 +680,42 @@ int r8125_bridge_reopen(struct net_device *ndev)
 	return bridge_ndo_open(ndev);
 }
 
+/*
+ * System-sleep PM. Called from the Rust pci::Driver suspend/resume callbacks
+ * (which the kernel-Rust PCI adapter now wires into dev_pm_ops). The PCI core
+ * saves/restores config space and handles the D-state around these; we only
+ * quiesce/re-init the device. RTNL is NOT held by the PM core, so take it here
+ * (bridge_ndo_open/stop run under RTNL). netif_device_detach/attach hide the
+ * device from the stack across the sleep. Only act if the interface was up.
+ */
+void r8125_bridge_pm_suspend(struct net_device *ndev)
+{
+	rtnl_lock();
+	if (netif_running(ndev)) {
+		netif_device_detach(ndev);
+		bridge_ndo_stop(ndev);
+	}
+	rtnl_unlock();
+}
+
+int r8125_bridge_pm_resume(struct net_device *ndev)
+{
+	int rc = 0;
+
+	rtnl_lock();
+	if (netif_running(ndev)) {
+		rc = bridge_ndo_open(ndev);
+		/* Only re-expose the device to the stack if re-init succeeded;
+		 * a failed reopen must surface as a resume error, not a silently
+		 * reattached dead interface.
+		 */
+		if (rc == 0)
+			netif_device_attach(ndev);
+	}
+	rtnl_unlock();
+	return rc;
+}
+
 void r8125_bridge_carrier_on(struct net_device *ndev)
 {
 	netif_carrier_on(ndev);
@@ -693,7 +731,7 @@ void r8125_bridge_tx_disable(struct net_device *ndev)
 	netif_tx_disable(ndev);
 }
 
-/* ── sk_buff helpers + counter side-effects (§6.3) ─────────────────── */
+/* ── sk_buff helpers + counter side-effects ────────────────────────── */
 
 void r8125_bridge_skb_dma_unmap_tx(struct device *dev, dma_addr_t handle,
 				   size_t len)

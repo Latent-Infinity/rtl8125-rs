@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Static checks for the M4 checksum/stat offload path. The traffic proof is
+# Static checks for the checksum/stat offload path. The traffic proof is
 # the real test; these guards catch ordering regressions visible in source.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

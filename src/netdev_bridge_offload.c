@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * HW offload helpers for r8125_rust (M4-perf, task 48).
+ * HW offload helpers for r8125_rust.
  *
  * Rust hot-path doesn't peek into sk_buff internals. This file holds the
  * protocol introspection: TX checksum bit selection, RX checksum result
@@ -174,14 +174,14 @@ void r8125_bridge_skb_rx_csum_set(struct sk_buff *skb, u32 desc_opts1)
 
 void r8125_bridge_account_tx(struct net_device *ndev, unsigned int bytes)
 {
-	/* Per-CPU tx_packets/tx_bytes via Candidate G's
-	 * NETDEV_PCPU_STAT_TSTATS setup at bridge_alloc. r8169 uses the
-	 * same helper at rtl8169_tx_handler (r8169_main.c:4769).
+	/* Per-CPU tx_packets/tx_bytes via the NETDEV_PCPU_STAT_TSTATS
+	 * setup at bridge_alloc. r8169 uses the same helper at
+	 * rtl8169_tx_handler (r8169_main.c:4769).
 	 */
 	dev_sw_netstats_tx_add(ndev, 1, bytes);
 }
 
-/* ── Scatter-gather + TSO (M4-perf phase 2, task 49) ─────────────────── */
+/* ── Scatter-gather + TSO ────────────────────────────────────────────── */
 
 /* TX descriptor opts1 bits used only by the TSO path. Same prefix
  * scheme as the CSUM opts2 bits above. Realtek vendor + r8169 agree

@@ -11,8 +11,6 @@
 //! Page register (MII 0x1F) per r8169 `r8168g_mdio_write`: writing it
 //! updates `NetdevState::phy.ocp_base` instead of poking a real PHY
 //! register, and subsequent MII access routes through that page.
-//!
-//! Plan §7 M4-traffic (PHY init blocking task 46).
 
 use core::sync::atomic::Ordering;
 

@@ -45,7 +45,7 @@ Legend: ✅ done · 🟡 partial / needs a privileged or operator step · ⛔ bl
 
 ## Critical path to M1 (in order)
 
-> **▶ Executable form: [`M0a_TO_M1_RUNBOOK.md`](M0a_TO_M1_RUNBOOK.md).** That
+> **▶ Executable form: [`BRINGUP_RUNBOOK.md`](BRINGUP_RUNBOOK.md).** That
 > file is the step-by-step, copy-pasteable version of the path below — every
 > command, an acceptance check per step, the tracker row each step clears, and
 > the exact evidence to commit. A human can follow it top to bottom. The
@@ -68,7 +68,7 @@ operator/root and physical work — none of it is code, and none of it is M0b:
    kernel installed and booted in the VFIO guest; host 100× `bind_vfio.sh`
    cycle clean (#8); guest enumerates the RTL8125 (#8); serial console
    panic-tested (#13); trivial Rust module 100× load-loop in the guest (#4,
-   #14). `docs/M0a_TO_M1_RUNBOOK.md` Phases 4–8 are closed (Phase 3 netplan
+   #14). `docs/BRINGUP_RUNBOOK.md` Phases 4–8 are closed (Phase 3 netplan
    switchover deferred — it gates M0b row 10, not M1).
 
    → **M1 has begun.**

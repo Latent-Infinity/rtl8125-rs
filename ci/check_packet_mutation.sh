@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# Packet-mutation fuzz harness (plan §7 M5).
+# Packet-mutation fuzz harness.
 #
 # > "Packet-mutation harness to cover the data path: pktgen and
 # >  Scapy/mausezahn injecting malformed L2/L3/L4 headers, bad

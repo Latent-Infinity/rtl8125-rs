@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# ASPM idle soak — the historical L1.x lockup gate (plan §7 M5).
+# ASPM idle soak — the historical L1.x lockup gate.
 #
 # > "The 24-hour ASPM idle soak is the gate that has historically
 # >  eliminated entire generations of RTL8125 driver candidates —
-# >  passing it is the explicit goal of this milestone."
+# >  passing it is the explicit goal of this work."
 #
 # Procedure:
 #   1. Load the module, bring link up.

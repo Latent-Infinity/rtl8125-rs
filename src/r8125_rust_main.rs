@@ -6,7 +6,7 @@
 //! XIDs return `-ENODEV` from probe (no silent fallback to a generic
 //! handler).
 //!
-//! ## Architecture (plan §6.1)
+//! ## Architecture
 //!
 //! Rust-side modules (this crate):
 //!
@@ -14,8 +14,7 @@
 //!   table, probe / unbind orchestration.
 //! - [`regs`] — curated register offsets and bitfield constants.
 //! - [`mmio`] — typed [`Regs`](mmio::Regs) wrapper around `pci::Bar`.
-//!   The only module outside `unsafe_boundary` that touches MMIO
-//!   (plan §6.2).
+//!   The only module outside `unsafe_boundary` that touches MMIO.
 //! - [`hw`] — per-revision XID → `ChipInfo` dispatch, the r8169-port
 //!   `hw_start_8125b` chip-init sequence, and the reset path.
 //! - [`netdev`] — `NetdevState`, `ndo_open`/`stop`/`start_xmit`, and
@@ -24,7 +23,7 @@
 //!   TX completion reaping, queue stop/wake hysteresis
 //!   (`RUST_STANDARDS.md §15.2`).
 //! - [`ring`] — descriptor layout + ring index newtypes.
-//! - [`skb`] — type-state `TxSkb<S>` mirroring the plan §6.3 lifecycle.
+//! - [`skb`] — type-state `TxSkb<S>` mirroring the SKB lifecycle.
 //! - [`dma`], [`phy`], [`pm`] — DMA pool, PHY OCP / C45 MDIO helpers,
 //!   ASPM capability accessor.
 //! - [`unsafe_boundary`] — the single permitted home for `unsafe`.
@@ -34,13 +33,13 @@
 //!
 //! C-side cshim (`src/netdev_bridge*.c`): covers the `net_device` +
 //! NAPI + `sk_buff` + `mii_bus` + `ethtool_ops` surface that
-//! kernel-Rust has not yet abstracted (plan §5.2; see `docs/M7_PREP.md`
+//! kernel-Rust has not yet abstracted (see `docs/PREP.md`
 //! for the upstream gap inventory). Contract:
 //! `src/netdev_bridge.h::r8125_bridge_ops`.
 //!
 //! ## Discipline
 //!
-//! - Crate root carries `#![deny(unsafe_code)]` (plan §6.2).
+//! - Crate root carries `#![deny(unsafe_code)]`.
 //! - Module parameters: `inject_reset_timeout` (probe failure-injection
 //!   test gate), `force_aspm` (test-only ASPM-on soak; DO NOT set in
 //!   production), `intx_only` (MSI/MSI-X rollback), interrupt coalesce
@@ -57,9 +56,9 @@
 //! pattern as `samples/rust/rust_print` (`rust_print_main.rs` +
 //! `rust_print_events.c` → `rust_print.ko`).
 //!
-//! Milestone history, design rationale, and bisection logs live in
+//! Development history, design rationale, and bisection logs live in
 //! `docs/` — see `docs/RTL8125_Rust_Driver_Implementation_Plan.md`,
-//! `docs/M5_CLOSEOUT.md`, `docs/RTL8125B_TSO_NOTES.md`.
+//! `docs/RTL8125B_TSO_NOTES.md`.
 #![deny(unsafe_code)]
 #![allow(clippy::unnecessary_safety_comment)]
 
@@ -87,7 +86,7 @@ kernel::module_pci_driver! {
     description: "Rust driver for the Realtek RTL8125 2.5G Ethernet controller",
     license: "GPL v2",
     params: {
-        // Deliberate failure-injection knob for the plan §7 M2
+        // Deliberate failure-injection knob for the
         // "failed reset path is recoverable" gate. When non-zero, the
         // reset code suppresses the `CmdReset` write so the poll loop
         // always times out, and probe returns `-EIO`. Default 0 (off).
@@ -99,10 +98,10 @@ kernel::module_pci_driver! {
             default: 0,
             description: "Force the reset poll to time out (testing only)",
         },
-        // M5 ASPM-soak knob: when non-zero, hw_start_8125b skips the
+        // ASPM-soak knob: when non-zero, hw_start_8125b skips the
         // Config5 ASPM_en clear so the PCIe link can enter L1.x during
         // idle. Required to exercise the historical RTL8125 L1.x
-        // lockup gate (plan §7 M5).
+        // lockup gate.
         //
         // Default 0 (ASPM disabled — matches r8169
         // rtl_hw_aspm_clkreq_enable(false) and keeps TSO reliable per
@@ -112,7 +111,7 @@ kernel::module_pci_driver! {
             default: 0,
             description: "Leave ASPM enabled (test-only, breaks TSO)",
         },
-        // M6 sub-feature #1 rollback knob (Phase A.2 — ACTIVE).
+        // MSI-X rollback knob.
         // Default 0 lets probe call `pci_alloc_irq_vectors` with the
         // MSI-X → MSI → INTx preference chain, then enable
         // `INT_CFG0_ENABLE_8125` so the chip routes IRQs through the
@@ -154,7 +153,7 @@ kernel::module_pci_driver! {
             default: 0,
             description: "Reserve operator intent for ASPM force-off (chip-side already off by default)",
         },
-        // RX Opt #4 — IRQ affinity policy with PCI-local default.
+        // IRQ affinity policy with PCI-local default.
         // Conventions (u8 because `kernel::module_param` doesn't yet
         // expose signed types):
         //   255  → auto: pick first online CPU on the chip's NUMA node
@@ -225,7 +224,7 @@ kernel::module_pci_driver! {
         // Legacy RX descriptor escape hatch. Default 0 uses the V3 (32-byte)
         // RX descriptor path that carries the RXHASH metadata. Non-zero forces
         // the legacy 16-byte descriptor layout (the path validated through the
-        // M4–M6 matrices/soaks) and disables RXHASH (legacy descriptors have no
+        // earlier test matrices/soaks) and disables RXHASH (legacy descriptors have no
         // hash field) — a rollback knob if the V3 path regresses on a target.
         rx_legacy_desc: u8 {
             default: 0,

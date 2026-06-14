@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * netdev_bridge_ethtool.c - ethtool -S exposure for the section 6.3 counters.
+ * netdev_bridge_ethtool.c - ethtool -S exposure for the disposition counters.
  *
- * The section 6.3 disposition counters (tx_received / tx_consumed /
+ * The disposition counters (tx_received / tx_consumed /
  * tx_busy_exception / tx_dropped_error / rx_handed_to_stack /
- * rx_dropped_error) are the formal accounting that the plan requires:
+ * rx_dropped_error) are the formal accounting:
  *
  *   tx_received == tx_consumed + tx_busy_exception + tx_dropped_error
  *
@@ -12,7 +12,7 @@
  * kernel-internal API; this file makes them readable via
  * `ethtool -S enp5s0` so the runtime invariant check (
  * `ci/check_counter_invariant.sh`) can assert the equation after a
- * 1 GB transfer per plan section 6.3 / section 15 M4 close-out.
+ * 1 GB transfer.
  *
  * Why ethtool and not debugfs: ethtool stats are the kernel-idiomatic
  * surface for per-device internal counters, are stable across kernel
@@ -21,9 +21,9 @@
  * within its 400-line review cap.
  *
  * Hard cap: 400 LOC. Enforced by ci/check_cshim_loc_caps.sh. Raised from 200
- * for the B5 ethtool RSS control plane (get/set_rxfh, get_channels, get_rxnfc),
- * then to 340 for the P0 phylib link control plane, then 400 for pause/ring params
- * nway_reset) per docs/UPSTREAM_GAP_CLOSURE_PLAN.md.
+ * for the ethtool RSS control plane (get/set_rxfh, get_channels, get_rxnfc),
+ * then to 340 for the phylib link control plane, then 400 for pause/ring params
+ * and nway_reset.
  */
 
 #include "netdev_bridge_internal.h"
@@ -53,7 +53,7 @@ static void bridge_get_drvinfo(struct net_device *ndev,
 /*
  * Order MUST match `bridge_ethtool_stats[]` ordering below: the kernel
  * reads strings via .get_strings(ETH_SS_STATS), then values via
- * .get_ethtool_stats() in the same order. The section 6.3 invariant check
+ * .get_ethtool_stats() in the same order. The invariant check
  * relies on these names.
  *
  * Per-counter intent (also documented in
@@ -121,7 +121,7 @@ u32 r8125_bridge_rxfh_indir_default(u32 index, u32 n_rx_rings)
 }
 
 /*
- * RSS control plane (B5). The chip uses Toeplitz hashing with the boot-stable
+ * RSS control plane. The chip uses Toeplitz hashing with the boot-stable
  * system key and the kernel DEFAULT indirection spread for the active RX-queue
  * count (`ethtool_rxfh_indir_default`, bucket i -> queue i % active_rx_queues) —
  * exactly what `apply_rss_programming` writes to hardware. `get_rxfh` therefore

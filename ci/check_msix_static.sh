@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# Static gate for M6 sub-feature #1 (MSI-X migration). See
-# docs/M6_MSIX_DESIGN.md for the implementation contract this script
-# enforces.
+# Static gate for the MSI-X migration. See docs/MSIX_DESIGN.md for
+# the implementation contract this script enforces.
 #
-# The check is intentionally vacuous before M6 lands — it skips when
+# The check is intentionally vacuous before MSI-X lands — it skips when
 # none of the MSI-X register surface is present in the source. Once
 # `IMR_V2_SET` / `IMR_V2_CLEAR` / `ISR_V2` constants appear in
 # `src/regs.rs`, the full enforcement engages.
@@ -36,19 +35,19 @@ NETDEV="$ROOT/src/netdev.rs"
 MAIN="$ROOT/src/r8125_rust_main.rs"
 
 # Pre-engagement: V2 surface is only ACTIVE when some code path sets
-# `INT_CFG0_ENABLE_8125` on the chip. Phase A.1 had the surface in
-# regs.rs as scaffolding without activating it. Phase A.2 moves the
-# activation out of `hw_start_8125b` (which is run before MSI/MSI-X
-# allocation is known) and into `ndo_open`, where it's gated on
-# `state.irq_mode()`. Accept the activation in either file.
+# `INT_CFG0_ENABLE_8125` on the chip. An earlier step had the surface in
+# regs.rs as scaffolding without activating it. The activation later moved
+# out of `hw_start_8125b` (which is run before MSI/MSI-X allocation is
+# known) and into `ndo_open`, where it's gated on `state.irq_mode()`.
+# Accept the activation in either file.
 if ! grep -qE '\bIMR_V2_SET\b|\bISR_V2\b' "$REGS"; then
-	yel "MSI-X register surface not yet in src/regs.rs (M6 #1 not landed) — skipping"
+	yel "MSI-X register surface not yet in src/regs.rs (not landed) — skipping"
 	exit 0
 fi
 # Distinguish "the constant is mentioned in a comment" from "the bit is
 # actually written to the chip": look for an actual set_int_cfg0 call
 # that includes INT_CFG0_ENABLE_8125 as a written value, in either
-# hw_start_8125b or ndo_open (Phase A.2 home).
+# hw_start_8125b or ndo_open.
 if ! grep -hE 'set_int_cfg0\([^)]*INT_CFG0_ENABLE_8125|set_int_cfg0_v2_enable\(true\)' "$HW" "$NETDEV" >/dev/null 2>&1; then
 	yel "V2 register surface scaffolded but chip-side INT_CFG0_ENABLE_8125 not active yet — full check deferred"
 	exit 0
@@ -65,7 +64,7 @@ if [[ "$rc" -eq 0 ]]; then
 fi
 
 # 2. INT_CFG0_ENABLE_8125 is written conditionally (mode-gated) at
-# bring-up. Phase A.2 keeps it in ndo_open guarded by
+# bring-up. It lives in ndo_open guarded by
 # `state.irq_mode() != IrqMode::Intx`; accept either gating idiom.
 if ! grep -hE 'set_int_cfg0\([^)]*INT_CFG0_ENABLE_8125|set_int_cfg0_v2_enable\(true\)' "$HW" "$NETDEV" >/dev/null 2>&1; then
 	red "no set_int_cfg0(INT_CFG0_ENABLE_8125) call found — chip will stay on legacy ISR"
@@ -109,7 +108,7 @@ fi
 if grep -qE '\bintx_only\s*:' "$MAIN"; then
 	grn "intx_only module param exists for legacy-IRQ fallback"
 else
-	red "missing 'intx_only: u8' module param (M6 per-feature rollback gate)"
+	red "missing 'intx_only: u8' module param (per-feature rollback gate)"
 fi
 
 exit $rc

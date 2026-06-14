@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# Teardown/reprobe cycle test — the closest M5 suspend/resume proxy we
-# can build today given the kernel-Rust PCI API gap (see docs/M5_PM_GAP.md).
+# Teardown/reprobe cycle test — the closest suspend/resume proxy we
+# can build today given the kernel-Rust PCI API gap (see docs/PM_GAP.md).
 #
 # IMPORTANT — two chip/platform facts shape this test:
 #   1. The RTL8125B does NOT advertise Function-Level Reset (lspci shows
@@ -17,7 +17,7 @@
 #      udev on `bus/rescan`, so a bare remove+rescan re-binds the device to
 #      r8169, not us. We therefore pin the device to $DRIVER via
 #      `driver_override` after each rescan (the procedure validated in
-#      docs/M5_CLOSEOUT.md).
+#      docs/HARDENING_CLOSEOUT.md).
 #
 # Each cycle drives the driver's own remove()->probe() cleanly:
 #   1. echo 1 > /sys/bus/pci/devices/$BDF/remove   (remove(): phy_stop, free rings)
@@ -26,7 +26,7 @@
 #   4. bring the netdev up; verify link + ping
 #   5. scan dmesg for KASAN/UBSAN/BUG/WARNING/lockup
 #
-# 10 cycles is the M5 spec ("10x suspend/resume cycles"). Active-traffic
+# 10 cycles matches the spec ("10x suspend/resume cycles"). Active-traffic
 # teardown is covered separately by ci/check_rmmod_while_up.sh.
 
 set -uo pipefail

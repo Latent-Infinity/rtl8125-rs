@@ -11,7 +11,7 @@ joins the machine to Tailscale, and then hands the machine to the agent. From
 that point forward, identity checks, toolchain setup, kernel install, driver
 builds, and long-running validation are agent-driven over SSH.
 
-This runbook is the alternate to [`M0a_TO_M1_RUNBOOK.md`](M0a_TO_M1_RUNBOOK.md).
+This runbook is the alternate to [`BRINGUP_RUNBOOK.md`](BRINGUP_RUNBOOK.md).
 Where that doc gets the Controller's KVM guest going, this doc gets the
 Gateway's bare-metal environment going. Both reference the same plan
 ([`RTL8125_Rust_Driver_Implementation_Plan.md`](RTL8125_Rust_Driver_Implementation_Plan.md))
@@ -288,7 +288,7 @@ faster), then deploys the `.deb` to Gateway.
    Note the kernel version exactly.
 2. Reproduce that build from `references/ubuntu-kernel-7.0.0-15` (already
    fetched via `tools/fetch_references.sh`). The agent has the build
-   recipe in `docs/M0a_TO_M1_RUNBOOK.md` Phase 2.
+   recipe in `docs/BRINGUP_RUNBOOK.md` Phase 2.
 3. Package as `.deb` (`make bindeb-pkg`) and copy to Gateway via rsync:
    ```bash
    rsync -e "ssh -i ~/.ssh/agent/rtl8125_gateway_codex" \
@@ -424,7 +424,7 @@ the contract. Verify each on Gateway:
 3. **`ci/check_packet_mutation.sh`** — 1000 malformed frames from peer
 4. **`ci/check_aspm_idle_soak.sh`** — Gateway can FINALLY test this with
    a real bridge that supports ASPM L1 (the QEMU bridge on Controller-KVM
-   only advertises L0s — see `docs/M5_CLOSEOUT.md`)
+   only advertises L0s — see `docs/HARDENING_CLOSEOUT.md`)
 5. **`ci/check_aspm_on_idle_soak.sh`** — same, with `force_aspm=1`
 6. **`ci/check_aspm_both_soaks.sh`** — the unified 48h wrapper
 7. **`ci/check_flr_cycle.sh`** — the chip doesn't support FLR; bypass

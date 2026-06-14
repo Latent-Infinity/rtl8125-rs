@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * netdev_bridge_counters.c — per-CPU storage for the §6.3 disposition
+ * netdev_bridge_counters.c — per-CPU storage for the disposition
  * counters.
  *
  * The six counters (tx_received / tx_consumed / tx_busy_exception /
@@ -85,7 +85,7 @@ void r8125_bridge_counters_free(struct r8125_bridge *b)
  * each CPU's slot. We make no attempt to freeze the per-CPU values
  * during the walk; the snapshot is an instantaneous photograph and
  * small aggregate skew is acceptable for the ethtool/invariant-check
- * use cases (the §6.3 invariant runtime check quiesces TX via a link
+ * use cases (the invariant runtime check quiesces TX via a link
  * down/up cycle before reading, so writers are silent at snapshot
  * time anyway).
  */

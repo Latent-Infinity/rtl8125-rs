@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Enforce the kernel AI coding-assistant + DCO policy on commit messages
-# (plan §9.2; faithful to references/linux-mainline/Documentation/process/
+# (faithful to references/linux-mainline/Documentation/process/
 # coding-assistants.rst). Checks the range of commits given (default: commits
 # not on origin/main, else HEAD).
 #
@@ -28,11 +28,11 @@ for c in $commits; do
 
   # R1
   if grep -qiE "^Signed-off-by:.*$AGENT_RE" <<<"$sob"; then
-    echo "FAIL $c: agent-looking Signed-off-by (R1, §9.2: only humans certify the DCO)"; fail=1
+    echo "FAIL $c: agent-looking Signed-off-by (R1: only humans certify the DCO)"; fail=1
   fi
   # R2
   if [[ -n "$ab" && -z "$sob" ]]; then
-    echo "FAIL $c: Assisted-by without any human Signed-off-by (R2, §9.2)"; fail=1
+    echo "FAIL $c: Assisted-by without any human Signed-off-by (R2)"; fail=1
   fi
   # R3
   while IFS= read -r line; do

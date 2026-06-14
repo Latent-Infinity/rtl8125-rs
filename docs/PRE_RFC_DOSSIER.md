@@ -7,7 +7,7 @@ numbers are captured on Gateway bare-metal, and (c) one of us has
 read the on-list r8169 + kernel-Rust threads end-to-end so we know
 what's already been said.
 
-`docs/M7_PREP.md` is the *research* dossier — the unfiltered
+`docs/PREP.md` is the *research* dossier — the unfiltered
 inventory and three-exit analysis. **This file** is the *outbound*
 dossier — the one a maintainer would actually read. It is intentionally
 short, has its claims linked to evidence in the tree, and ends with
@@ -47,7 +47,7 @@ RFC driver. The three questions are at the bottom of this file.
 | Unsafe-boundary contract | Where `unsafe` lives, allowlist, census | [`src/unsafe_boundary.rs`](../src/unsafe_boundary.rs), [`ci/.unsafe-allowlist`](../ci/.unsafe-allowlist), [`ci/.unsafe-census`](../ci/.unsafe-census) |
 | sk_buff ownership contract | §6.3 of the plan, encoded as `DriverOwnedSkb` | [`src/skb.rs`](../src/skb.rs), [§6.3](RTL8125_Rust_Driver_Implementation_Plan.md#63-sk_buff-and-dma-ownership-at-the-ffi-boundary) |
 | cshim contract | The 38-symbol bridge the driver consumes | [`src/netdev_bridge.h`](../src/netdev_bridge.h) |
-| M5 close-out | Soak evidence + suspend/resume + ASPM L1 | [`docs/M5_CLOSEOUT.md`](M5_CLOSEOUT.md) |
+| M5 close-out | Soak evidence + suspend/resume + ASPM L1 | [`docs/HARDENING_CLOSEOUT.md`](HARDENING_CLOSEOUT.md) |
 | M6 #1 MSI-X | Before/after with rollback path | [`docs/perf/m6_msix_before_after.md`](perf/m6_msix_before_after.md) |
 | M6 #2 jumbo | Before/after + TSO/CSUM auto-drop | [`docs/perf/m6_jumbo_before_after.md`](perf/m6_jumbo_before_after.md) |
 | CI gates | 22 static gates that catch our recurring failure modes | [`ci/run_checks.sh`](../ci/run_checks.sh) |
@@ -92,7 +92,7 @@ abstractions yet.
 
 The cshim is *thin in LOC but thick in contract* — that's
 deliberate. The audit in
-[`M7_CSHIM_KERNEL_DIFF.md`](M7_CSHIM_KERNEL_DIFF.md) identified
+[`CSHIM_KERNEL_DIFF.md`](CSHIM_KERNEL_DIFF.md) identified
 **7 invariants we encode that kernel C permits relaxing**. Each
 one prevents a real bug class we have either experienced in this
 project or seen in r8169's history:
@@ -155,7 +155,7 @@ chip-specific lifecycle** — would stay in Rust + small chip-side
 shim, which is the same shape every C netdev driver has.
 
 **Caveat on the ~950 LOC figure**: per the `kernel::block` case
-study ([`M7_BLOCK_CADENCE.md`](M7_BLOCK_CADENCE.md)), Rust kernel
+study ([`BLOCK_CADENCE.md`](BLOCK_CADENCE.md)), Rust kernel
 abstractions reach merge in a "prerequisites land separately, then
 the subsystem-specific patches collapse to a small final series"
 shape. block::'s RFC was 11 patches; the series that actually
@@ -190,7 +190,7 @@ questions we want answered are:
 > proposing Rust abstractions for `net_device` / `napi_struct` /
 > `sk_buff`. FUJITA Tomonori's 2023 v2 series stalled and the
 > only `rust/kernel/net/` content shipped in 7.1-rc5 is `phy/`.
-> Survey details in `docs/M7_RUST_NETDEV_LANDSCAPE.md`.
+> Survey details in `docs/RUST_NETDEV_LANDSCAPE.md`.
 > Is there in-progress work we missed — anything `block::`-style
 > for netdev that hasn't reached the lists yet, or that's in an
 > off-list branch you'd want us to align with?
@@ -307,7 +307,7 @@ the mailing list:
 - [x] Search `lore.kernel.org/rust-for-linux` for
       `net_device`/`skb`/`napi` in 2025–2026 and read every
       thread end-to-end. **Done 2026-05-29**, results in
-      [`M7_RUST_NETDEV_LANDSCAPE.md`](M7_RUST_NETDEV_LANDSCAPE.md):
+      [`RUST_NETDEV_LANDSCAPE.md`](RUST_NETDEV_LANDSCAPE.md):
       no active series; FUJITA Tomonori's 2023 v2 net_device
       proposal stalled, and `rust/kernel/net/` in 7.1-rc5 ships
       only `phy/`. Our Q1 is well-posed.
@@ -319,7 +319,7 @@ the mailing list:
       cadence and maintainer-feedback shape. block:: landed
       most recently and is the closest analogue. **Done
       2026-05-29**, results in
-      [`M7_BLOCK_CADENCE.md`](M7_BLOCK_CADENCE.md): 15-month
+      [`BLOCK_CADENCE.md`](BLOCK_CADENCE.md): 15-month
       RFC→merge, two-author RFC, 11→3 patch-stack collapse,
       Axboe verbal endorsement, scale-anxiety from other
       subsystem maintainers. Adjusts our timeline estimate
@@ -330,7 +330,7 @@ the mailing list:
       + `include/linux/netdevice.h` lifecycle commentary).
       Anything we encode that the C side doesn't enforce is a
       candidate question to raise explicitly. **Done 2026-05-29**,
-      results in [`M7_CSHIM_KERNEL_DIFF.md`](M7_CSHIM_KERNEL_DIFF.md):
+      results in [`CSHIM_KERNEL_DIFF.md`](CSHIM_KERNEL_DIFF.md):
       7 deliberate over-enforcements identified (with rationale
       + bug-class each prevents), 5 kernel-C demands verified
       satisfied (no real bugs found). The §6.3 invariant +
@@ -344,12 +344,12 @@ draft.
 
 ## Cross-references
 
-- `docs/M7_PREP.md` — internal research dossier this file
+- `docs/PREP.md` — internal research dossier this file
   derives from; do not link from the outbound message but keep
   reachable for our own reviewers.
 - `docs/RTL8125_Rust_Driver_Implementation_Plan.md` §7 M7 — the
   authoritative plan section.
-- `docs/M5_CLOSEOUT.md` — soak sign-off, cited inline above.
+- `docs/HARDENING_CLOSEOUT.md` — soak sign-off, cited inline above.
 - `docs/perf/m6_msix_before_after.md`,
   `docs/perf/m6_jumbo_before_after.md` — M6 #1/#2 evidence.
 - [`docs/perf/r8169_comparison.md`](perf/r8169_comparison.md) — the

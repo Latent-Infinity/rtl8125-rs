@@ -12,7 +12,7 @@
 //! device exposes a capability list, which is the only ASPM bit we can
 //! capture in pure safe Rust today.
 //!
-//! ## What does NOT work today (recorded gap — plan §13)
+//! ## What does NOT work today (recorded gap)
 //!
 //! Walking the PCI capability list to find the PCIe capability requires
 //! **runtime** offsets (each `next` pointer is read at runtime), and

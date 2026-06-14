@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0
-//! Per-revision chip identification + reset sequence (plan §3.1, §7 M2).
+//! Per-revision chip identification + reset sequence.
 //!
 //! ## Identification
 //!
 //! Mirrors r8169's `rtl8169_get_chip_version`:
 //! `xid = (TxConfig >> 20) & 0xfcf`, then table-matched by
-//! `(xid & mask) == val`. M2 hard-codes a one-entry table (RTL8125B XID
-//! 0x641 = `RTL_GIGA_MAC_VER_63`) — the only chip on the validated MS-A2.
+//! `(xid & mask) == val`. The driver hard-codes a one-entry table (RTL8125B
+//! XID 0x641 = `RTL_GIGA_MAC_VER_63`) — the only chip on the validated MS-A2.
 //! Other XIDs return `None`, and `pci::Driver::probe` turns that into
-//! `-ENODEV`. **No silent fallback** (plan §7 M2 gate).
+//! `-ENODEV`. **No silent fallback.**
 //!
 //! ## Reset
 //!
@@ -17,7 +17,7 @@
 //! If the poll times out, the BAR mapping (via `Devres<Bar>`) and the PCI
 //! device reference (via `ARef<pci::Device>`) drop on the error path,
 //! leaving the hardware in a state where another driver (r8169) can rebind
-//! cleanly — the plan §7 M2 "failed reset path is recoverable" requirement.
+//! cleanly — the "failed reset path is recoverable" requirement.
 //!
 //! The `inject_timeout` argument is the module-parameter-driven failure
 //! injection knob; when true the `set_chip_cmd` write is suppressed so the
@@ -33,7 +33,7 @@ use crate::regs;
 /// MAC version naming kept aligned with r8169's `RTL_GIGA_MAC_VER_*` enum so
 /// future cross-references stay obvious. Only the variants this driver
 /// actually supports are listed; expanding the list is the supported way to
-/// add a new sub-revision (and gets the strictest review per plan §9).
+/// add a new sub-revision (and gets the strictest review).
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum MacVersion {
     /// RTL8125B (XID 0x641 / `RTL_GIGA_MAC_VER_63` in r8169).
@@ -61,7 +61,7 @@ pub(crate) struct ChipInfo {
     pub(crate) max_mtu: usize,
 }
 
-/// Known-chip dispatch table — M2 carries only the validated entry. Adding
+/// Known-chip dispatch table — carries only the validated entry. Adding
 /// a row here is the supported way to support a new RTL8125 sub-revision.
 pub(crate) const KNOWN: &[ChipInfo] = &[ChipInfo {
     mask: 0x7cf,
@@ -101,9 +101,9 @@ fn wait_mac_ocp_e00e_clear(regs: &Regs<'_>) -> Result<()> {
 /// (RTL8125B). This is the minimum MAC OCP / MMIO init sequence required
 /// for the 8125B's TX and RX engines to actually move packets — without
 /// it, ChipCmd RX|TX enable appears to take effect but the engines are
-/// silent. The M4-perf follow-up also carries r8169's single-queue and
-/// PCIe power-state setup so the chip is in the same baseline state before
-/// SG/TSO experiments.
+/// silent. This also carries r8169's single-queue and PCIe power-state
+/// setup so the chip is in the same baseline state before SG/TSO
+/// experiments.
 ///
 /// Sequence in source-of-truth order so cross-referencing with r8169 is
 /// trivial. Every line is a direct port from r8169_main.c
@@ -140,14 +140,14 @@ fn hw_start_8125b_unlocked(regs: &Regs<'_>) -> Result<()> {
     let cfg1 = regs.config1();
     regs.set_config1(cfg1 & !0x10);
 
-    // M4-perf phase 2 / TSO: disable ASPM in Config5 (clear ASPM_en bit 0).
+    // TSO: disable ASPM in Config5 (clear ASPM_en bit 0).
     // r8169 `rtl_hw_aspm_clkreq_enable(false)` clears this before TX bring-
     // up so the PCIe link doesn't enter L1 during transmit bursts. Pair
     // with the L1-exit-trigger OCP write below — together they keep the
     // chip's TX FIFO and PCIe link awake when TSO is generating MSS-
     // sized segments at line rate.
     //
-    // M5 ASPM-soak override: `force_aspm` module-param skips this clear
+    // ASPM-soak override: `force_aspm` module-param skips this clear
     // so the chip can enter L1.x during the historical L1.x lockup
     // soak. Production must keep this disabled (TSO depends on it).
     let force_aspm = *crate::module_parameters::force_aspm.value() != 0;
@@ -201,7 +201,7 @@ fn hw_start_8125b_unlocked(regs: &Regs<'_>) -> Result<()> {
     let misc = regs.misc();
     regs.set_misc(misc & !regs::MISC_RXDV_GATED_EN);
 
-    // M6 #2 — chip-side `RxMaxSize` sized to match the jumbo-capable
+    // Chip-side `RxMaxSize` sized to match the jumbo-capable
     // RX pool. The descriptor LEN field is 14 bits (`DESC_LEN_MASK`)
     // so `JUMBO_16K_BYTES - 1 = 0x3FFF` is the chip-encodable maximum
     // and the chip's drop threshold sits above any MTU we'd advertise
@@ -210,7 +210,7 @@ fn hw_start_8125b_unlocked(regs: &Regs<'_>) -> Result<()> {
     // FIFO threshold above any plausible frame), and so do we.
     regs.set_rx_max_size(regs::RX_MAX_SIZE_JUMBO);
 
-    // M4-perf phase 2 (task #49): write the TX engine's DMA burst +
+    // Write the TX engine's DMA burst +
     // InterFrameGap config. r8169 calls `rtl_set_tx_config_registers`
     // at the end of `rtl_hw_start` for this. Without it, default reset
     // values starve the TX FIFO under TSO bursts (manifest: massive
@@ -229,7 +229,7 @@ fn hw_start_8125b_unlocked(regs: &Regs<'_>) -> Result<()> {
         regs::MAC_OCP_L1_EXIT_TRIGGERS_MASK,
     );
 
-    // M6 sub-feature #1 Phase A.2 — chip-side V2 activation has moved
+    // Chip-side V2 activation has moved
     // to `ndo_open` (immediately after `set_chip_cmd(RX|TX)`), where it
     // can read `state.irq_mode()` and `state.use_v2_irq_surface()` and
     // only set `INT_CFG0_ENABLE_8125` when V2 is known-good.
@@ -249,7 +249,7 @@ fn hw_start_8125b_unlocked(regs: &Regs<'_>) -> Result<()> {
 /// Hardware reset — mirrors r8169 `rtl_hw_reset`. Writes `CmdReset` to
 /// `ChipCmd` and polls 100 × 100 µs for the bit to clear. If
 /// `inject_timeout` is true, the early-exit check is suppressed so the poll
-/// always times out (deliberate failure injection for the plan §7 M2 "failed
+/// always times out (deliberate failure injection for the "failed
 /// reset path is recoverable" gate).
 pub(crate) fn reset(regs: &Regs<'_>, inject_timeout: bool) -> Result<()> {
     // Trigger the reset normally either way — skipping the write would make

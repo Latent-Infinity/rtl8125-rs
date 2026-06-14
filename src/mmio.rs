@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 //! Typed MMIO register accessors — the only module outside `unsafe_boundary`
-//! that touches BAR memory (plan §6.1, §6.2, §7 M2 gate). All other modules
+//! that touches BAR memory. All other modules
 //! pass around `&Regs` and call its typed methods rather than reaching into
 //! the `pci::Bar` themselves.
 //!
-//! At M2 the typed surface is intentionally small: `tx_config()` for the
+//! The typed surface started intentionally small: `tx_config()` for the
 //! revision-detect path and `chip_cmd()` / `set_chip_cmd()` for the reset
-//! path. M3+ will add register groups (descriptors, MAC address, IRQ status,
-//! …) here as new typed accessors.
+//! path. Later work added register groups (descriptors, MAC address, IRQ
+//! status, …) here as new typed accessors.
 //!
 //! All accesses go through the kernel's safe `pci::Bar` wrappers
 //! (`read8`/`read32`/etc), so this module needs no `unsafe`.
@@ -42,7 +42,7 @@ impl<'a> Regs<'a> {
         self.bar.read32(regs::TX_CONFIG)
     }
 
-    /// Write `TxConfig` — DMA burst + InterFrameGap (M4-perf phase 2).
+    /// Write `TxConfig` — DMA burst + InterFrameGap.
     /// Mirrors r8169 `rtl_set_tx_config_registers`. Required at open
     /// time for TSO to operate without TX FIFO starvation.
     pub(crate) fn set_tx_config(&self, value: u32) {
@@ -54,9 +54,9 @@ impl<'a> Regs<'a> {
         self.bar.read8(regs::CHIP_CMD)
     }
 
-    /// Write `ChipCmd` (offset 0x37, 1-byte). M2 only ever writes
-    /// `regs::CMD_RESET` here; M3+ will read-modify-write to preserve TX/RX
-    /// enable bits during the packet path.
+    /// Write `ChipCmd` (offset 0x37, 1-byte). The reset path only ever writes
+    /// `regs::CMD_RESET` here; the packet path read-modify-writes to preserve
+    /// TX/RX enable bits.
     pub(crate) fn set_chip_cmd(&self, value: u8) {
         self.bar.write8(value, regs::CHIP_CMD);
     }
@@ -97,7 +97,7 @@ impl<'a> Regs<'a> {
         self.bar.write8(regs::CFG9346_LOCK, regs::CFG9346);
     }
 
-    // ── M4 hot-path accessors ─────────────────────────────────────────────
+    // ── hot-path accessors ────────────────────────────────────────────────
 
     /// Program the TX ring base address (TNPDS — low 32 bits then high 32).
     pub(crate) fn set_tx_ring_base(&self, addr: u64) {
@@ -195,7 +195,7 @@ impl<'a> Regs<'a> {
         self.bar.write32(bits, regs::ISR);
     }
 
-    // ── ISR_V2 / IMR_V2 (M6 #1 Phase A.2 — V2 register surface) ─────────
+    // ── ISR_V2 / IMR_V2 (V2 register surface) ───────────────────────────
     //
     // The four methods below are the V2 counterparts of the legacy
     // `isr`/`set_imr`/`ack_isr` window. `ndo_open` selects between the
@@ -317,7 +317,7 @@ impl<'a> Regs<'a> {
         self.bar.write8(value, regs::CONFIG5);
     }
 
-    // ── 8125 multi-queue / RSS disable (M4-perf phase 2 / TSO) ─────────
+    // ── 8125 multi-queue / RSS disable (TSO) ───────────────────────────
 
     /// `RSS_CTRL_8125` (32-bit at 0x4500). Write 0 to disable.
     pub(crate) fn set_rss_ctrl_8125(&self, value: u32) {

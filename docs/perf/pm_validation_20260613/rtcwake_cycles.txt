@@ -1,0 +1,53 @@
+start=23:14:01
+rtcwake: assuming RTC uses UTC ...
+rtcwake: wakeup from "mem" using /dev/rtc0 at Fri Jun 12 23:14:27 2026
+rtcwake_rc=0 resumed=23:14:35
+[173807.675445] PM: suspend entry (deep)
+[173807.687689] Freezing user space processes
+[173807.689035] Freezing user space processes completed (elapsed 0.001 seconds)
+[173807.689080] Freezing remaining freezable tasks
+[173807.690018] Freezing remaining freezable tasks completed (elapsed 0.000 seconds)
+[173816.887422] Restarting tasks: Starting
+[173816.888557] Restarting tasks: Done
+[173816.895428] PM: suspend exit
+RTCWAKE_DONE
+pre-suspend carrier=1 running=y
+pre-suspend traffic:
+rtcwake: assuming RTC uses UTC ...
+rtcwake: wakeup from "mem" using /dev/rtc0 at Fri Jun 12 23:39:57 2026
+rtcwake_rc=0 resumed=23:40:03
+post-resume carrier=1
+post-resume traffic (NO manual up/down):
+--- dmesg (suspend/resume + link + splats) ---
+[175311.753747] PM: suspend entry (deep)
+[175311.788117] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[175313.782286] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[175313.782873] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=true IRQ=70 tx_irq=197 link_irq=202 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x00000000 ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x01 PHYStatus=0x88 tx_dma=0x00000000bac1a000 rx_dma=0x00000000be118000
+[175317.900550] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[175318.859917] PM: suspend exit
+splats=0
+RTCWAKE_UP_DONE
+post-last-resume traffic now: 1.44 Gbits/sec
+rtcwake: assuming RTC uses UTC ...
+rtcwake: wakeup from "mem" using /dev/rtc0 at Fri Jun 12 23:47:25 2026
+cycle 1: carrier=1 traffic=1.42 Gbits/sec
+rtcwake: assuming RTC uses UTC ...
+rtcwake: wakeup from "mem" using /dev/rtc0 at Fri Jun 12 23:47:57 2026
+cycle 2: carrier=1 traffic=1.42 Gbits/sec
+rtcwake: assuming RTC uses UTC ...
+rtcwake: wakeup from "mem" using /dev/rtc0 at Fri Jun 12 23:48:29 2026
+cycle 3: carrier=1 traffic=1.43 Gbits/sec
+total splats across 3 cycles: 0
+CYC_DONE
+loaded vermagic=7.0.0-kasan SMP preempt mod_unload modversions  carrier=1
+rtcwake: assuming RTC uses UTC ...
+rtcwake: wakeup from "mem" using /dev/rtc0 at Sat Jun 13 04:33:15 2026
+post-resume carrier=1 traffic=1.44 Gbits/sec
+[192835.167035] PM: suspend entry (deep)
+[192835.177786] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[192837.162864] r8125_rust: r8125_rust ndo_open complete: mode=Msi use_v2=true IRQ=70 tx_irq=197 link_irq=202 ChipCmd=0x0c ISR=0x00000000 IMR_rb=0x00000000 ISR_v2=0x00000000 IMR_V2_SET_diag=0x00000000 INT_CFG0=0x01 PHYStatus=0x88 tx_dma=0x00000000fdee8000 rx_dma=0x00000000fedf0000
+[192837.163786] r8125_rust 0000:03:00.0 enp3s0: Link is Down
+[192841.299445] r8125_rust 0000:03:00.0 enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+[192842.253020] PM: suspend exit
+splats=0
+FINAL_DONE

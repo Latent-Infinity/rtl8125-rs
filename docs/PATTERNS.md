@@ -449,7 +449,7 @@ gates each next candidate on a specific Gateway measurement.
   [`probe-stack-overflow-task58`](../memory/probe-stack-overflow-task58.md).
 - **Single-author abstraction proposal** — FUJITA Tomonori's 2023
   net_device series stalled at v2 because solo. Plural-author is
-  load-bearing for upstream. See `M7_BLOCK_CADENCE.md`.
+  load-bearing for upstream. See `BLOCK_CADENCE.md`.
 - **Transcribing register bits from secondary references** — the
   INT_CFG0_ENABLE_8125 = BIT(0) vs BIT(3) bisection was caused by
   reading FreeBSD if_re.c instead of the chip vendor's r8125.h.
@@ -482,7 +482,7 @@ copy the named pattern from above:
 ## Cross-references
 
 - [`RTL8125_Rust_Driver_Implementation_Plan.md`](RTL8125_Rust_Driver_Implementation_Plan.md) — the gating authority
-- [`M7_CSHIM_KERNEL_DIFF.md`](M7_CSHIM_KERNEL_DIFF.md) — kernel-C audit of patterns #1, #4, #5, #6
-- [`M7_BLOCK_CADENCE.md`](M7_BLOCK_CADENCE.md) — `kernel::block` calibration; sources of the plural-author finding
+- [`CSHIM_KERNEL_DIFF.md`](CSHIM_KERNEL_DIFF.md) — kernel-C audit of patterns #1, #4, #5, #6
+- [`BLOCK_CADENCE.md`](BLOCK_CADENCE.md) — `kernel::block` calibration; sources of the plural-author finding
 - [`RUST_STANDARDS.md`](RUST_STANDARDS.md) — the project-wide rubric these patterns enact
 - [`POST_SOAK_PLAN.md`](POST_SOAK_PLAN.md) §Tier 4 — schedule for the portability work that completes this extraction

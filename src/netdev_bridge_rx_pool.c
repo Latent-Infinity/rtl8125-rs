@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * netdev_bridge_rx_pool.c — zero-copy RX via page_pool + per-MTU buffer
- *                          sizing for the r8125_rust path (M6 sub-feature
- *                          #2; RX optimization Candidates B + #3).
+ *                          sizing for the r8125_rust path.
  *
  * History / why this shape:
  *
@@ -20,7 +19,7 @@
  *   slot is refilled from the pool with a fresh page (alloc-before-consume
  *   so a refill failure drops the frame but never starves the ring).
  *
- *   Buffers are sized per-MTU (RX Candidate #3): a 1500-MTU frame gets an
+ *   Buffers are sized per-MTU: a 1500-MTU frame gets an
  *   order-0 (4 KiB) page, not a 16 KiB jumbo page. This is not only a
  *   memory win — `build_skb` sets skb->truesize to the whole buffer, and a
  *   16 KiB truesize for a 1.5 KiB frame would throttle TCP receive-memory

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# Runtime invariant check for plan §6.3:
+# Runtime invariant check for the disposition counters:
 #
 #     tx_received == tx_consumed + tx_busy_exception + tx_dropped_error
 #
@@ -10,7 +10,7 @@
 # from inside a guest that has the driver loaded and a peer reachable
 # at $PEER (default 10.0.0.1).
 #
-# Pass criteria (per plan §15 M4 close-out):
+# Pass criteria:
 #   - tx_received - (tx_consumed + tx_busy_exception + tx_dropped_error) == 0
 #     after a >= 1 GiB transfer and a brief quiesce
 #   - rx_handed_to_stack > 0 (RX path exercised)
@@ -41,7 +41,7 @@ if [[ $(cat "/sys/class/net/$IFACE/operstate") != "up" ]]; then
 	sleep 5
 fi
 
-# Snapshot all six §6.3 counters from ethtool -S into shell vars.
+# Snapshot all six disposition counters from ethtool -S into shell vars.
 snapshot() {
 	local prefix=$1
 	while read -r name val; do
@@ -109,12 +109,12 @@ rhs=$((dtx_cons + dtx_busy + dtx_drop))
 gap=$((lhs - rhs))
 
 echo
-echo "§6.3 invariant: tx_received == tx_consumed + tx_busy_exception + tx_dropped_error"
+echo "invariant: tx_received == tx_consumed + tx_busy_exception + tx_dropped_error"
 echo "  $lhs == $rhs  (gap $gap)"
 
 fail=0
 if [[ $gap -ne 0 ]]; then
-	red "FAIL: §6.3 TX invariant violated (gap = $gap, expected 0)"
+	red "FAIL: TX invariant violated (gap = $gap, expected 0)"
 	fail=1
 fi
 if [[ $drx_hand -eq 0 ]]; then
@@ -126,6 +126,6 @@ if [[ $drx_drop -gt 0 ]]; then
 fi
 
 if [[ $fail -eq 0 ]]; then
-	grn "PASS: §6.3 counter invariant holds across ${BYTES} transfer"
+	grn "PASS: counter invariant holds across ${BYTES} transfer"
 fi
 exit "$fail"

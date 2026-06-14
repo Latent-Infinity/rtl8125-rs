@@ -32,7 +32,7 @@ and exits M5 with full code-side coverage of the plan §7 deliverables.
 
 | Item | Status | Where |
 |---|---|---|
-| `suspend` / `resume` PCI callbacks | ⚠️ blocked on upstream | kernel-Rust PCI trait exposes only probe/unbind; see `docs/M5_PM_GAP.md` |
+| `suspend` / `resume` PCI callbacks | ⚠️ blocked on upstream | kernel-Rust PCI trait exposes only probe/unbind; see `docs/PM_GAP.md` |
 | 10× suspend/resume cycles | ⚠️ proxied via FLR | `ci/check_flr_cycle.sh` triggers function-level reset 10×, verifies re-probe |
 | 24-hour ASPM idle soak | ⚠️ operator-time required | `ci/check_aspm_idle_soak.sh` runnable; needs 24h wall-clock |
 
@@ -236,7 +236,7 @@ ssh -i ~/.ssh/agent/rtl8125_gateway_codex firestrand@100.125.107.46 \
 ## Upstream API gap noted
 
 Kernel-Rust `kernel::pci::Driver` does not expose suspend/resume
-hooks. See `docs/M5_PM_GAP.md` for the analysis and remediation path.
+hooks. See `docs/PM_GAP.md` for the analysis and remediation path.
 The FLR-cycle harness (or remove+rescan workaround) is the closest
 substitute today.
 

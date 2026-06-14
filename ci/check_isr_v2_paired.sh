@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# Static gate for M6 MSI-X (plan §7 M6 #1): the ISR_V2 mask
+# Static gate for MSI-X: the ISR_V2 mask
 # manipulation must be paired across hot-path and shutdown so the
 # chip cannot leave the soft state with "no driver listening but
 # IRQ enabled" or vice versa.
@@ -29,13 +29,13 @@ NETDEV="$ROOT/src/netdev.rs"
 NAPI="$ROOT/src/napi.rs"
 
 # Pre-engagement check. V2 surface is scaffolding-only until chip-side
-# INT_CFG0_ENABLE_8125 is set; full pairing checks engage at Phase A.2.
+# INT_CFG0_ENABLE_8125 is set; full pairing checks engage once it is.
 if ! grep -qE '\bset_imr_v2_mask\b' "$MMIO"; then
-	yel "set_imr_v2_mask not yet in src/mmio.rs (M6 MSI-X not landed) — skipping"
+	yel "set_imr_v2_mask not yet in src/mmio.rs (MSI-X not landed) — skipping"
 	exit 0
 fi
 HW="$ROOT/src/hw.rs"
-# Phase A.2 moves the activation out of hw_start_8125b into ndo_open
+# Activation moves out of hw_start_8125b into ndo_open
 # (gated on `state.irq_mode()`). Accept either location.
 if ! grep -hE 'set_int_cfg0\([^)]*INT_CFG0_ENABLE_8125|set_int_cfg0_v2_enable\(true\)' "$HW" "$NETDEV" >/dev/null 2>&1; then
 	yel "V2 surface scaffolded but chip-side activation deferred — pairing checks skipped"

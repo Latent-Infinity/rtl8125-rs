@@ -45,7 +45,7 @@ caused by *this box's current state*, not by flaws in the approach:
    wrong.** ewaldc's git history is 3 commits. The rich ASPM-workaround history
    is in **Realtek-official (99 commits)** + in-source comments. Repoint it.
 
-Detailed M1-entry status: `docs/M1_ENTRY_CRITERIA.md`.
+Detailed M1-entry status: `docs/ENTRY_CRITERIA.md`.
 
 ---
 
@@ -194,4 +194,4 @@ kept here verbatim as the rationale/audit trail for each change.
 
 None of these changed the architecture. The layered Rust-core + audited C-shim
 design, the unsafe-boundary discipline, and the gated milestones all stand. The
-remaining path to M1 is unchanged and is tracked in `docs/M1_ENTRY_CRITERIA.md`.
+remaining path to M1 is unchanged and is tracked in `docs/ENTRY_CRITERIA.md`.

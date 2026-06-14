@@ -187,7 +187,7 @@ When you hit something not in this taxonomy:
   is an item
 - [`PATTERNS.md`](PATTERNS.md) #12 module-param rollback knobs +
   #13 soak harness + #4 §6.3 invariant
-- [`M7_CSHIM_KERNEL_DIFF.md`](M7_CSHIM_KERNEL_DIFF.md) — kernel-C
+- [`CSHIM_KERNEL_DIFF.md`](CSHIM_KERNEL_DIFF.md) — kernel-C
   vs cshim contract that the failure modes here encode
 - [`RTL8125_Rust_Driver_Implementation_Plan.md`](RTL8125_Rust_Driver_Implementation_Plan.md) §6.3
   the disposition-counter contract

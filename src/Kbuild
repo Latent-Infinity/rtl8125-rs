@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: GPL-2.0
 # Composite Kbuild for r8125_rust.ko (Rust + C-shim OOT module).
 #
-# Crate root: r8125_rust.rs (Rust). C bridge: netdev_bridge.c (per plan §5.2
-# / §6.3, providing net_device / NAPI / sk_buff glue that has no stable
-# kernel-Rust API yet). Both objects link into a single r8125_rust.ko.
+# Crate root: r8125_rust.rs (Rust). C bridge: netdev_bridge.c (providing
+# net_device / NAPI / sk_buff glue that has no stable kernel-Rust API yet).
+# Both objects link into a single r8125_rust.ko.
 #
 # Pattern mirrors samples/rust/rust_print (rust_print_main.rs +
 # rust_print_events.c → rust_print.ko). C and Rust components live in the

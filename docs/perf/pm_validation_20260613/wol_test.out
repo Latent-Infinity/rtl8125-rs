@@ -1,0 +1,20 @@
+=== initial (expect Supports: pumbg or g; Wake-on: d) ===
+	Supports Wake-on: g
+	Wake-on: d
+pci power/wakeup initial=disabled
+=== set wol g ===
+set_rc=0
+	Supports Wake-on: g
+	Wake-on: g
+pci power/wakeup after-g=enabled
+=== set wol d (disarm) ===
+set_rc=0
+	Supports Wake-on: g
+	Wake-on: d
+pci power/wakeup after-d=disabled
+=== reject unsupported (wol u) -> expect EINVAL/error ===
+netlink error: cannot enable unsupported WoL mode (offset 36)
+netlink error: Invalid argument
+set_u_rc=75
+splats=0
+WOL_DONE

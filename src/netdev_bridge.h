@@ -1,16 +1,16 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
  * netdev_bridge.h — the canonical Rust ↔ C ownership contract for the
- *                   r8125_rust driver (plan §5.2 / §6.3 / §7 M4).
+ *                   r8125_rust driver.
  *
  * This file is the DELIVERABLE, not its implementation in netdev_bridge*.c.
  * Reviewers compare every `struct sk_buff *`-touching call against the
  * pre/post-conditions stated here. Any change to a function signature or
  * an ownership transition requires updating both this header AND the
  * matching Rust code in `src/skb.rs` / `src/netdev.rs` / `src/napi.rs` in
- * the same commit (plan §6.3 final paragraph).
+ * the same commit.
  *
- * Filename note: the plan §6.1 layout places this file in `cshim/` at the
+ * Filename note: the original layout places this file in `cshim/` at the
  * repo root. We deviate to `src/` because the kernel build's composite-
  * module pattern (used by `samples/rust/rust_print` — main.rs + events.c
  * co-located) requires C and Rust components in the same M= directory.
@@ -42,7 +42,7 @@ struct napi_struct;
  *  Every callback returning `int` returns 0 on success or a negative
  *  errno. `xmit` returns the standard `netdev_tx_t` value:
  *    - NETDEV_TX_OK (0): driver took the skb (queued or freed it).
- *    - NETDEV_TX_BUSY (0x10):  kernel retains the skb. See §6.3.
+ *    - NETDEV_TX_BUSY (0x10):  kernel retains the skb.
  *
  *  Rust implementations must be marked `extern "C"` and `pub`; nothing
  *  else in Rust calls them directly.
@@ -53,10 +53,10 @@ struct r8125_bridge_ops {
 	 * open(priv, feature_flags) — full device bring-up
 	 * ─────────
 	 * Pre   : netdev is registered, RTNL held, device hardware is in
-	 *         the post-reset / post-probe state from probe-time M2.
+	 *         the post-reset / post-probe state from probe time.
 	 * Post  : on success, the device is fully ready to move packets:
 	 *           - hw_start_8125b run (MAC init, INT_CFG, TXCFG,
-	 *             RXCFG_M4_BASELINE, RSS disable, OCP tuning,
+	 *             RXCFG baseline, RSS disable, OCP tuning,
 	 *             L1-exit triggers).
 	 *           - All RX descriptor slots posted with OWN bit set.
 	 *           - IRQ requested through the Rust unsafe-boundary
@@ -67,7 +67,7 @@ struct r8125_bridge_ops {
 	 *             started (carrier-on follows asynchronously when
 	 *             auto-neg completes).
 	 *           - TX queue ready to accept skbs from xmit (subject
-	 *             to the §6.3 NETDEV_TX_BUSY ring-full guard).
+	 *             to the NETDEV_TX_BUSY ring-full guard).
 	 *         The kernel may start calling xmit / poll / change_mtu
 	 *         immediately after open returns 0.
 	 * Return: 0 on success; negative errno on failure. On failure the
@@ -87,18 +87,18 @@ struct r8125_bridge_ops {
 	 *         have either reached `bridge_skb_consume_tx` (the normal
 	 *         path) or been `dev_kfree_skb_any`'d. All RX buffers have
 	 *         been recycled or freed. NAPI is disabled. IRQ is freed.
-	 *         Per §6.3 the `tx_received == tx_consumed + tx_busy_exception
+	 *         The `tx_received == tx_consumed + tx_busy_exception
 	 *         + tx_dropped_error` invariant must hold after this returns.
 	 */
 	void (*stop)(void *priv);
 
 	/*
-	 * xmit(priv, skb) — TX path entry, §6.3 contract holds
+	 * xmit(priv, skb) — TX path entry, ownership contract holds
 	 * ───────────────
 	 * Pre   : kernel hands `skb` ownership to driver. Driver MUST dispose
 	 *         in EXACTLY ONE of:
 	 *           (a) NETDEV_TX_OK + skb mapped + queued + posted to ring
-	 *                 → §6.3 slot transition `Empty → Submitted`,
+	 *                 → slot transition `Empty → Submitted`,
 	 *                   counter `tx_received++`.
 	 *           (b) NETDEV_TX_BUSY + skb UNTOUCHED (not freed, not mapped,
 	 *               not stored) — kernel will requeue. Counter
@@ -260,8 +260,8 @@ struct r8125_tally {
 /* ──────────────────────────────────────────────────────────────────────
  *  Lifecycle: alloc → register → … → unregister_and_free.
  *
- *  Allocation accounting (§6.3 invariant) is initialised in the alloc
- *  call; `r8125_bridge_counters_snapshot` exposes the running totals.
+ *  Allocation accounting (the TX disposition invariant) is initialised in
+ *  the alloc call; `r8125_bridge_counters_snapshot` exposes the running totals.
  * ──────────────────────────────────────────────────────────────────────
  */
 
@@ -298,7 +298,7 @@ void r8125_bridge_unregister_and_free(struct net_device *ndev);
 /*
  * Pin the MSI-X (or MSI/INTx) vector `irq` to `cpu` via
  * `irq_set_affinity_and_hint`. Latency-aligned default
- * (Candidate L of RX_OPTIMIZATION_CANDIDATES.md). Returns 0 on
+ * (RX_OPTIMIZATION_CANDIDATES.md). Returns 0 on
  * success or a negative errno; the kernel auto-clears the hint at
  * `free_irq`.
  */
@@ -328,12 +328,12 @@ void r8125_bridge_dma_rmb(void);
 void r8125_bridge_dma_wmb(void);
 
 /* ──────────────────────────────────────────────────────────────────────
- *  Flow-control + NAPI-arming helpers — the §6.3 invariants live here.
+ *  Flow-control + NAPI-arming helpers — the TX disposition invariants live here.
  * ──────────────────────────────────────────────────────────────────────
  */
 
 /* Stop the TX queue. Call from xmit BEFORE the ring fills, NOT in the
- * NETDEV_TX_BUSY hot path (see §6.3). Safe from xmit context.
+ * NETDEV_TX_BUSY hot path. Safe from xmit context.
  */
 void r8125_bridge_tx_stop_queue(struct net_device *ndev);
 
@@ -386,6 +386,13 @@ void r8125_bridge_dev_addr(struct net_device *ndev, unsigned char out[ETH_ALEN])
  */
 int r8125_bridge_reopen(struct net_device *ndev);
 
+/* System-sleep PM (called from the Rust pci::Driver suspend/resume callbacks).
+ * suspend: detach + quiesce if up; resume: re-init + attach if it was up. The
+ * PCI core handles config save/restore + D-state around these.
+ */
+void r8125_bridge_pm_suspend(struct net_device *ndev);
+int r8125_bridge_pm_resume(struct net_device *ndev);
+
 /* Link-state helpers — Rust calls these after detecting carrier change. */
 void r8125_bridge_carrier_on(struct net_device *ndev);
 void r8125_bridge_carrier_off(struct net_device *ndev);
@@ -395,7 +402,7 @@ void r8125_bridge_tx_disable(struct net_device *ndev);
 
 /* ──────────────────────────────────────────────────────────────────────
  *  sk_buff helpers — Rust never dereferences `struct sk_buff` directly.
- *  Every read/write goes through one of these (plan §6.3, type-state).
+ *  Every read/write goes through one of these (type-state).
  *
  *  Each helper documents the counter side-effect; the Rust type-state
  *  in `src/skb.rs` mirrors these into `TxSkb<S>` transitions.
@@ -409,12 +416,12 @@ void r8125_bridge_skb_dma_unmap_frag_tx(struct device *dev,
 					dma_addr_t handle, size_t len);
 
 /* ──────────────────────────────────────────────────────────────────────
- *  Jumbo RX-pool: per-slot streaming-DMA allocator (M6 sub-feature #2).
+ *  Jumbo RX-pool: per-slot streaming-DMA allocator.
  *
  *  The earlier 2 KiB coherent-ring design used one allocation sized for
  *  256 slots. This design uses `page_pool` because fragmented systems
  *  cannot reliably allocate 4 MiB contiguous DMA-coherent memory.
- *  These helpers own the zero-copy RX buffer lifecycle (M6 #2 v3): a
+ *  These helpers own the zero-copy RX buffer lifecycle: a
  *  per-MTU page_pool at ndo_open, with napi_build_skb delivery +
  *  page recycling. Implementation: netdev_bridge_rx_pool.c.
  *
@@ -433,8 +440,8 @@ void r8125_bridge_rx_free(struct net_device *ndev, unsigned int queue_id,
 			  void *cpu);
 
 /*
- * `r8125_bridge_rx_one_packet` — zero-copy RX super-call (Candidate B +
- * per-MTU #3, docs/RX_OPTIMIZATION_CANDIDATES.md). Hands the received page
+ * `r8125_bridge_rx_one_packet` — zero-copy RX super-call
+ * (docs/RX_OPTIMIZATION_CANDIDATES.md). Hands the received page
  * to the stack via napi_build_skb + skb_mark_for_recycle (no copy), and
  * refills the slot alloc-before-consume from the pool. Outputs the slot's
  * refilled (cpu, dma); on a refill-failure drop they equal the inputs.
@@ -451,7 +458,7 @@ void r8125_bridge_rx_one_packet(struct net_device *ndev,
  * etc.). Counter: tx_dropped_error++. Calls `dev_kfree_skb_any` exactly
  * once; the skb pointer is invalid after this call.
  *
- * This is the §6.3 "(c) drop_with_error" disposition.
+ * This is the "(c) drop_with_error" disposition.
  */
 void r8125_bridge_skb_free_error(struct sk_buff *skb);
 
@@ -470,7 +477,7 @@ bool r8125_bridge_netif_running(struct net_device *ndev);
 int  r8125_bridge_reopen_for_mtu(struct net_device *ndev, int new_mtu);
 
 /* ──────────────────────────────────────────────────────────────────────
- *  HW checksum offload (M4-perf, task 48).
+ *  HW checksum offload.
  *
  *  The Rust ndo_start_xmit / napi::poll paths don't peek into sk_buff
  *  internals; the cshim does the protocol introspection and tells the
@@ -517,7 +524,7 @@ void r8125_bridge_skb_rx_csum_set(struct sk_buff *skb, u32 desc_opts1);
 void r8125_bridge_account_tx(struct net_device *ndev, unsigned int bytes);
 
 /* ──────────────────────────────────────────────────────────────────────
- *  Scatter-gather TX + TSO (M4-perf phase 2, task #49).
+ *  Scatter-gather TX + TSO.
  *
  *  For multi-fragment skbs we post one descriptor per
  *  (linear-head + each paged frag); the chip walks them from FirstFrag
@@ -571,7 +578,7 @@ void r8125_bridge_netdev_completed_queue(struct net_device *ndev,
 					 unsigned int pkts, unsigned int bytes);
 
 /* ──────────────────────────────────────────────────────────────────────
- *  Counter snapshot — §6.3 invariant `tx_received == tx_consumed +
+ *  Counter snapshot — the invariant `tx_received == tx_consumed +
  *  tx_busy_exception + tx_dropped_error`. CI smoke test reads this at
  *  quiesce and asserts.
  * ──────────────────────────────────────────────────────────────────────
@@ -592,7 +599,7 @@ void r8125_bridge_counters_snapshot(struct net_device *ndev,
 				    struct r8125_bridge_counters *out);
 
 /* ──────────────────────────────────────────────────────────────────────
- *  PHY plumbing (plan §7 M4-traffic, task #46).
+ *  PHY plumbing.
  *
  *  The cshim owns the kernel-side MDIO bus + `struct phy_device` (the
  *  Rust crate does not expose these surfaces yet). Rust supplies the

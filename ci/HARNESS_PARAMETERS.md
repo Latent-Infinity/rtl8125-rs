@@ -49,7 +49,7 @@ bash ci/check_active_soak.sh
   `force_aspm=1` module-side activation)
 - `ci/check_aspm_both_soaks.sh` — orchestrator running both above
   back-to-back
-- `ci/check_counter_invariant.sh` — runtime §6.3 invariant check
+- `ci/check_counter_invariant.sh` — runtime counter-invariant check
   (positional args also accepted for back-compat:
   `check_counter_invariant.sh <iface> <peer>`)
 - `ci/check_rmmod_while_up.sh` — rmmod-under-traffic stress loop
@@ -57,7 +57,7 @@ bash ci/check_active_soak.sh
 ## What is NOT parameterized (and won't be without good reason)
 
 - **Per-CPU counter names** (`tx_received` etc.) — these are the
-  §6.3 contract; if the next driver renames them, it's a different
+  counter contract; if the next driver renames them, it's a different
   invariant. Don't templatize.
 - **Module name** (`r8125_rust`) — every script targets this
   specific module. Renaming per project is a one-line per-script

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
-//! NAPI poll body — plan §7 M4 (initial), §7 M5 (hardening).
+//! NAPI poll body.
 //!
-//! ## NAPI contract this body must satisfy (plan §7 M5)
+//! ## NAPI contract this body must satisfy
 //!
 //! 1. **`budget == 0`** is an explicit "TX cleanup only" call:
 //!    the kernel uses it to drain TX completions without consuming RX
@@ -45,8 +45,8 @@ const RX_HASH_INFO_L4_BIT: u64 = 1u64 << 62;
 const RX_HASH_INFO_ENABLED_BIT: u64 = 1u64 << 61;
 const RX_HASH_INFO_VALUE_MASK: u64 = 0xFFFF_FFFF;
 
-// Per-descriptor RX length advertised to the chip is now per-MTU (M6 #2
-// v3): the pool's device-writable `buf_len` (already ≤ `DESC_LEN_MASK`,
+// Per-descriptor RX length advertised to the chip is now per-MTU:
+// the pool's device-writable `buf_len` (already ≤ `DESC_LEN_MASK`,
 // the 14-bit descriptor field). It's read once per poll from
 // the selected queue's `buf_len` and reused for both the frame-length clamp
 // and the descriptor LEN field — see `process_rx_completions`.
@@ -122,12 +122,11 @@ fn process_rx_completions(state: &NetdevState, queue_id: u32, budget_u: usize) -
     };
     let mut work_done = 0usize;
     let mut rx_tail = rx.tail.inner.load(Ordering::Acquire);
-    // Candidate F (RX_OPTIMIZATION_CANDIDATES.md §F): hoist the
-    // `ndev` atomic load out of the per-packet loop. `ndev` is
+    // Hoist the `ndev` atomic load out of the per-packet loop. `ndev` is
     // invariant across the whole NAPI poll call — load it once.
     let ndev = state.ndev.load(Ordering::Acquire);
     let rx_hash_enabled = state.rx_hash_enabled.load(Ordering::Relaxed);
-    // Per-MTU buffer length for this open (M6 #2 v3): drives both the
+    // Per-MTU buffer length for this open: drives both the
     // frame-length clamp and the descriptor LEN field. Invariant across
     // the poll, so load once. Already ≤ DESC_LEN_MASK (the cshim caps it).
     let buf_len = rx.buf_len.load(Ordering::Relaxed);
@@ -161,13 +160,13 @@ fn process_rx_completions(state: &NetdevState, queue_id: u32, budget_u: usize) -
         let slot_dma = rx.slot_dma[rx_tail].load(Ordering::Relaxed);
         let mut post_dma = slot_dma;
         if len > 0 {
-            // RX super-call (RX_OPTIMIZATION_CANDIDATES.md §B + per-MTU #3):
+            // RX super-call (zero-copy + per-MTU):
             // zero-copy napi_build_skb + page-pool recycle, with
             // alloc-before-consume refill. The received page is handed to
             // the stack (no copy) and the slot is refilled with a fresh
             // page; the call returns the slot's new (cpu, dma). On a refill
             // failure it drops the frame and returns the old (cpu, dma)
-            // unchanged. The cshim handles all §6.3 counter accounting.
+            // unchanged. The cshim handles all counter accounting.
             let slot_cpu = rx.slot_cpu[rx_tail].load(Ordering::Relaxed);
             let hash_info = if !rx_hash_enabled {
                 0
@@ -235,7 +234,7 @@ fn process_rx_completions(state: &NetdevState, queue_id: u32, budget_u: usize) -
 /// DMA mapping and `napi_consume_skb` the LastFrag-slot skb. Returns
 /// `(advanced_tail, head_snapshot, reaped_count)`. The caller is
 /// responsible for storing the new tail and the wake-queue hysteresis —
-/// keeping that in `poll` proper preserves the §7 M5 ordering check
+/// keeping that in `poll` proper preserves the ordering check
 /// (`tx_tail` stored before any `bridge_tx_wake_queue`).
 fn process_tx_completions(state: &NetdevState) -> (usize, usize, usize) {
     let mut tx_tail = state.tx.tail.inner.load(Ordering::Acquire);
@@ -255,7 +254,7 @@ fn process_tx_completions(state: &NetdevState) -> (usize, usize, usize) {
             // Hardware still owns this slot — stop here.
             break;
         }
-        // M4-perf phase 2 (SG): every descriptor in a logical packet has
+        // SG: every descriptor in a logical packet has
         // its own DMA mapping that must be unmapped here. The skb pointer
         // is in the LastFrag slot only; intermediate frags get null.
         let map_addr = state.tx.shadow_dma[slot].load(Ordering::Acquire);
@@ -333,10 +332,10 @@ fn process_tx_completions(state: &NetdevState) -> (usize, usize, usize) {
 /// stack in this round; we also reap as many TX completions as available.
 ///
 /// Returns `work_done` in `[0, budget]`. See the module docstring for
-/// the §6.3 / §7-M5 contract this function must satisfy.
+/// the contract this function must satisfy.
 pub(crate) fn poll(state: &NetdevState, queue_id: u32, budget: c_int) -> c_int {
     crate::netdev::note_napi_poll(state);
-    // `budget == 0` is the explicit "TX-cleanup only" path (plan §7 M5).
+    // `budget == 0` is the explicit "TX-cleanup only" path.
     // The kernel uses it during netpoll / netconsole and during certain
     // shutdown sequences. We skip the RX loop entirely (no skb-build,
     // no GRO, no page-pool touches) and DO NOT call napi_complete_done
@@ -386,7 +385,7 @@ pub(crate) fn poll(state: &NetdevState, queue_id: u32, budget: c_int) -> c_int {
 
     let work_done = work_done as c_int;
     if work_done < budget {
-        // See module docstring for the §7 M5 contract: `budget == 0`
+        // See module docstring for the contract: `budget == 0`
         // falls through this branch (0 < 0 is false) so we don't
         // call complete_done in the TX-cleanup-only path.
         let ndev = state.ndev.load(Ordering::Acquire);

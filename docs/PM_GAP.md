@@ -1,5 +1,13 @@
 # Kernel-Rust PCI PM — upstream API gap
 
+> **RESOLUTION (2026-06-13): implemented + hardware-validated as a cfg-gated
+> prototype.** The kernel-Rust PCI PM API extension and the driver's
+> `suspend`/`resume` callbacks are written, build cleanly, and were validated on
+> the gateway across **6 `rtcwake -m mem` suspend/resume cycles** (interface
+> down + up + 3-cycle loop + a final cfg-gated confirm): every resume restores
+> carrier and resumes traffic (~1.44 Gbit/s) **with no manual `ip link`
+> up/down**, **0 KASAN/lockdep splats**. See "Resolution" at the bottom.
+
 **Status (2026-05-26): blocked on upstream**. Kernel-Rust's
 `kernel::pci::Driver` trait (`rust/kernel/pci.rs` as of Linux 7.0) exposes
 only `probe` and `unbind` — there is no Rust-side hook for `.suspend`,
@@ -125,3 +133,90 @@ path arming PCI wake — so WoL lands with pm_ops, not before.
 **Scope:** this is the "split the upstream API work" effort the plan calls for —
 a kernel-Rust patch + 2 kernel rebuilds + a suspend/resume validation cycle —
 best done as its own focused pass, not mixed into the ethtool feature commits.
+
+---
+
+## Resolution (2026-06-13)
+
+Implemented exactly as Option 1, with a build gate so the driver still compiles
+against a **stock** (unextended) kernel — the whole point of keeping it
+upstreamable.
+
+### Two contributions, kept separate
+
+1. **Kernel-Rust PCI PM API** — `kernel-patches/0001-rust-pci-add-pm-callbacks.patch`.
+   Adds default-no-op `suspend`/`resume` to the `pci::Driver` trait, a
+   `suspend_callback`/`resume_callback` + `const PM_OPS: dev_pm_ops` on
+   `Adapter<T>`, and sets `pdrv->driver.pm = &Self::PM_OPS` in `register()`.
+   This is the upstream RfL contribution and must land before the driver side
+   can be enabled on a stock tree.
+2. **Driver `suspend`/`resume`** — in-tree, but gated on the `r8125_pci_pm`
+   cfg (built only with `make PCI_PM=1`; compiled out of the default build):
+   - `src/pci.rs`: `R8125Driver::suspend`/`resume` → cshim PM helpers.
+   - `src/unsafe_boundary.rs`: `bridge_pm_suspend`/`_resume` safe wrappers
+     (+ extern decls) — census 76 → 78.
+   - `src/netdev.rs`: `NetdevHandle::ndev()` accessor.
+   - `src/netdev_bridge.c`: `r8125_bridge_pm_{suspend,resume}` (RTNL +
+     netif_device_detach/attach around the existing ndo_stop/open). `resume`
+     returns `int` and only `netif_device_attach`es on a successful reopen — a
+     failed re-init propagates through `bridge_pm_resume` → `Driver::resume` as
+     an error rather than reattaching a dead interface.
+
+### Build gate
+
+`make` (default) compiles PM **out** — stock-kernel + upstream-safe, CI builds
+this. `make PCI_PM=1` compiles PM **in** — requires a kernel carrying patch
+0001. The Makefile always passes `-A unexpected_cfgs` so the custom cfg name is
+clean under `CONFIG_WERROR` (the parenthesised `--check-cfg` form is unusable
+because the kernel rustc recipe runs flags through a shell). When the kernel
+API lands upstream, drop the cfg gate and make the callbacks unconditional.
+
+### Release modes — what a given build actually ships
+
+The cfg gate means PM is **not** in the default artifact. Be explicit about
+which of the two supported builds you are shipping:
+
+| Build | Kernel | PM in `.ko`? | Status |
+|-------|--------|--------------|--------|
+| `make` (default) | stock | **no** | system-sleep PM is a **known gap** — the PCI core still does its default config-save/D-state, but the driver has no `suspend`/`resume`. This is the upstream-submission build. |
+| `make PCI_PM=1` | patched with `kernel-patches/0001` | **yes** | full driver suspend/resume, validated. This is the only build that should be described as "has PM". |
+
+Do not describe a default-build artifact as having driver PM. Until the
+kernel-Rust PCI PM API lands upstream, "PM shipped" means *patched kernel +
+`PCI_PM=1`*; otherwise PM remains the documented gap above.
+
+### Validation (gateway, 7.0.0-kasan, KASAN+lockdep+kmemleak+DMA_API_DEBUG)
+
+`rtcwake -m mem -s N` (RTC auto-wake; a headless box has no working WoL yet to
+wake it otherwise). dmesg per cycle: `PM: suspend entry (deep)` → our callback
+`Link is Down` → resume `ndo_open complete` → `Link is Up - 2.5Gbps/Full` →
+`PM: suspend exit`. Interface-down cycle no-ops cleanly (callback sees
+`!netif_running`). 6 cycles, 0 splats, traffic resumes every time.
+
+### WoL — NOT advertised (chip-arming sequence prototyped, not wired)
+
+**Decision (2026-06-13): the ethtool WoL surface is intentionally not wired.**
+An earlier pass implemented + validated the magic-packet chip arming (Cfg9346 →
+OCP 0xC0B6 BIT0 → Config3.MagicPacket), and `ethtool -s wol g/d` round-tripped
+on the gateway (`Wake-on: g`, PCI `power/wakeup=enabled`; unsupported modes
+rejected). That validated only the *arming*, not an actual wake — and the
+end-to-end wake has two unmet prerequisites, so advertising `WAKE_MAGIC` would
+promise a wake the driver cannot deliver. The surface was therefore reverted;
+`get_wol`/`set_wol` are tracked **PLANNED** in the surface inventory. The
+arming-validation evidence is kept at
+`docs/perf/pm_validation_20260613/wol_test.out` for the follow-up.
+
+**Prerequisites for advertising `WAKE_MAGIC` (both must be met):**
+
+1. *Suspend keeps the PHY alive.* The current PM suspend path runs the full
+   `ndo_stop` (phy_stop), so the link drops in S3 and a magic packet can't be
+   received. A real wake needs the vendor `powerdown_pll(from_suspend)`
+   behaviour — renegotiate to a WoL link speed and keep the PHY powered, only
+   when WoL is armed — coupled into the `r8125_pci_pm` suspend path.
+2. *A rig that can test the wake.* The gateway's loopback topology (enp3s0 ↔
+   enp4s0) can't self-test it: during S3 the magic-packet sender sleeps with the
+   box. This needs an **external** sender on enp3s0's L2 segment.
+
+Until both are done and an actual magic-packet wake is observed, WoL stays
+unadvertised. (Vendor C and mainline r8169 both couple WoL programming with the
+suspend/PHY-power path for exactly this reason.)

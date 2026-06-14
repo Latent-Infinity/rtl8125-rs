@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# CI orchestrator (plan §9.4). Runs the mechanical checks that do NOT need the
-# kernel build toolchain (those run in the guest CI job once §15 #3/#4/#5 are
-# green). Designed to pass at M0 and tighten as code lands.
+# CI orchestrator. Runs the mechanical checks that do NOT need the
+# kernel build toolchain (those run in the guest CI job once the
+# validated kernel toolchain is available). Designed to pass early and
+# tighten as code lands.
 set -uo pipefail
 CI="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 rc=0
@@ -59,13 +60,13 @@ echo
 echo "== RTL8125B hardware init parity =="
 bash "$CI/check_hw_init.sh" || rc=1
 echo
-echo "== §6.3 disposition-counter infrastructure (static) =="
+echo "== disposition-counter infrastructure (static) =="
 bash "$CI/check_counter_infrastructure.sh" || rc=1
 echo
-echo "== §15.2 cache-padding convention =="
+echo "== cache-padding convention =="
 bash "$CI/check_cache_padding.sh" || rc=1
 echo
-echo "== M5 NAPI contract (poll budget, IRQ masking, queue hysteresis) =="
+echo "== NAPI contract (poll budget, IRQ masking, queue hysteresis) =="
 bash "$CI/check_napi_contract.sh" || rc=1
 echo
 echo "== RX descriptor stride agreement (read/write/publish vs format) =="
@@ -95,13 +96,13 @@ echo
 echo "== Tier 3c aspm_force_off operator-knob contract =="
 bash "$CI/check_aspm_force_off_param.sh" || rc=1
 echo
-echo "== Latency-aligned discipline (Candidates G, L, M) =="
+echo "== Latency-aligned discipline (TSTATS, IRQ affinity, tx_queue_len) =="
 bash "$CI/check_latency_knobs.sh" || rc=1
 echo
 echo "== soak harness false-pass guards =="
 bash "$CI/check_soak_harness.sh" || rc=1
 echo
-echo "== DMA barriers (RX read + TX/RX publish, Candidate #1) =="
+echo "== DMA barriers (RX read + TX/RX publish) =="
 bash "$CI/check_dma_barriers.sh" || rc=1
 echo
 echo "== checkpatch.pl on cshim (kernel-community style gate) =="
@@ -117,21 +118,21 @@ echo
 echo "== upstream-style selftest shape =="
 bash "$CI/check_selftest_smoke.sh" || rc=1
 echo
-echo "== M6 / RSS design gates =="
+echo "== MSI-X / RSS design gates =="
 bash "$CI/check_msix_static.sh" || rc=1
 bash "$CI/check_isr_v2_paired.sh" || rc=1
 bash "$CI/check_irq_mode_contract.sh" || rc=1
 bash "$CI/check_rx_pool_pages.sh" || rc=1
 bash "$CI/check_jumbo_mtu_chip.sh" || rc=1
 echo
-echo "== §18 kernel-build Clippy gate =="
+echo "== kernel-build Clippy gate =="
 bash "$CI/check_clippy.sh" || rc=1
 echo
-echo "== deferred to guest CI (need validated kernel toolchain — §15 #3/#4/#5) =="
+echo "== deferred to guest CI (need validated kernel toolchain) =="
 cat <<'EOF'
-  - make -C $KDIR M=$PWD     (empty Rust module builds — §15 #14)
-  - KASAN/KCSAN/lockdep/kmemleak/DMA_API_DEBUG guest soak (M1/M3/M5 gates)
-  - ci/check_counter_invariant.sh (runtime §6.3 invariant — needs chip)
+  - make -C $KDIR M=$PWD     (empty Rust module builds)
+  - KASAN/KCSAN/lockdep/kmemleak/DMA_API_DEBUG guest soak
+  - ci/check_counter_invariant.sh (runtime invariant — needs chip)
   (the kernel-build Clippy gate above runs locally when rustc-1.93 is
    installed; it skips cleanly on hosts without the validated toolchain)
 These are stubbed, not skipped: enable in CI after the debug+Rust guest kernel

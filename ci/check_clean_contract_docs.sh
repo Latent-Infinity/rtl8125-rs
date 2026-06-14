@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# Guard against comments that describe an older milestone or a future
-# interrupt mode as current behavior. These checks are intentionally
+# Guard against comments that describe an outdated implementation stage
+# or a future interrupt mode as current behavior. These checks are intentionally
 # narrow: they catch stale phrases that previously contradicted the
 # implementation without trying to lint prose in general.
 
@@ -30,7 +30,7 @@ if grep -nE \
 	cat /tmp/r8125_clean_contract_docs.$$
 	red "stale implementation-contract prose found"
 else
-	grn "source-level contracts avoid known stale milestone / IRQ-mode phrases"
+	grn "source-level contracts avoid known stale implementation-stage / IRQ-mode phrases"
 fi
 rm -f /tmp/r8125_clean_contract_docs.$$
 

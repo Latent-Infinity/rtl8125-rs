@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# Active traffic soak with KASAN + lockdep + kmemleak + DMA_API_DEBUG
-# (plan section 7 M5). The gate requires "24-hour low-rate active soak (<= 100
+# Active traffic soak with KASAN + lockdep + kmemleak + DMA_API_DEBUG.
+# The gate requires "24-hour low-rate active soak (<= 100
 # Mbps mixed traffic) with KASAN + KCSAN + CONFIG_DMA_API_DEBUG enabled
 # - zero reports". Our guest has KASAN/lockdep/kmemleak/DMA_API_DEBUG;
 # KCSAN is mutually exclusive with KASAN in this kernel build.
@@ -10,7 +10,7 @@
 # Procedure:
 #   1. Sustained iperf3 in background (--bandwidth 100M to throttle).
 #   2. Periodic dmesg sample for KASAN/lockdep/DMA-API/kmemleak.
-#   3. Periodic section 6.3 counter-invariant check.
+#   3. Periodic counter-invariant check.
 #   4. At the end: verify the chip is still up and counters are sane.
 #
 # Usage:
@@ -113,7 +113,7 @@ while [[ $(date +%s) -lt $deadline ]]; do
 		printf 'sample %d (t=%ds): %d warnings in dmesg\n' "$samples" "$elapsed" "$bad" | tee -a "$LOG"
 		sudo dmesg | grep -E 'BUG|KASAN|UBSAN|Oops|kmemleak|DMA-API.*WARN|lockdep|slab-use-after-free' | tail -3 | tee -a "$LOG"
 	fi
-	# Snapshot the section 6.3 invariant as a soft sanity (gap should stay 0).
+	# Snapshot the counter invariant as a soft sanity (gap should stay 0).
 	stats=$(ethtool -S "$IFACE" 2>/dev/null)
 	tr=$(echo "$stats" | awk '/tx_received:/{print $2}')
 	tc=$(echo "$stats" | awk '/tx_consumed:/{print $2}')

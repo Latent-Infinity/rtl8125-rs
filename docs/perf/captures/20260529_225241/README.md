@@ -48,6 +48,6 @@ The dump tarball contains:
 
 ## How this fits the dossiers
 
-- M5_CLOSEOUT.md §"Controller-KVM 100× rmmod-under-traffic stress" cites this directory.
+- HARDENING_CLOSEOUT.md §"Controller-KVM 100× rmmod-under-traffic stress" cites this directory.
 - r8169_comparison.md cites `SUMMARY.md` + draws the RX-asymmetry finding from `2d_h2g_tcp_1500.json` (1.205 Gbps) vs `iperf3_r8169_host2guest_tcp_1500.json` (2.325 Gbps).
 - The `post_perf_state.tar.gz` is also the working template for what an operator would upload during incident response per `docs/FAILURE_MODES.md`.

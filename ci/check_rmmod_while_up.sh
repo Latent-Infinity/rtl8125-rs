@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# M5 NAPI deliverable: "rmmod while interface is up either is rejected
-# cleanly or quiesces hardware first — never crashes" (plan §7 M5).
+# NAPI deliverable: "rmmod while interface is up either is rejected
+# cleanly or quiesces hardware first — never crashes".
 #
 # Strategy: stress-test by repeatedly loading the module, starting
 # active TCP traffic via iperf3, and rmmod'ing while the traffic is
@@ -10,7 +10,7 @@
 # Oops/BUG/UAF reports. Any single report fails the gate.
 #
 # Defaults to 5 cycles which is enough to surface intermittent races.
-# A longer soak (CYCLES=50, ~12 min) is recommended before M5 sign-off.
+# A longer soak (CYCLES=50, ~12 min) is recommended before sign-off.
 
 set -uo pipefail
 

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# Static gate for plan §6.3 — the disposition-counter infrastructure
+# Static gate for the disposition-counter infrastructure
 # (mechanical, no hardware needed). The matching runtime test that
 # asserts the actual invariant lives in `ci/check_counter_invariant.sh`
 # and runs on a guest with the chip; this script enforces that the
 # pieces it depends on stay in tree.
 #
-# Six §6.3 counters: tx_received, tx_consumed, tx_busy_exception,
+# Six disposition counters: tx_received, tx_consumed, tx_busy_exception,
 # tx_dropped_error, rx_handed_to_stack, rx_dropped_error.
 #
 # We check, for each:
@@ -36,8 +36,8 @@ ETHTOOL_C="$ROOT/src/netdev_bridge_ethtool.c"
 COUNTERS_C="$ROOT/src/netdev_bridge_counters.c"
 BRIDGE_H="$ROOT/src/netdev_bridge.h"
 # `rx_handed_to_stack` and `rx_dropped_error` increment sites moved
-# into `r8125_bridge_rx_one_packet` (Candidate B,
-# RX_OPTIMIZATION_CANDIDATES.md §B) on 2026-05-30 — search the
+# into `r8125_bridge_rx_one_packet`
+# (RX_OPTIMIZATION_CANDIDATES.md §B) on 2026-05-30 — search the
 # RX-pool TU too.
 RX_POOL_C="$ROOT/src/netdev_bridge_rx_pool.c"
 
@@ -62,7 +62,7 @@ for c in "${COUNTERS[@]}"; do
 		red "$c not advertised via ethtool -S (missing from bridge_ethtool_strings)"
 		continue
 	fi
-	grn "§6.3 counter $c: percpu field + this_cpu_inc + sum-snapshot + ethtool"
+	grn "disposition counter $c: percpu field + this_cpu_inc + sum-snapshot + ethtool"
 done
 
 # bridge_counter_sum must walk all possible CPUs so the snapshot reflects
@@ -103,24 +103,24 @@ fi
 # names and indices staying stable.
 nstrings=$(awk '/bridge_ethtool_strings\[\]\[ETH_GSTRING_LEN\]/,/^};/' "$ETHTOOL_C" | grep -c '^\s*"')
 if [[ "$nstrings" -lt "${#COUNTERS[@]}" ]]; then
-	red "bridge_ethtool_strings has $nstrings entries; expected at least ${#COUNTERS[@]} §6.3 counters"
+	red "bridge_ethtool_strings has $nstrings entries; expected at least ${#COUNTERS[@]} disposition counters"
 else
 	table_prefix=$(awk '/bridge_ethtool_strings\[\]\[ETH_GSTRING_LEN\]/,/^};/' "$ETHTOOL_C" |
 		grep -E '^\s*"' | head -n "${#COUNTERS[@]}" | sed -E 's/^[[:space:]]*"([^"]+)".*/\1/' | tr '\n' ' ')
 	expected_prefix="${COUNTERS[*]} "
 	if [[ "$table_prefix" == "$expected_prefix" ]]; then
-		grn "ethtool string table starts with all ${#COUNTERS[@]} §6.3 counters"
+		grn "ethtool string table starts with all ${#COUNTERS[@]} disposition counters"
 	else
 		red "first ${#COUNTERS[@]} ethtool stats must remain: ${COUNTERS[*]} (got: $table_prefix)"
 	fi
 fi
 
-# The §6.3 invariant equation must be documented somewhere reviewers will find it.
+# The invariant equation must be documented somewhere reviewers will find it.
 if grep -qE "tx_received\s*==\s*tx_consumed\s*\+\s*tx_busy_exception\s*\+\s*tx_dropped_error" \
 		"$BRIDGE_H" "$BRIDGE_C" "$ETHTOOL_C"; then
-	grn "§6.3 invariant equation appears in the bridge sources"
+	grn "invariant equation appears in the bridge sources"
 else
-	red "§6.3 invariant equation not documented in bridge sources"
+	red "invariant equation not documented in bridge sources"
 fi
 
 # The runtime check script must exist and be executable.

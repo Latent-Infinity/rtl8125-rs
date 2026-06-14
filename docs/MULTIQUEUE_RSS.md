@@ -33,7 +33,7 @@ source-reading:
 - **RSS disable**: the default `rss_queues=0` keeps the proven single-queue RFC
   path (RSS_CTRL cleared); multi-queue is a validated operator opt-in.
 - TX remains a single ring (reaped by queue 0); the V2 TX-completion vector is
-  entry 16 (see `docs/M6_MSIX_DESIGN.md`).
+  entry 16 (see `docs/MSIX_DESIGN.md`).
 
 ## Why the default stays single-queue
 

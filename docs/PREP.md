@@ -5,7 +5,7 @@
 is the **internal** research dossier for the M7 maintainer
 conversation. The **outbound** dossier (what we'd actually send to
 maintainers) is the lighter-weight
-[`M7_PRE_RFC_DOSSIER.md`](M7_PRE_RFC_DOSSIER.md).
+[`PRE_RFC_DOSSIER.md`](PRE_RFC_DOSSIER.md).
 
 The plan §7 M7 frames the decision as one of three exits:
 1. Submit a driver RFC to netdev
@@ -159,7 +159,7 @@ abstraction would be:
 
 Realistic timeline: **12-18+ months** of patch iteration with
 maintainers before any of those abstractions are in mainline.
-Calibrated against `kernel::block` ([`M7_BLOCK_CADENCE.md`](M7_BLOCK_CADENCE.md)):
+Calibrated against `kernel::block` ([`BLOCK_CADENCE.md`](BLOCK_CADENCE.md)):
 RFC May 2023 → first merge Aug 2024 (15 months) → "complete"
 follow-up series still landing Feb 2026 (33+ months). Smaller
 surfaces, fewer prerequisites, or plural-author teams can push
@@ -268,8 +268,8 @@ work that should follow M6 completion + soak-gate sign-off.
 - `src/netdev_bridge.h` — the cshim contract that would either
   become a Rust abstraction (exit b) or stay as documented bridge
   code (exit c).
-- `docs/M5_PM_GAP.md` — a concrete example of a kernel-Rust gap we
+- `docs/PM_GAP.md` — a concrete example of a kernel-Rust gap we
   already documented (`kernel::pci::Driver` exposes only
   probe/unbind, no PM).
-- `docs/M5_CLOSEOUT.md` — sign-off evidence we'd cite in the
+- `docs/HARDENING_CLOSEOUT.md` — sign-off evidence we'd cite in the
   maintainer consultation.

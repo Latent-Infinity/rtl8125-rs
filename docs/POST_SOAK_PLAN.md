@@ -73,7 +73,7 @@ Capture transferable shapes WHILE context is fresh.
 These are NOT on the plan, by design:
 
 - **Multi-queue / RSS** — hardware ceiling on 8125B per
-  `M6_MULTIQ_NA.md`. No software fix possible.
+  `MULTIQUEUE_RSS.md`. No software fix possible.
 - **XDP optimization** — LB use case doesn't need it.
 - **KMSAN / KCSAN extended soaks** — KASAN coverage sufficient
   for this driver's pattern.
@@ -107,7 +107,7 @@ These are NOT on the plan, by design:
                                 now).
 
 2026-06-01                      Tier 1d cold-boot auto-load.
-                                Sign off M5_CLOSEOUT.md.
+                                Sign off HARDENING_CLOSEOUT.md.
                                 Sign off r8169_comparison.md.
                                 Tier 4c finalize.
 
@@ -138,9 +138,9 @@ without touching the chip. Plenty to fill the soak window.
 
 ## Cross-references
 
-- [`M5_CLOSEOUT.md`](M5_CLOSEOUT.md) — what signs off at end of Tier 1
-- [`M7_PRE_RFC_DOSSIER.md`](M7_PRE_RFC_DOSSIER.md) — what 5a sends
-- [`M7_CSHIM_KERNEL_DIFF.md`](M7_CSHIM_KERNEL_DIFF.md) — research backing 5c
-- [`M7_BLOCK_CADENCE.md`](M7_BLOCK_CADENCE.md) — calibration backing 5c
+- [`HARDENING_CLOSEOUT.md`](HARDENING_CLOSEOUT.md) — what signs off at end of Tier 1
+- [`PRE_RFC_DOSSIER.md`](PRE_RFC_DOSSIER.md) — what 5a sends
+- [`CSHIM_KERNEL_DIFF.md`](CSHIM_KERNEL_DIFF.md) — research backing 5c
+- [`BLOCK_CADENCE.md`](BLOCK_CADENCE.md) — calibration backing 5c
 - [`perf/r8169_comparison.md`](perf/r8169_comparison.md) — closes at end of Tier 2
 - [`RTL8125_Rust_Driver_Implementation_Plan.md`](RTL8125_Rust_Driver_Implementation_Plan.md) §7 M5/M6/M7 — gating authority

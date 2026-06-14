@@ -25,7 +25,7 @@ use kernel::transmute::{AsBytes, FromBytes};
 
 /// Hardware descriptor count per direction. Matches r8169's `NUM_TX_DESC` /
 /// `NUM_RX_DESC` (= 256). RTL8125 supports up to 1024 but 256 is the
-/// well-trodden working default; bumping it is an M5 perf-tuning exercise.
+/// well-trodden working default; bumping it is a perf-tuning exercise.
 pub(crate) const RING_LEN: usize = 256;
 
 /// Software canary pattern for the per-descriptor shadow array. Picked so it's
@@ -164,7 +164,7 @@ macro_rules! ring_index {
             /// Wrap the index modulo `RING_LEN`. Cheap because `RING_LEN`
             /// is a power of two — the compiler turns this into `& (N-1)`.
             #[inline]
-            #[allow(dead_code)] // used from M4 onward
+            #[allow(dead_code)] // used by the active datapath
             pub(crate) fn wrapped(self) -> Self {
                 $name(self.0 & (RING_LEN - 1))
             }
@@ -241,7 +241,7 @@ where
     }
 
     /// DMA address of slot 0 of the ring — what gets programmed into the
-    /// device's `TNPDS` / `RDSAR` register in M4.
+    /// device's `TNPDS` / `RDSAR` register.
     pub(crate) fn dma_handle(&self) -> DmaAddress {
         self.desc.dma_handle()
     }

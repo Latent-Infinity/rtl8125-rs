@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Mechanical enforcement of the unsafe-code discipline (plan §6.2, §9.4).
-# M0-safe: with no src/*.rs yet, every check passes vacuously.
+# Mechanical enforcement of the unsafe-code discipline.
+# Safe with no src/*.rs yet: every check passes vacuously.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -11,7 +11,7 @@ bad(){ printf '\033[1;31mFAIL\033[0m %s\n' "$*"; fail=1; }
 
 mapfile -t RS < <(find src -name '*.rs' 2>/dev/null)
 
-# 1. crate root carries #![deny(unsafe_code)]  (plan §6.2).
+# 1. crate root carries #![deny(unsafe_code)].
 # Kernel-Rust build rule $(obj)/%.o: $(obj)/%.rs forces the crate-root filename
 # to match the obj-m target — see src/Kbuild — so on this project the crate
 # root is src/r8125_rust.rs, not src/lib.rs. We still tolerate src/lib.rs to
@@ -23,9 +23,9 @@ done
 if [[ -n "$CRATE_ROOT" ]]; then
   grep -qE '^\s*#!\[deny\(unsafe_code\)\]' "$CRATE_ROOT" \
     && ok "$CRATE_ROOT has #![deny(unsafe_code)]" \
-    || bad "$CRATE_ROOT missing #![deny(unsafe_code)] (plan §6.2)"
+    || bad "$CRATE_ROOT missing #![deny(unsafe_code)]"
 else
-  ok "no crate root in src/ yet (pre-M1) — deny-check vacuous"
+  ok "no crate root in src/ yet — deny-check vacuous"
 fi
 
 # 2. no file outside .unsafe-allowlist may #![allow(unsafe_code)]
@@ -36,7 +36,7 @@ if [[ -f .unsafe-allowlist ]]; then
     if grep -qE '^\s*#!\[allow\(unsafe_code\)\]' "$f"; then
       ok2=0; for a in "${ALLOW[@]}"; do [[ "$f" == "$a" ]] && ok2=1; done
       [[ $ok2 -eq 1 ]] && note "allowed: $f (in .unsafe-allowlist)" \
-                       || bad "$f has #![allow(unsafe_code)] but is NOT in .unsafe-allowlist (plan §6.2)"
+                       || bad "$f has #![allow(unsafe_code)] but is NOT in .unsafe-allowlist"
     fi
   done
   ok ".unsafe-allowlist enforcement ran (${#RS[@]} rs files)"
@@ -44,17 +44,17 @@ else
   bad ".unsafe-allowlist missing"
 fi
 
-# 3. no raw MMIO outside mmio.rs / unsafe_boundary.rs (plan §7 M2 gate, §9.4)
+# 3. no raw MMIO outside mmio.rs / unsafe_boundary.rs
 for f in "${RS[@]:-}"; do
   [[ -z "$f" ]] && continue
   case "$f" in src/mmio.rs|src/unsafe_boundary.rs) continue;; esac
   if grep -nE '\b(readl|writel|readb|writeb|readw|writew|ioread|iowrite|read_volatile|write_volatile)\b' "$f" >/dev/null; then
-    bad "raw MMIO in $f (allowed only in mmio.rs / unsafe_boundary.rs — plan §7 M2)"
+    bad "raw MMIO in $f (allowed only in mmio.rs / unsafe_boundary.rs)"
   fi
 done
 ok "raw-MMIO containment check ran"
 
-# 4. unsafe-block census: count may only DECREASE over time (plan §9.4).
+# 4. unsafe-block census: count may only DECREASE over time.
 # Counts actual unsafe code constructs — `unsafe { ... }`, `unsafe fn`,
 # `unsafe impl`, `unsafe trait`, `unsafe extern` — not the bare word "unsafe"
 # in doc comments (which is fine and even encouraged for boundary docs).
@@ -70,7 +70,7 @@ done
 if [[ -f "$CENSUS" ]]; then
   prev=$(cat "$CENSUS");
   if [[ "$cur" -gt "$prev" ]]; then
-    bad "unsafe census increased $prev → $cur — needs a justification commit (plan §9.4)"
+    bad "unsafe census increased $prev → $cur — needs a justification commit"
   else
     ok "unsafe census $prev → $cur (non-increasing)"; echo "$cur" > "$CENSUS"
   fi

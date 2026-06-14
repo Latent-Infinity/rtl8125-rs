@@ -78,7 +78,7 @@ the Gbits/s number. The interesting wins are:
   per-device by construction so we never read+ack an IRQ that wasn't
   ours.
 - **Foundational for multi-queue / RPS** (future M6+1 work — see
-  `docs/M6_MULTIQ_NA.md` for why we don't multi-queue on 8125B today,
+  `docs/MULTIQUEUE_RSS.md` for why we don't multi-queue on 8125B today,
   but the infrastructure now exists).
 
 ## `intx_only=1` regression rollback
@@ -119,7 +119,7 @@ Memory entry saved at
 [`rtl8125b-int-cfg0-enable-bit`](../../../../home/firestrand/.claude/projects/-home-firestrand-Projects-Rt8125-driver/memory/rtl8125b-int-cfg0-enable-bit.md)
 so future sessions don't re-discover this bit. The bit is also
 documented in
-[`docs/M6_MSIX_DESIGN.md`](../M6_MSIX_DESIGN.md) under the Phase A.2
+[`docs/MSIX_DESIGN.md`](../MSIX_DESIGN.md) under the Phase A.2
 LANDED section.
 
 ## §6.3 disposition-counter invariant
@@ -156,7 +156,7 @@ Even though raw throughput is unchanged, the MSI-X migration unlocks:
 1. **Per-MSI-X-vector IRQ affinity**: pin the chip's IRQ to a specific
    CPU; the kernel's `irqbalance` already does this for MSI-X vectors
    automatically but did nothing useful for shared INTx.
-2. **Multi-queue RSS**: M6 #3 deferred (`docs/M6_MULTIQ_NA.md`) for the
+2. **Multi-queue RSS**: M6 #3 deferred (`docs/MULTIQUEUE_RSS.md`) for the
    8125B specifically, but the V2 ISR layout supports up to 16
    per-message-id sources — the registers are there when a future chip
    variant turns on RSS.

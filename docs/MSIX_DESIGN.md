@@ -288,9 +288,9 @@ change is a rare event).
 
 - **Multi-queue / RSS** — explicitly N/A for 8125B per Realtek vendor
   source (single TX + single RX queue on this chip rev). Document in
-  `docs/M6_MULTIQ_NA.md` instead of attempting the work.
+  `docs/MULTIQUEUE_RSS.md` instead of attempting the work.
 - **Jumbo frames** — separate M6 sub-feature, designed in
-  `docs/M6_JUMBO_DESIGN.md` (forthcoming).
+  `docs/JUMBO_DESIGN.md` (forthcoming).
 - **Per-feature ethtool toggles** — `ethtool -L set rx 1 tx 1` would
   be trivial since we have 1+1; not worth wiring up until we have
   multi-queue, which we don't.

@@ -1,7 +1,21 @@
 # Unsafe census justifications
 
-Per plan §9.4, every census bump (rejected by `ci/run_checks.sh`) needs a
+Every census bump (rejected by `ci/run_checks.sh`) needs a
 short rationale here. Append; never delete.
+
+## 2026-06-13 — system-sleep PM bump 76 → 78
+
+Net +2 `unsafe { ... }` blocks in `src/unsafe_boundary.rs` for the pci::Driver
+suspend/resume callbacks (kernel-Rust PCI PM extension; see docs/PM_GAP.md +
+kernel-patches/0001-rust-pci-add-pm-callbacks.patch).
+
+- ADDED `bridge_pm_suspend(ndev)` — wraps `r8125_bridge_pm_suspend`, which takes
+  RTNL and (if the iface was up) detaches + quiesces via the existing ndo_stop.
+- ADDED `bridge_pm_resume(ndev)` — wraps `r8125_bridge_pm_resume`, which re-inits
+  via ndo_open + reattaches. SAFETY for both: `ndev` is the registered
+  net_device (null-checked in the wrapper; the C side no-ops on a down iface),
+  called from the PM callback while the device is bound. No ownership/MMIO/skb at
+  the boundary; the chip work is the already-audited ndo_open/stop paths.
 
 ## 2026-06-11 — MAC RX-filter programming bump 75 → 76
 
@@ -17,7 +31,7 @@ reset clears IDR0 or after a random-MAC fallback; mirrors `rtl8125_rar_set`).
   ownership transfer, no MMIO, no skb. The MMIO write of the address
   (`Regs::set_mac_address`) is in safe `mmio.rs` via the typed `Bar` accessors.
 
-## 2026-05-25 — M4-traffic bump 43 → 46
+## 2026-05-25 — traffic-path PHY plumbing bump 43 → 46
 
 Net +3 `unsafe { ... }` blocks in `src/unsafe_boundary.rs`: four new wrappers
 for the C-side PHY plumbing, minus the removed Rust `carrier_on` wrapper now
@@ -42,14 +56,14 @@ handled directly by the C PHY link handler.
 
 These are mechanical FFI wrappers — each is a single line of `unsafe`
 calling out to the C side. The C side is the actual boundary; the Rust
-side preserves the §6.2 discipline by keeping every `unsafe` block in
-the one allowlisted file with a SAFETY comment.
+side preserves the unsafe-boundary discipline by keeping every `unsafe`
+block in the one allowlisted file with a SAFETY comment.
 
-No new MMIO-touching `unsafe` was added by this milestone; all MMIO for
+No new MMIO-touching `unsafe` was added by this change; all MMIO for
 the PHY OCP path goes through the existing `Regs::gphy_ocp_*` methods
 which use the kernel `pci::Bar` accessors (safe).
 
-## 2026-05-25 — M4-perf phase 1 bump 46 → 49
+## 2026-05-25 — performance offload wrappers bump 46 → 49
 
 Three new safe wrappers in `src/unsafe_boundary.rs`, each a one-line
 `unsafe { … }` calling a C bridge function:
@@ -65,9 +79,9 @@ Three new safe wrappers in `src/unsafe_boundary.rs`, each a one-line
 
 All three mutate state owned by the kernel net stack (skb fields, netdev
 stats) and are therefore mechanical FFI wrappers. No new MMIO unsafe
-was added by this milestone.
+was added by this change.
 
-## 2026-05-25 — M4-perf phase 2 (SG/TSO WIP) bump 49 → 53
+## 2026-05-25 — SG/TSO wrappers (WIP) bump 49 → 53
 
 Six SG/TSO wrappers were added in `src/unsafe_boundary.rs`, each a
 one-line `unsafe { … }` calling a C bridge function. The obsolete
@@ -101,7 +115,7 @@ are now advertised with the RTL8125B-specific `netif_set_tso_max_segs`
 cap documented in `docs/RTL8125B_TSO_NOTES.md`. This did not require
 additional unsafe wrappers.
 
-## 2026-05-28 — M6 #2 jumbo RX-pool refactor bump 53 → 54
+## 2026-05-28 — jumbo RX-pool refactor bump 53 → 54
 
 Net `unsafe { … }` count moves 53 → 54 in `src/unsafe_boundary.rs`:
 
@@ -125,7 +139,7 @@ Net `unsafe { … }` count moves 53 → 54 in `src/unsafe_boundary.rs`:
   SAFETY: as above; the whole buffer is synced because the chip can
   fill any portion of it next time.
 
-**Removed (3)** — the M4 coherent-allocation RX pool helpers:
+**Removed (3)** — the earlier coherent-allocation RX pool helpers:
 
 - `rx_buf_ptr(bufs, idx)` — slot-pointer math inside the
   `CoherentAllocation<RxBuffer>` is gone; NAPI reads
@@ -139,21 +153,21 @@ Net: +4 added − 3 removed = +1. The new helpers are all mechanical
 FFI wrappers around C cshim functions that themselves perform the
 allocation, mapping, and free; no MMIO-touching unsafe is introduced.
 
-## 2026-05-30 — RX Optimization Candidate A decrement 54 → 53
+## 2026-05-30 — RX accounting move decrement 54 → 53
 
 `bridge_account_rx(ndev, bytes)` removed from `src/unsafe_boundary.rs`.
 RX packet/byte accounting now lives next to `napi_gro_receive` inside
 `r8125_bridge_rx_one_packet`, so the RX hot path makes one fewer FFI
-crossing per packet. See `docs/RX_OPTIMIZATION_CANDIDATES.md` §A for
+crossing per packet. See `docs/RX_OPTIMIZATION_CANDIDATES.md` for
 the rationale.
 
 TX accounting (`bridge_account_tx` / `r8125_bridge_account_tx`) is
 unchanged: xmit calls it once per skb (not per packet), so the FFI
 cost is bounded and the symbol stays as-is.
 
-## 2026-05-30 — RX Optimization Candidate B decrement 53 → 47
+## 2026-05-30 — RX super-call consolidation decrement 53 → 47
 
-`bridge_rx_one_packet` super-call (Candidate B of
+The `bridge_rx_one_packet` super-call (see
 docs/RX_OPTIMIZATION_CANDIDATES.md) collapses five per-packet FFI
 crossings into one cshim entry point. Net effect on the Rust unsafe
 boundary: **7 wrappers removed**, **1 wrapper added** = census
@@ -167,7 +181,7 @@ Removed Rust safe wrappers + extern declarations
 - `skb_deliver_rx` / `r8125_bridge_skb_deliver_rx` — replaced by
   cshim-internal `napi_gro_receive`.
 - `rx_drop_error` / `r8125_bridge_rx_drop_error` — cshim handles
-  the §6.3 `rx_dropped_error` bump internally on alloc failure.
+  the `rx_dropped_error` bump internally on alloc failure.
 - `rx_sync_for_cpu` / `r8125_bridge_rx_sync_for_cpu` — replaced by
   cshim-internal `dma_sync_single_for_cpu`.
 - `rx_sync_for_device` / `r8125_bridge_rx_sync_for_device` —
@@ -190,10 +204,10 @@ Net change to the unsafe surface: **-6 items**. The C cshim
 symbols/prototypes that became dead were removed instead of kept as
 private ABI.
 
-## 2026-05-30 — RX Optimization Candidates F + G (no census change)
+## 2026-05-30 — RX loop hoist + per-CPU TSTATS (no census change)
 
-Candidates F (hoist `state.ndev.load` out of NAPI RX loop) and G
-(per-CPU `dev_sw_netstats_{rx,tx}_add` + `NETDEV_PCPU_STAT_TSTATS`)
+Hoisting `state.ndev.load` out of the NAPI RX loop and the per-CPU
+`dev_sw_netstats_{rx,tx}_add` + `NETDEV_PCPU_STAT_TSTATS` accounting
 shipped without changing the unsafe surface. Both are inside the
 cshim or inside existing safe Rust code; no new wrappers, no extern
 decl changes. Census remains 47.
@@ -204,24 +218,23 @@ live in per-CPU storage allocated by the kernel core when
 CPUs on stats-read via `dev_get_tstats64`. The application-visible
 `ip -s link show enp5s0` output is unchanged in semantics.
 
-Candidate H was skipped (LLVM bounds-check elision is sufficient;
-`unsafe` surface trade-off not worth marginal gain). See
-`docs/RX_OPTIMIZATION_CANDIDATES.md`.
+The bounds-check-elision optimization was skipped (LLVM bounds-check
+elision is sufficient; `unsafe` surface trade-off not worth marginal
+gain). See `docs/RX_OPTIMIZATION_CANDIDATES.md`.
 
-## 2026-05-30 — RX Optimization Candidate L bump 47 → 48
+## 2026-05-30 — IRQ affinity hint bump 47 → 48
 
 Added `bridge_irq_pin_cpu(irq, cpu)` safe wrapper in
 `src/unsafe_boundary.rs`. Calls the new cshim
 `r8125_bridge_irq_pin_cpu` which calls `irq_set_affinity_and_hint`
 to nudge the kernel + irqbalance toward keeping the chip's MSI-X
 vector on a specific CPU. Latency-aligned default for the
-heterogeneous-LB use case (see docs/RX_OPTIMIZATION_CANDIDATES.md
-§L).
+heterogeneous-LB use case (see docs/RX_OPTIMIZATION_CANDIDATES.md).
 
 Net change: +1 unsafe wrapper (mechanical FFI call). No MMIO
 touching unsafe added.
 
-Candidate M (`tx_queue_len` 1000 → 256) is cshim-side only and
+The `tx_queue_len` change (1000 → 256) is cshim-side only and
 introduces no Rust unsafe.
 
 ## 2026-05-30 — RX descriptor dma_rmb bump 48 → 49
@@ -232,12 +245,12 @@ the RX descriptor OWN bit clears and before Rust reads descriptor
 length/checksum fields or DMA-written bytes.
 
 This mirrors r8169's `rtl_rx` ordering and closes the weak-memory
-correctness gap documented as Candidate C in
+correctness gap documented in
 `docs/RX_OPTIMIZATION_CANDIDATES.md`. The helper has no pointer or
 ownership preconditions; the safety contract is ordering-only and is
 enforced by `ci/check_rx_skb_build.sh`.
 
-## 2026-05-31 — RX Opt #1 bump 49 → 51
+## 2026-05-31 — descriptor publish barrier bump 49 → 51
 
 Added `dma_wmb()` safe wrapper in `src/unsafe_boundary.rs`, calling
 the new cshim `r8125_bridge_dma_wmb` (which calls Linux `dma_wmb()`).
@@ -255,7 +268,7 @@ Net change: +1 mechanical FFI wrapper plus +1 descriptor-ring unsafe
 block. The descriptor writes target DMA-coherent memory, not MMIO, and
 are covered by `ci/check_dma_barriers.sh`.
 
-## 2026-05-31 — RX Opt #4 bump 51 → 52
+## 2026-05-31 — NUMA-aware IRQ auto-pin bump 51 → 52
 
 Added `bridge_irq_pin_auto(pdev, irq)` safe wrapper in
 `src/unsafe_boundary.rs`, calling new cshim
@@ -266,7 +279,7 @@ to `bridge_irq_pin_cpu` (CPU 0 hardcoded → now policy-selected).
 Net change: +1 mechanical FFI wrapper. The new module param
 `irq_pin_cpu: u8` (default 255 = auto) selects between
 `bridge_irq_pin_auto` (255), no-op (254), and explicit
-`bridge_irq_pin_cpu(N)` (0..253). See Candidate #4 of
+`bridge_irq_pin_cpu(N)` (0..253). See
 `docs/RX_OPTIMIZATION_CANDIDATES.md`.
 
 ## 2026-05-31 — Temporary stall diagnostics bump 52 → 54
@@ -295,7 +308,7 @@ Removed the temporary KVM-stall ethtool diagnostic surface after review:
 - DIAG-TEMP hot-path atomics, note hooks, and ethtool strings.
 
 Net change: -1 mechanical FFI wrapper and -1 raw-pointer C ABI copy, so the
-unsafe census returns to 52. The permanent §6.3 ethtool counters remain, and
+unsafe census returns to 52. The permanent ethtool counters remain, and
 `ci/check_counter_infrastructure.sh` plus the runtime counter-invariant gate
 cover that retained surface.
 
@@ -349,9 +362,9 @@ dead `r8125_bridge_skb_nr_frags` symbol was removed. This reduces per-packet
 FFI crossings on the single-buffer TX path while preserving the rule that all
 skb mutations happen before DMA mapping.
 
-## 2026-06-06 — Phase A1 descriptor migration bump 59 → 69
+## 2026-06-06 — descriptor migration bump 59 → 69
 
-Phase A1 introduced format-aware RX/TX descriptor publication and type-safe
+This change introduced format-aware RX/TX descriptor publication and type-safe
 V3/V4 parsing support:
 
 - Added `AsBytes`/`FromBytes` implementations for `RxDescriptor` /
@@ -362,7 +375,7 @@ V3/V4 parsing support:
   same ordering contract.
 
 Net effect: +10 unsafe `impl` / helpers in `unsafe_boundary.rs`. This is the
-intended cost of Phase A1 and is bounded to the audited boundary.
+intended cost of the descriptor migration and is bounded to the audited boundary.
 
 ## 2026-06-07 — RSS key fill wrapper bump 69 → 70
 

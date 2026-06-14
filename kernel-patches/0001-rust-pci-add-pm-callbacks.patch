@@ -1,0 +1,76 @@
+--- rust/kernel/pci.rs.orig.bak	2026-06-12 19:22:55.647222038 +0000
++++ rust/kernel/pci.rs	2026-06-12 19:22:55.666306851 +0000
+@@ -82,6 +82,7 @@
+             (*pdrv.get()).probe = Some(Self::probe_callback);
+             (*pdrv.get()).remove = Some(Self::remove_callback);
+             (*pdrv.get()).id_table = T::ID_TABLE.as_ptr();
++            (*pdrv.get()).driver.pm = &Self::PM_OPS;
+         }
+
+         // SAFETY: `pdrv` is guaranteed to be a valid `DriverType`.
+@@ -134,6 +135,44 @@
+
+         T::unbind(pdev, data);
+     }
++
++    unsafe extern "C" fn suspend_callback(dev: *mut bindings::device) -> c_int {
++        // SAFETY: the PM core passes the `struct device` embedded in a `pci_dev`
++        // that is bound to this driver; `container_of` recovers the `pci_dev`.
++        let pdev = unsafe {
++            &*container_of!(dev, bindings::pci_dev, dev).cast::<Device<device::CoreInternal>>()
++        };
++        // SAFETY: called between probe and remove, so drvdata holds a `T`.
++        let data = unsafe { pdev.as_ref().drvdata_borrow::<T>() };
++        from_result(|| {
++            T::suspend(pdev, data)?;
++            Ok(0)
++        })
++    }
++
++    unsafe extern "C" fn resume_callback(dev: *mut bindings::device) -> c_int {
++        // SAFETY: see `suspend_callback`.
++        let pdev = unsafe {
++            &*container_of!(dev, bindings::pci_dev, dev).cast::<Device<device::CoreInternal>>()
++        };
++        // SAFETY: see `suspend_callback`.
++        let data = unsafe { pdev.as_ref().drvdata_borrow::<T>() };
++        from_result(|| {
++            T::resume(pdev, data)?;
++            Ok(0)
++        })
++    }
++
++    const PM_OPS: bindings::dev_pm_ops = bindings::dev_pm_ops {
++        suspend: Some(Self::suspend_callback),
++        resume: Some(Self::resume_callback),
++        freeze: Some(Self::suspend_callback),
++        thaw: Some(Self::resume_callback),
++        poweroff: Some(Self::suspend_callback),
++        restore: Some(Self::resume_callback),
++        // SAFETY: zero-initialises the remaining Option<fn> fields to None.
++        ..unsafe { core::mem::MaybeUninit::<bindings::dev_pm_ops>::zeroed().assume_init() }
++    };
+ }
+
+ /// Declares a kernel module that exposes a single PCI driver.
+@@ -322,6 +361,20 @@
+     fn unbind(dev: &Device<device::Core>, this: Pin<&Self>) {
+         let _ = (dev, this);
+     }
++
++    /// System-sleep suspend. Default no-op: the PCI core still saves config
++    /// state and sets the D-state, so drivers that do not override this are
++    /// unaffected. Override to quiesce the device (stop TX, mask IRQs, arm wake).
++    fn suspend(dev: &Device<device::Core>, this: Pin<&Self>) -> Result {
++        let _ = (dev, this);
++        Ok(())
++    }
++
++    /// System-sleep resume. Default no-op. Override to restore device state.
++    fn resume(dev: &Device<device::Core>, this: Pin<&Self>) -> Result {
++        let _ = (dev, this);
++        Ok(())
++    }
+ }
+
+ /// The PCI device representation.

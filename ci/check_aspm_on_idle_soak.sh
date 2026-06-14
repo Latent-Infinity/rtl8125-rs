@@ -3,7 +3,7 @@
 #
 # Variant of `check_aspm_idle_soak.sh` that forces ASPM L1.x ON via
 # the `force_aspm=1` module parameter. This exercises the *historical*
-# RTL8125 L1.x lockup gate that the plan §7 M5 calls out as "the gate
+# RTL8125 L1.x lockup gate described as "the gate
 # that has historically eliminated entire generations of RTL8125
 # driver candidates".
 #

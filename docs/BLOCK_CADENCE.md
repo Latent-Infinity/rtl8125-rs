@@ -1,7 +1,7 @@
 # `kernel::block` review cadence — calibration for M7
 
 **Status (2026-05-29):** desk-research for M7 outbound-blocker #3 (see
-[`M7_PRE_RFC_DOSSIER.md`](M7_PRE_RFC_DOSSIER.md) reading-list
+[`PRE_RFC_DOSSIER.md`](PRE_RFC_DOSSIER.md) reading-list
 checklist). Goal: extract from the `kernel::block` + `rnull` patch
 history what a `kernel::net::*` series would realistically cost, so
 the M7 dossier's Q2 (driver-first vs abstractions-first) is grounded
@@ -117,8 +117,8 @@ not bottom-up rebuilds of subsystem state.
 |---|---|
 | "~950 LOC of new `rust/kernel/net/` content sketch" | **Verified plausible.** `kernel::block`'s shipped surface is in similar size class. |
 | "Single series with rtl8125_rust as example user" (Q2 option) | **Precedented.** block::base + rnull stub shipped together in 6.11-rc1. |
-| "6-12 months of patch iteration" (M7_PREP.md §exit-b estimate) | **Was conservative; revise to 12-18+ months.** Real data: 15 months RFC → first merge for the simpler block case. Net is larger. |
-| "Solo-author propensity to stall" (M7_RUST_NETDEV_LANDSCAPE.md inferred from Tomonori 2023) | **Strongly supported.** block:: had Hindborg + Almeida Filho on the RFC; Tomonori was solo and stalled. |
+| "6-12 months of patch iteration" (PREP.md §exit-b estimate) | **Was conservative; revise to 12-18+ months.** Real data: 15 months RFC → first merge for the simpler block case. Net is larger. |
+| "Solo-author propensity to stall" (RUST_NETDEV_LANDSCAPE.md inferred from Tomonori 2023) | **Strongly supported.** block:: had Hindborg + Almeida Filho on the RFC; Tomonori was solo and stalled. |
 | "Prerequisites in same series" (implicit assumption in our 4-trait sketch) | **Wrong.** Prerequisites carve out and land separately. The "single series with example user" pattern only works AFTER prerequisites are upstream. Our sketch would shrink from 5 traits → "the netdev-specific subset that doesn't already exist," with the rest landing as standalone series first. |
 
 ## Recommended dossier patches (not yet applied)
@@ -133,11 +133,11 @@ not bottom-up rebuilds of subsystem state.
 
 ## Cross-references
 
-- [`M7_PRE_RFC_DOSSIER.md`](M7_PRE_RFC_DOSSIER.md) — outbound
+- [`PRE_RFC_DOSSIER.md`](PRE_RFC_DOSSIER.md) — outbound
   consultation this calibrates.
-- [`M7_RUST_NETDEV_LANDSCAPE.md`](M7_RUST_NETDEV_LANDSCAPE.md) —
+- [`RUST_NETDEV_LANDSCAPE.md`](RUST_NETDEV_LANDSCAPE.md) —
   in-flight netdev-Rust survey (no active series).
-- [`M7_PREP.md`](M7_PREP.md) — three-exit decision matrix.
+- [`PREP.md`](PREP.md) — three-exit decision matrix.
 - LWN: [#930792](https://lwn.net/Articles/930792/) (RFC announcement),
   [#1015409](https://lwn.net/Articles/1015409/) (process discussion +
   Axboe perspective).

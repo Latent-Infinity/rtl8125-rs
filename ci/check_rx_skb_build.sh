@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# RX zero-copy hot-path contract (M6 #2 v3).
+# RX zero-copy hot-path contract.
 #
 # `r8125_bridge_rx_one_packet` runs once per received packet from NAPI poll.
 # Since the page_pool rewrite it must hand the received page to the stack
@@ -123,7 +123,7 @@ fi
 if grep -q 'ub::bridge_rx_one_packet(' <<<"$process_rx_body"; then
 	grn "NAPI RX poll calls bridge_rx_one_packet super-call"
 else
-	red "NAPI RX poll must call ub::bridge_rx_one_packet - see RX_OPTIMIZATION_CANDIDATES.md §B"
+	red "NAPI RX poll must call ub::bridge_rx_one_packet - see RX_OPTIMIZATION_CANDIDATES.md"
 fi
 
 # The poll must install the refilled buffer the super-call returns, or the

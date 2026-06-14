@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# Phase 0 guardrail for docs/UPSTREAM_GAP_CLOSURE_PLAN.md.
+# Surface-coverage guardrail.
 #
 # Names every netdev_ops / ethtool_ops / PM surface a reviewer expects and pins
 # each to a status:
 #   PRESENT  - wired in the ops struct (asserted: the symbol MUST be found).
-#   PLANNED  - a P0/P1 gap not yet implemented (asserted: must NOT be wired yet,
-#              so when a feature lands this gate FAILS until the row is flipped to
+#   PLANNED  - a gap not yet implemented (asserted: must NOT be wired yet, so
+#              when a feature lands this gate FAILS until the row is flipped to
 #              PRESENT — it cannot silently regress or drift).
-#   DEFER    - a P2 intentional defer (asserted: documented in the plan or
-#              UPSTREAM_REVIEW.md, and not wired).
+#   DEFER    - an intentional defer (asserted: documented in UPSTREAM_REVIEW.md
+#              or the gap doc, and not wired).
 #
 # This is the anti-"silently-missed-surface" gate: the exact class of error that
-# produced the RSS readback + down-interface cache fixes. As each plan phase
-# lands, move the row PLANNED->PRESENT in the table below; CI then enforces it.
+# produced the RSS readback + down-interface cache fixes. As each feature lands,
+# move the row PLANNED->PRESENT in the table below; CI then enforces it.
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -49,32 +49,46 @@ ROWS=(
   "PRESENT|get_channels|.get_channels|$ETH_C"
   "PRESENT|set_channels|.set_channels|$ETH_C"
   "PRESENT|get_rx_ring_count|.get_rx_ring_count|$ETH_C"
-  # ---- PRESENT: P0 link control plane (Phase 1, phylib) ----
+  # ---- PRESENT: link control plane (phylib) ----
   "PRESENT|get_link_ksettings|.get_link_ksettings|$ETH_C"
   "PRESENT|set_link_ksettings|.set_link_ksettings|$ETH_C"
   "PRESENT|nway_reset|.nway_reset|$ETH_C"
-  # ---- PRESENT: P0 receive-mode filtering (Phase 1) ----
+  # ---- PRESENT: receive-mode filtering ----
   "PRESENT|ndo_set_rx_mode|.ndo_set_rx_mode|$NETDEV_C"
-  # ---- PLANNED: P0 (Phase 2) ----
-  "PLANNED|pm_ops_suspend|bridge_pm_suspend|$NETDEV_C"
-  "PLANNED|pm_ops_resume|bridge_pm_resume|$NETDEV_C"
-  # ---- PLANNED: P1 (Phase 3) ----
-  "PLANNED|get_wol|.get_wol|$ETH_C"
-  "PLANNED|set_wol|.set_wol|$ETH_C"
+  # ---- PRESENT: PM (via kernel-Rust pci PM extension; PCI_PM=1 build) ----
+  "PRESENT|pm_ops_suspend|bridge_pm_suspend|$NETDEV_C"
+  "PRESENT|pm_ops_resume|bridge_pm_resume|$NETDEV_C"
   "PRESENT|get_ringparam|.get_ringparam|$ETH_C"
   "PRESENT|get_pauseparam|.get_pauseparam|$ETH_C"
   "PRESENT|set_pauseparam|.set_pauseparam|$ETH_C"
   "PRESENT|hw_tally_stats|rx_missed_errors|$NETDEV_C"
-  "PLANNED|coalesce|.get_coalesce|$ETH_C"
-  # ---- DEFER: P2 (documented, not implemented). label = keyword that must
-  #      appear in the plan / UPSTREAM_REVIEW.md; token = the op symbol. ----
-  "DEFER|EEE|.get_eee|$ETH_C"
-  "DEFER|PTP|.get_ts_info|$ETH_C"
-  "DEFER|rxnfc|.get_rxnfc|$ETH_C"
-  "DEFER|regs|.get_regs|$ETH_C"
-  "DEFER|eeprom|.get_eeprom|$ETH_C"
-  "DEFER|msglevel|.get_msglevel|$ETH_C"
-  "DEFER|netpoll|.ndo_poll_controller|$NETDEV_C"
+  # ---- PLANNED: magic-packet WoL — chip arming is implemented but the
+  #      end-to-end wake (PHY-alive suspend path) is unfinished, so the ethtool
+  #      surface is intentionally NOT advertised yet (see docs/PM_GAP.md). ----
+  "PLANNED|get_wol|.get_wol|$ETH_C"
+  "PLANNED|set_wol|.set_wol|$ETH_C"
+  # ---- PLANNED: mainline r8169 compatibility / production parity gaps. ----
+  "PLANNED|set_ringparam|bridge_set_ringparam|$ETH_C"
+  "PLANNED|ndo_features_check|.ndo_features_check|$NETDEV_C"
+  "PLANNED|ndo_eth_ioctl|.ndo_eth_ioctl|$NETDEV_C"
+  "PLANNED|get_ts_info|.get_ts_info|$ETH_C"
+  "PLANNED|get_eth_mac_stats|.get_eth_mac_stats|$ETH_C"
+  "PLANNED|get_eth_ctrl_stats|.get_eth_ctrl_stats|$ETH_C"
+  "PLANNED|get_pause_stats|.get_pause_stats|$ETH_C"
+  "PLANNED|get_eee|.get_eee|$ETH_C"
+  "PLANNED|set_eee|.set_eee|$ETH_C"
+  "PLANNED|get_rxnfc|.get_rxnfc|$ETH_C"
+  "PLANNED|set_rxnfc|.set_rxnfc|$ETH_C"
+  "PLANNED|get_regs|.get_regs|$ETH_C"
+  "PLANNED|get_eeprom|.get_eeprom|$ETH_C"
+  "PLANNED|get_msglevel|.get_msglevel|$ETH_C"
+  "PLANNED|set_msglevel|.set_msglevel|$ETH_C"
+  "PLANNED|netpoll|.ndo_poll_controller|$NETDEV_C"
+  "PLANNED|wol_broader_modes|WAKE_UCAST|$ETH_C"
+  # ---- DEFER: intentional, documented in the plan / UPSTREAM_REVIEW.md.
+  #      label = keyword that must appear there; token = the op symbol. ----
+  "DEFER|coalesce|.get_coalesce|$ETH_C"
+  "DEFER|RXALL|.set_priv_flags|$ETH_C"
 )
 
 echo "== netdev / ethtool surface inventory (UPSTREAM_GAP_CLOSURE_PLAN) =="

@@ -1,8 +1,8 @@
 # Session Resume — 2026-05-24
 
 Live-state tracker for the rtl8125-rs driver effort. Canonical specs:
-[`M1_ENTRY_CRITERIA.md`](M1_ENTRY_CRITERIA.md) and
-[`M0a_TO_M1_RUNBOOK.md`](M0a_TO_M1_RUNBOOK.md) — this file tracks where work
+[`ENTRY_CRITERIA.md`](ENTRY_CRITERIA.md) and
+[`BRINGUP_RUNBOOK.md`](BRINGUP_RUNBOOK.md) — this file tracks where work
 paused and what to do next.
 
 ---

@@ -147,7 +147,7 @@ platform before treating results as representative.
 From M5 close-out, the project uses two MS-A2 units:
 
 - **Controller** — the first MS-A2, hosts the KVM guest for fast Rust
-  iteration via VFIO passthrough (`docs/M0a_TO_M1_RUNBOOK.md`).
+  iteration via VFIO passthrough (`docs/BRINGUP_RUNBOOK.md`).
 - **Gateway** — a second MS-A2, runs the Rust driver directly on bare
   metal for the soak / perf / L1.x gates that VFIO/KVM can't honestly
   test. Setup: `docs/GATEWAY_SETUP.md`. After M6/M7 finishes, Gateway is

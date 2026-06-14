@@ -110,7 +110,7 @@ The TX Q0 mapping is the root cause of the UDP-TX wedge documented in
 delivered RX but lost TX completions. The vendor requires
 `R8125_MIN_MSIX_VEC_8125B = 22` (`r8125.h:690`) before using the V2 surface;
 otherwise it falls back to the legacy combined ISR/IMR surface. See also
-`docs/M6_MSIX_DESIGN.md` around the message-id discussion.
+`docs/MSIX_DESIGN.md` around the message-id discussion.
 
 ## Cost / Benefit
 

@@ -74,7 +74,7 @@ pub(crate) const INTR_RER: u32 = 0x0002;
 pub(crate) const INTR_TOK: u32 = 0x0004;
 pub(crate) const INTR_TER: u32 = 0x0008;
 pub(crate) const INTR_LINK_CHG: u32 = 0x0020;
-/// IRQ sources we listen for at M4 baseline: RX OK + RX err + TX OK + TX err
+/// IRQ sources we listen for at baseline: RX OK + RX err + TX OK + TX err
 /// + link-change. RX descriptor unavailable / overrun are silently dropped.
 pub(crate) const INTR_M4_BASELINE: u32 = INTR_ROK | INTR_RER | INTR_TOK | INTR_TER | INTR_LINK_CHG;
 
@@ -84,7 +84,7 @@ pub(crate) const INTR_M4_BASELINE: u32 = INTR_ROK | INTR_RER | INTR_TOK | INTR_T
 // with an MSI/MSI-X vector allocation from probe. Bit N corresponds to
 // MSI-X message_id N. We use a small subset: ROK_Q0 (bit 0), TOK_Q0
 // (bit 16), LINKCHG (bit 21 — vendor default `HwCurrIsrVer`).
-// Full hardware RSS can later add RX queue bits here; this checkpoint only
+// Full hardware RSS can later add RX queue bits here; this baseline only
 // unmasks queue 0 plus the single TX/link owners validated for B3.
 //
 // Vendor: `IMR_V2_CLEAR_REG_8125 = 0x0D00`, `ISR_V2_8125 = 0x0D04`,
@@ -120,10 +120,10 @@ pub(crate) const V2_LINK_VECTOR: u32 = 21;
 pub(crate) const V2_MIN_MSIX_VECTORS_8125B: u32 = 22;
 
 // ── INT_CFG — 8125 interrupt config ──────────────────────────────────────
-/// `INT_CFG0` (8-bit at 0x34). At M4 we write 0 (legacy-ISR mode).
+/// `INT_CFG0` (8-bit at 0x34). We write 0 (legacy-ISR mode).
 /// The B3 interrupt model sets `INT_CFG0_ENABLE_8125` to activate the
 /// per-message-id ISR_V2 register layout (`IMR_V2_*` / `ISR_V2` at
-/// 0x0D0C / 0x0D04). See docs/M6_MSIX_DESIGN.md.
+/// 0x0D0C / 0x0D04). See docs/MSIX_DESIGN.md.
 pub(crate) const INT_CFG0: usize = 0x34;
 /// `INT_CFG0` bit 0 — enables the V2 ISR/IMR register layout. Vendor:
 /// `rtl8125_hw_set_interrupt_type` (`r8125_n.c:4534`) does
@@ -161,11 +161,11 @@ pub(crate) const INT_MITI_V2_0_TX: usize = 0xA02;
 /// We target VER_63 only.
 pub(crate) const COALESCE_TABLE_8125B_START: usize = 0xA00;
 pub(crate) const COALESCE_TABLE_8125B_END: usize = 0xA80;
-/// Candidate RX moderation timer for vector 0. `0x10` eliminated 64/128B
+/// RX moderation timer for vector 0. `0x10` eliminated 64/128B
 /// packet loss but capped peak RX pps versus r8169, so the next validation
 /// pass starts lower and sweeps via the module parameter.
 pub(crate) const RX_COALESCE_TIMER_8125B_DEFAULT: u16 = 0x0008;
-/// Candidate TX moderation timer for vector 0. BQL is disabled on the tracked
+/// TX moderation timer for vector 0. BQL is disabled on the tracked
 /// MSI path by default, so TX-completion timing is still swept separately from
 /// the INTx+BQL latency fix.
 pub(crate) const TX_COALESCE_TIMER_8125B_DEFAULT: u16 = 0x0010;
@@ -365,7 +365,7 @@ pub(crate) const RXCFG_FETCH_DFLT_8125: u32 = 8 << 27; // bits 27-29
 pub(crate) const RXCFG_8125B_CHIP_BITS: u32 =
     RXCFG_DMA_BURST | RXCFG_PAUSE_SLOT_ON_8125B | RXCFG_FETCH_DFLT_8125;
 
-/// M4 baseline RX policy: broadcast + multicast + my-MAC (no promisc)
+/// baseline RX policy: broadcast + multicast + my-MAC (no promisc)
 /// + the 8125B chip-config bits above. r8169 writes these together so
 ///
 /// the full 32-bit RxConfig has both accept policy AND FIFO/DMA setup.
@@ -421,7 +421,7 @@ pub(crate) const JUMBO_16K_BYTES: usize = 16384;
 pub(crate) const DESC_OWN: u32 = 0x8000_0000;
 /// `EOR` — End-Of-Ring marker. Set on the last descriptor of the ring.
 pub(crate) const DESC_EOR: u32 = 0x4000_0000;
-/// TX: `FS`/`LS` — first / last fragment of a packet. M4 baseline uses
+/// TX: `FS`/`LS` — first / last fragment of a packet. The baseline uses
 /// linear single-fragment TX, so both bits are set on every TX descriptor.
 pub(crate) const DESC_TX_FS: u32 = 0x2000_0000;
 pub(crate) const DESC_TX_LS: u32 = 0x1000_0000;

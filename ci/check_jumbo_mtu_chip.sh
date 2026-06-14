@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# Static gate for M6 jumbo frames (plan §7 M6 #3). Verifies that
+# Static gate for jumbo frames. Verifies that
 # once max_mtu is bumped beyond ETH_DATA_LEN, the chip-side
 # RxMaxSize register is sized accordingly. Without this pairing the
 # chip would silently truncate frames at the smaller of (RxMaxSize,

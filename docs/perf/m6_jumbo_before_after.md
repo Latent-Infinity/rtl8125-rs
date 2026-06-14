@@ -136,7 +136,7 @@ calls + 43 889 MSI-X IRQs/5 s** completed in **1 s** with no kernel
 + the `pci::Driver::unbind` BAR-UAF fix together close the entire
 class of teardown-time bugs that previously blocked the M5 close-out
 on Gateway. See
-[`docs/M6_JUMBO_DESIGN.md`](../M6_JUMBO_DESIGN.md) for the design
+[`docs/JUMBO_DESIGN.md`](../JUMBO_DESIGN.md) for the design
 narrative.
 
 ## Caveats and pending work

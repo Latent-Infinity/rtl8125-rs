@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-//! sk_buff ownership wrapper for the RTL8125 Rust driver — plan §6.3.
+//! sk_buff ownership wrapper for the RTL8125 Rust driver.
 //!
 //! ## DriverOwnedSkb (task #62, 2026-05-29)
 //!
@@ -20,9 +20,9 @@
 //! time when a value is dropped without being consumed; that path is also
 //! a kmemleak-visible skb leak in the debug+Rust guest kernel.
 //!
-//! ## What §6.3 type-state lands here later (refactor pending — M5)
+//! ## What type-state lands here later (refactor pending)
 //!
-//! The plan §6.3 sketches per-state wrappers above the
+//! A possible refactor sketches per-state wrappers above the
 //! [`DriverOwnedSkb`] layer:
 //!
 //! ```text
@@ -33,8 +33,8 @@
 //! struct Completing;        // hardware released OWN; reaper holds it
 //! ```
 //!
-//! with state-consuming transitions. That refactor is queued for an
-//! M5 follow-up alongside the NAPI-stability work (plan §7 M5), where
+//! with state-consuming transitions. That refactor is queued for a
+//! follow-up alongside the NAPI-stability work, where
 //! the type discipline pays its rent in
 //! `tx_received == tx_consumed + tx_busy_exception + tx_dropped_error`
 //! correctness under load. [`DriverOwnedSkb`] is the entry point for
@@ -170,7 +170,7 @@ impl DriverOwnedSkb {
     }
 
     /// `(consumes)` TX completion path — give the skb back to NAPI
-    /// for recycling. §6.3 TX disposition (a). `tx_consumed++` happens
+    /// for recycling. TX disposition (a). `tx_consumed++` happens
     /// inside the cshim helper. Returns the wire length (`skb->len`) so the
     /// reaper can batch it into the BQL completed-queue accounting.
     #[inline]

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# Kernel-Rust Clippy gate (RUST_STANDARDS.md §18, plan §6.1/§11).
+# Kernel-Rust Clippy gate (RUST_STANDARDS.md §18).
 #
 # Runs `make CLIPPY=1` and fails on any clippy/rustc warning. This is
 # the in-tree kernel-build Clippy — NOT `cargo clippy` (the project

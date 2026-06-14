@@ -10,12 +10,12 @@
 #   1. The cshim is the only audited C in the project — the unsafe
 #      surface our Rust crate trusts. Reviewer attention scales
 #      poorly above ~400 LOC per translation unit.
-#   2. The plan §5.2 documents the cshim as a *bounded* set of net-
+#   2. The cshim is a *bounded* set of net-
 #      device-side wrappers, not a place where chip logic accretes.
 #      File size growing past its declared cap is the canary for
 #      that drift.
-#   3. The M7 maintainer consultation cites cshim symbol + LOC
-#      totals (docs/M7_PRE_RFC_DOSSIER.md). Keeping each file inside
+#   3. The maintainer consultation cites cshim symbol + LOC
+#      totals (docs/PRE_RFC_DOSSIER.md). Keeping each file inside
 #      its documented cap means those totals stay honest.
 #
 # Parsing rule: grab the first integer on any line that contains

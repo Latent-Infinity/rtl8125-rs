@@ -19,9 +19,9 @@
  M ci/check_rmmod_while_up.sh
  M ci/check_rx_pool_pages.sh
  M ci/run_checks.sh
- M docs/M5_CLOSEOUT.md
- M docs/M5_PM_GAP.md
- M docs/M7_PREP.md
+ M docs/HARDENING_CLOSEOUT.md
+ M docs/PM_GAP.md
+ M docs/PREP.md
  M docs/RUST_STANDARDS.md
  M docs/SESSION_RESUME.md
  M src/README.md
@@ -78,10 +78,10 @@
 ?? docs/FAILURE_MODES.md
 ?? docs/GATEWAY_HARDWARE.md
 ?? docs/LESSONS_LEARNED.md
-?? docs/M7_BLOCK_CADENCE.md
-?? docs/M7_CSHIM_KERNEL_DIFF.md
-?? docs/M7_PRE_RFC_DOSSIER.md
-?? docs/M7_RUST_NETDEV_LANDSCAPE.md
+?? docs/BLOCK_CADENCE.md
+?? docs/CSHIM_KERNEL_DIFF.md
+?? docs/PRE_RFC_DOSSIER.md
+?? docs/RUST_NETDEV_LANDSCAPE.md
 ?? docs/PATTERNS.md
 ?? docs/PER_MTU_RX_SIZING.md
 ?? docs/POST_SOAK_PLAN.md

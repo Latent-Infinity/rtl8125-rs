@@ -62,7 +62,7 @@ const RTL8125_DEVICE_ID: u32 = 0x8125;
 /// alias; BAR4 is the MSI-X table — neither is what we want to map.
 const R8125_MMIO_BAR: u32 = 2;
 
-/// Per-device-ID payload. M1/M2 have no per-ID dispatch — the per-revision
+/// Per-device-ID payload. There is no per-ID dispatch — the per-revision
 /// dispatch table lives in `hw.rs` and is matched at runtime against
 /// `TxConfig` XID. `IdInfo = ()` keeps the table minimal.
 type IdInfo = ();
@@ -91,28 +91,28 @@ kernel::pci_device_table!(
 /// first so its idempotent Drop runs before `_bar` + `tx_ring` + `rx_ring`
 /// when `unbind` never ran. Then `pdev` (just a refcount) last.
 ///
-/// Historical: 2026-05-25 M4-full first cut crashed with a KASAN slab-UAF
-/// in `rust_stop+0x80` because this struct previously listed `_netdev`
+/// Historical: 2026-05-25 the first full net_device cut crashed with a KASAN
+/// slab-UAF in `rust_stop+0x80` because this struct previously listed `_netdev`
 /// last, with a doc comment that wrongly claimed Rust drops fields in
-/// reverse. See `src/netdev.rs` M4_FULL_OPS comment block.
+/// reverse. See `src/netdev.rs` FULL_OPS comment block.
 ///
 /// - `_netdev` — RAII for the registered net_device + boxed NetdevState.
 ///   `unbind` calls `shutdown` while the BAR is mapped; Drop is the
 ///   idempotent fallback and always frees the KBox.
 /// - `_bar` — [`Devres`]-owned MMIO mapping; on drop calls `iounmap` +
 ///   `pci_release_region`.
-/// - `tx_ring`, `rx_ring` — M3 cold DMA descriptor rings (`RING_LEN + 1`
+/// - `tx_ring`, `rx_ring` — cold DMA descriptor rings (`RING_LEN + 1`
 ///   each, +1 tail canary). On drop, `dma_free_coherent` runs.
 /// - `pdev` — [`ARef`] keeps the underlying `struct pci_dev` alive for
 ///   the whole bound period. Drops last.
 ///
 /// No explicit `PinnedDrop` impl — that would be an `unsafe impl`, which
 /// the crate-root `#![deny(unsafe_code)]` rejects. The safe `unbind` hook plus
-/// field-level Drop handle teardown; M1/M2/M3/M4 gates have verified it under
+/// field-level Drop handle teardown; this has been verified under
 /// kmemleak + lockdep + KASAN.
 #[pin_data]
 pub(crate) struct R8125Driver {
-    /// M4 net_device — must drop FIRST. See struct-level docs.
+    /// net_device — must drop FIRST. See struct-level docs.
     _netdev: NetdevHandle,
     #[pin]
     _bar: Devres<pci::Bar<{ mmio::R8125_MMIO_LEN }>>,
@@ -147,6 +147,31 @@ impl pci::Driver for R8125Driver {
         this._netdev.shutdown();
     }
 
+    /// System-sleep suspend (wired via the kernel-Rust PCI adapter's dev_pm_ops,
+    /// extended for PM support). Quiesce the device through the cshim; the PCI
+    /// core saves config space + sets the D-state around this. No-op if the
+    /// interface was down. See docs/PM_GAP.md.
+    ///
+    /// Gated on the `r8125_pci_pm` cfg (Makefile `PCI_PM=1`): the
+    /// `pci::Driver::suspend`/`resume` trait hooks only exist on a kernel
+    /// carrying the kernel-Rust PCI PM extension
+    /// (kernel-patches/0001-rust-pci-add-pm-callbacks.patch). On a stock kernel
+    /// the trait has no such methods, so this impl must be compiled out to keep
+    /// the driver buildable upstream. Validated on 7.0.0-kasan, 2026-06-13.
+    #[cfg(r8125_pci_pm)]
+    fn suspend(_dev: &pci::Device<Core>, this: Pin<&Self>) -> Result {
+        unsafe_boundary::bridge_pm_suspend(this._netdev.ndev());
+        Ok(())
+    }
+
+    /// System-sleep resume: re-initialise the device through the cshim if it was
+    /// up before suspend (config space + D0 already restored by the PCI core).
+    /// See [`suspend`](Self::suspend) for the `r8125_pci_pm` cfg rationale.
+    #[cfg(r8125_pci_pm)]
+    fn resume(_dev: &pci::Device<Core>, this: Pin<&Self>) -> Result {
+        unsafe_boundary::bridge_pm_resume(this._netdev.ndev())
+    }
+
     fn probe(pdev: &pci::Device<Core>, _info: &Self::IdInfo) -> impl PinInit<Self, Error> {
         pin_init::pin_init_scope(move || {
             dev_info!(
@@ -157,10 +182,10 @@ impl pci::Driver for R8125Driver {
                 pdev.revision_id()
             );
 
-            // M1: enable memory decoding before claiming the BAR mapping.
+            // Enable memory decoding before claiming the BAR mapping.
             pdev.enable_device_mem()?;
 
-            // M3: set 64-bit DMA mask BEFORE any coherent allocation. Wraps
+            // Set 64-bit DMA mask BEFORE any coherent allocation. Wraps
             // the kernel-Rust `unsafe fn dma_set_mask_and_coherent`; the
             // SAFETY contract lives in `unsafe_boundary::set_64bit_dma_mask`.
             unsafe_boundary::set_64bit_dma_mask(pdev)?;
@@ -178,7 +203,7 @@ impl pci::Driver for R8125Driver {
                 _: {
                     // Field init order matters: `_bar` is now initialized; we
                     // can take a temporary `&pci::Bar` through `Devres::access`
-                    // and drive the M2 register-layer work. If any step here
+                    // and drive the register-layer work. If any step here
                     // returns `Err`, the in-flight init drops `_bar`'s Devres
                     // → `iounmap` + `pci_release_region`, and the device is
                     // left in a state where r8169 can rebind cleanly.
@@ -229,7 +254,7 @@ impl pci::Driver for R8125Driver {
                     ]
                 },
                 _: {
-                    // M3 cold-ring sanity.
+                    // Cold-ring sanity.
                     tx_ring.verify_canaries()?;
                     for r in rx_rings.iter() {
                         r.verify_canaries()?;
@@ -243,7 +268,7 @@ impl pci::Driver for R8125Driver {
                         ring::RING_LEN
                     );
                 },
-                // M4-full: read real MAC from IDR0..IDR5; build a
+                // Read real MAC from IDR0..IDR5; build a
                 // `Box<NetdevState>` that captures stable pointers to BAR
                 // and ring descriptors + an RX buffer pool; pass it as the
                 // cshim cookie. The NetdevHandle reclaims the Box on drop.
@@ -359,7 +384,7 @@ impl pci::Driver for R8125Driver {
                         if intx_only { ", forced by intx_only" } else { "" }
                     );
 
-                    // Candidate L + #4 + multi-queue — IRQ affinity policy.
+                    // IRQ affinity policy.
                     //
                     // The `irq_pin_cpu` module param selects:
                     //   255  → auto: SPREAD the active vectors across distinct

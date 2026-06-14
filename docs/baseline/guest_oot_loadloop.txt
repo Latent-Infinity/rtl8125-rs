@@ -55,7 +55,7 @@ dmesg grep -iE 'kmemleak|lockdep|BUG:|WARNING|KASAN|UBSAN' = (none — CLEAN)
 ## ACCEPTANCE: PASS
 100 insmod/rmmod cycles, refcount 0 each time, zero kmemleak/lockdep/BUG/WARN.
 
-## Runbook corrections required (docs/M0a_TO_M1_RUNBOOK.md Phase 7)
+## Runbook corrections required (docs/BRINGUP_RUNBOOK.md Phase 7)
 The Phase 7 recipe as written does NOT work in this environment:
 1. `LLVM=1` is WRONG — the guest kernel is GCC-built (gcc 15.2.0). LLVM=1
    forces clang for the C module-glue (.mod.o) and clang rejects GCC-only

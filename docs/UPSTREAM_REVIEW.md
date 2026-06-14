@@ -25,8 +25,8 @@ below was assembled from the netdev FAQ, `Documentation/process/`,
 | **Clean rmmod path; no leaks on probe failure** | done | `pci.rs` unbind sequencing documented; 100-cycle rmmod-under-traffic stress green (task #69); 20-cycle KVM stress green |
 | **NAPI contract (budget, completion, IRQ masking)** | done | `napi.rs` module docstring lists the M5 section 7 contract; `ci/check_napi_contract.sh` enforces statically |
 | **ethtool baseline (`get_link`, `get_drvinfo`, stats)** | done | `get_link`, `get_drvinfo`, `-S` stats; **plus** the RSS control plane (`get/set_rxfh`, `get_rxfh_*_size`, `get_channels`, `set_channels`, `get_rx_ring_count`). **Gaps (see HW-feature row below):** `get/set_link_ksettings` + `nway_reset`, `get/set_coalesce`, `get/set_wol`, `get/set_ringparam`, `get/set_pauseparam` |
-| **HW-feature surface for a NIC RFC** | partial — gaps tracked | Present: csum/TSO/SG/VLAN/RXHASH/jumbo offloads, multi-queue RSS. **Missing before posting (chip supports all): `link_ksettings`+`nway_reset` (basic `ethtool <if>` — high), `pm_ops` suspend/resume (high, see `docs/M5_PM_GAP.md`), WoL `get/set_wol` (high), `get/set_coalesce` (INT_MITI already programmed), `get/set_ringparam`, `get/set_pauseparam`; EEE + PTP/`get_ts_info` deferrable.** |
-| **Driver-level PM ops (`suspend` / `resume`)** | Deferred | No `pm_ops` set on `pci_driver`; system-suspend across the driver is untested. Documented in `docs/M5_PM_GAP.md`; tracked for a follow-up patch |
+| **HW-feature surface for a NIC RFC** | partial — gaps tracked | Present: csum/TSO/SG/VLAN/RXHASH/jumbo offloads, multi-queue RSS. **Missing before posting (chip supports all): `link_ksettings`+`nway_reset` (basic `ethtool <if>` — high), `pm_ops` suspend/resume (high, see `docs/PM_GAP.md`), WoL `get/set_wol` (high), `get/set_coalesce` (INT_MITI already programmed), `get/set_ringparam`, `get/set_pauseparam`; EEE + PTP/`get_ts_info` deferrable.** |
+| **Driver-level PM ops (`suspend` / `resume`)** | Deferred | No `pm_ops` set on `pci_driver`; system-suspend across the driver is untested. Documented in `docs/PM_GAP.md`; tracked for a follow-up patch |
 | **PCI hot-plug `remove` ordering** | done | `R8125Driver::remove` sequencing documented at `src/pci.rs:132`; tested by 100-cycle stress |
 | **MAINTAINERS entry** | Drafted this pass | **Added `MAINTAINERS` stanza in this pass** with the current repository author identity; the human submitter must confirm or replace it before posting |
 | **`Documentation/networking/device_drivers/realtek/r8125_rust.rst`** | Fixed this pass | **Added user-facing reST doc in this pass**, kernel-style, covers module params + supported chips + ethtool stats + limitations |
@@ -34,10 +34,10 @@ below was assembled from the netdev FAQ, `Documentation/process/`,
 | **checkpatch.pl clean (cshim)** | Fixed this pass | `ci/check_checkpatch.sh` runs on six cshim C files plus two headers; current state is clean |
 | **Clippy clean (Rust)** | done | `ci/check_clippy.sh` enforces; full `clippy::pedantic` plus crate-local `#![deny(unsafe_code)]` except for the one audited `unsafe_boundary` module |
 | **Signed-off-by on every commit** | Blocked | Current commit history was developed in agent-assisted shape **without** DCO trailers. **A `.gitmessage` template + `docs/COMMIT_POLICY.md` added in this pass.** Pre-submission requires `git rebase -i --signoff` or `git filter-repo` to add DCO retroactively; flagged in the M7 dossier as a hard prerequisite |
-| **Reviewed-by / Tested-by from a second engineer** | Blocked | Single-developer tree; this is normal for a pre-RFC dossier, but the submission cover letter should call out the Tested-by from the soak harness automation explicitly (Controller + Gateway 24h ASPM-{on,off} x {idle,active} matrix per `docs/M5_CLOSEOUT.md`) |
+| **Reviewed-by / Tested-by from a second engineer** | Blocked | Single-developer tree; this is normal for a pre-RFC dossier, but the submission cover letter should call out the Tested-by from the soak harness automation explicitly (Controller + Gateway 24h ASPM-{on,off} x {idle,active} matrix per `docs/HARDENING_CLOSEOUT.md`) |
 | **Performance numbers vs in-tree alternative** | done | `docs/perf/r8169_comparison.md` + Gateway baseline; KVM 24h active soak + Gateway 24h active soak both clean with cache-padded fix |
 | **KASAN / lockdep / DMA_API_DEBUG clean over 24h soak** | done | `ci/check_active_soak.sh` enforces; M5_CLOSEOUT confirms |
-| **Cover-letter material (why this driver, given r8169)** | done | `docs/M7_PRE_RFC_DOSSIER.md` answers verbatim; section "Why a Rust RTL8125 driver" |
+| **Cover-letter material (why this driver, given r8169)** | done | `docs/PRE_RFC_DOSSIER.md` answers verbatim; section "Why a Rust RTL8125 driver" |
 | **Self-tests in `tools/testing/selftests/net/`** | Added this pass | `tools/testing/selftests/net/r8125_rust_smoke.sh` covers load, bound netdev discovery, `ip link show`, and unload; the local Makefile wires it into `TEST_PROGS`; `ci/check_selftest_smoke.sh` enforces its TAP/skip/load/unload shape |
 | **Reproducible CI (`make`, build matrix)** | done | `ci/run_checks.sh` runs the local static gate suite plus `ci/check_clippy.sh` against the validated rustc-1.93 |
 | **No new global symbols leaked to other modules** | Fixed this pass | Removed `EXPORT_SYMBOL_GPL` from module-private `r8125_bridge_*` cshim helpers; `ci/check_no_bridge_exports.sh` prevents regressions |
@@ -56,7 +56,7 @@ below was assembled from the netdev FAQ, `Documentation/process/`,
    takes responsibility for the patch -- see `docs/COMMIT_POLICY.md`.
 2. **Driver suspend/resume (`pm_ops`).** Even RFC patches that touch a
    PCI device under power management get pushback if `pm_ops` is left
-   empty. We have the design noted in `docs/M5_PM_GAP.md` but no code.
+   empty. We have the design noted in `docs/PM_GAP.md` but no code.
    Suggested scope: implement `pci_driver.driver.pm = &r8125_rust_pm`
    with `suspend_late` / `resume_early` callbacks that tear down the
    chip via `ndo_stop` shape and bring it back up via `ndo_open`.
@@ -87,7 +87,7 @@ remaining ethtool surfaces is tracked in `docs/UPSTREAM_GAP_CLOSURE_PLAN.md`.
 > are implemented and hardware-validated at vendor-C parity-or-better (default
 > stays single-queue `rss_queues=0`). See `docs/RSS_RXHASH_IMPLEMENTATION_PLAN.md`,
 > `docs/perf/rss_multiqueue_20260609/`, `docs/perf/cvr_sweep_20260609/`. The old
-> `docs/M6_MULTIQ_NA.md` is superseded (its "N/A on 8125B" premise was wrong).
+> `docs/MULTIQUEUE_RSS.md` is superseded (its "N/A on 8125B" premise was wrong).
 
 ## Architectural concerns the maintainer will raise
 
@@ -95,12 +95,12 @@ These are not gaps in our tree -- they're known choices the cover letter
 must justify:
 
 - **"Why a new driver if r8169 already covers RTL8125?"** Covered by
-  `docs/M7_PRE_RFC_DOSSIER.md` section Background; the rebuttal is "this is
+  `docs/PRE_RFC_DOSSIER.md` section Background; the rebuttal is "this is
   a Rust netdev prototype driver; if the pathway is acceptable, the
   reusable abstractions are the leverage." If the maintainer prefers
-  Exit (b) in `docs/M7_PREP.md` (land abstractions first, port driver second),
+  Exit (b) in `docs/PREP.md` (land abstractions first, port driver second),
   we're prepared for that path.
-- **"Why a cshim?"** Covered by `docs/M7_CSHIM_KERNEL_DIFF.md` --
+- **"Why a cshim?"** Covered by `docs/CSHIM_KERNEL_DIFF.md` --
   the cshim helper set is documented there and mirrored by `// SAFETY:`
   rationale on the Rust side. The narrative is "thin C bridge, thick
   Rust core"; per-file C shim LOC caps and checkpatch keep the bridge
@@ -146,10 +146,10 @@ must justify:
 
 ## Cross-references
 
-- `docs/M7_PRE_RFC_DOSSIER.md` -- narrative cover letter draft.
-- `docs/M7_PREP.md` -- exit-path decision tree.
-- `docs/M7_CSHIM_KERNEL_DIFF.md` -- cshim <-> kernel surface diff.
-- `docs/M7_RUST_NETDEV_LANDSCAPE.md` -- kernel-Rust netdev work in-flight.
+- `docs/PRE_RFC_DOSSIER.md` -- narrative cover letter draft.
+- `docs/PREP.md` -- exit-path decision tree.
+- `docs/CSHIM_KERNEL_DIFF.md` -- cshim <-> kernel surface diff.
+- `docs/RUST_NETDEV_LANDSCAPE.md` -- kernel-Rust netdev work in-flight.
 - `Documentation/process/submitting-patches.rst` (in any kernel tree) --
   the canonical patch-submission checklist.
 - `Documentation/networking/index.rst` -- where the RST under

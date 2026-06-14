@@ -13,12 +13,11 @@
 #include <linux/phy.h>
 #include <linux/workqueue.h>
 
-/* §6.3 disposition counters live in per-CPU storage so the hot-path
+/* The disposition counters live in per-CPU storage so the hot-path
  * `this_cpu_inc()` is a single decorated INC instruction with no cache-
  * line bouncing between TX context (xmit / process) and reaper context
- * (NAPI / softirq). See RUST_STANDARDS.md §15.2 and docs/M4_CLOSEOUT.md.
- * `r8125_bridge_counters_snapshot` sums across CPUs for the userspace
- * `ethtool -S` surface.
+ * (NAPI / softirq). `r8125_bridge_counters_snapshot` sums across CPUs for
+ * the userspace `ethtool -S` surface.
  */
 struct page_pool;	/* zero-copy RX buffer owner (netdev_bridge_rx_pool.c) */
 
@@ -54,7 +53,7 @@ struct r8125_bridge {
 	struct r8125_bridge_rx_queue rxq[R8125_BRIDGE_RX_QUEUE_COUNT];
 	/* RX queues actually active this open (1..RX_QUEUE_COUNT). Reported by
 	 * ethtool get_channels / get_rx_ring_count. Defaults to 1; the Rust side
-	 * updates it when an rss_queues opt-in activates more (B6.3).
+	 * updates it when an rss_queues opt-in activates more.
 	 */
 	unsigned int active_rx_queues;
 	void *priv;
@@ -92,12 +91,12 @@ struct r8125_bridge {
 };
 
 /* ethtool ops table; defined in netdev_bridge_ethtool.c. Exposes the
- * §6.3 counters via `ethtool -S` so the runtime invariant check
+ * disposition counters via `ethtool -S` so the runtime invariant check
  * (`ci/check_counter_invariant.sh`) can read them from userspace.
  */
 extern const struct ethtool_ops r8125_bridge_ethtool_ops;
 
-/* §6.3 percpu counter lifecycle helpers, defined in
+/* The percpu counter lifecycle helpers, defined in
  * netdev_bridge_counters.c. Called from r8125_bridge_alloc /
  * r8125_bridge_{free,unregister_and_free} only; never on a hot path.
  */

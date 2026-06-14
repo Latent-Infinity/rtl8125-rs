@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
-//! The single permitted home for `unsafe` in this crate (plan §6.2).
+//! The single permitted home for `unsafe` in this crate.
 //!
 //! Crate root carries `#![deny(unsafe_code)]`; this module locally lifts that
 //! by `#![allow(unsafe_code)]`. CI (`ci/check_unsafe_allowlist.sh`) refuses
 //! any other file that locally allows `unsafe_code` unless it is named in
 //! `.unsafe-allowlist` — and this is the only entry there.
 //!
-//! Every block carries a `// SAFETY:` comment that states (plan §6.2):
+//! Every block carries a `// SAFETY:` comment that states:
 //!  - which hardware or C-side invariant is being relied on;
 //!  - who currently owns the memory (CPU vs. device);
 //!  - what ordering / barrier requirement applies;
@@ -15,12 +15,12 @@
 //!
 //! AI-generated patches that touch this file get the strictest human review.
 //!
-//! ## M2 status
+//! ## Register-layer status
 //!
 //! Empty — the kernel `pci`, `io::mem`, `devres`, and `time::delay` APIs
-//! covered every M2 register-layer need in safe Rust.
+//! covered every register-layer need in safe Rust.
 //!
-//! ## M3 status
+//! ## DMA-layer status
 //!
 //! Three residents land here:
 //!  - [`set_64bit_dma_mask`] wraps the unsafe `dma_set_mask_and_coherent`
@@ -67,7 +67,7 @@ use crate::ring::{
 /// per device) and **before** any `CoherentAllocation::alloc_coherent`, so
 /// the contract holds.
 ///
-/// Other §6.2 facets:
+/// Other safety facets:
 ///  - **Hardware invariant**: the RTL8125 is a PCIe device whose BAR2 and
 ///    descriptor DMAs both fit in any addr range ≤ 64 bits; a 64-bit mask
 ///    is always a superset of what the device needs.
@@ -145,14 +145,14 @@ unsafe impl FromBytes for RxDescV4 {}
 // (any value is its own one-shot initializer). See `pci.rs::probe`.
 
 // ───────────────────────────────────────────────────────────────────────
-// M4 — Rust ↔ C bridge FFI declarations + safe wrappers
+// Rust ↔ C bridge FFI declarations + safe wrappers
 //
 // The C side lives in `src/netdev_bridge*.c`; the contract is in
 // `src/netdev_bridge.h`. Everything here is mechanical glue:
 //   - the function-pointer table the Rust side hands to the C bridge
 //     (`BridgeOps` — `#[repr(C)]` matches `struct r8125_bridge_ops`),
 //   - `extern "C"` declarations for the cshim entry points,
-//   - safe Rust wrappers each with a `// SAFETY:` block per §6.2.
+//   - safe Rust wrappers each with a `// SAFETY:` block.
 // ───────────────────────────────────────────────────────────────────────
 
 /// Rust mirror of `struct r8125_bridge_ops` — same layout, same ABI.
@@ -217,6 +217,10 @@ extern "C" {
     );
     fn r8125_bridge_set_active_rx_queues(ndev: *mut bindings::net_device, n: c_uint);
     fn r8125_bridge_dev_addr(ndev: *mut bindings::net_device, out: *mut u8);
+    #[cfg(r8125_pci_pm)]
+    fn r8125_bridge_pm_suspend(ndev: *mut bindings::net_device);
+    #[cfg(r8125_pci_pm)]
+    fn r8125_bridge_pm_resume(ndev: *mut bindings::net_device) -> c_int;
     fn r8125_bridge_irq_pin_cpu(irq: u32, cpu: c_int) -> c_int;
     fn r8125_bridge_num_online_cpus() -> c_uint;
     fn r8125_bridge_node_base_cpu(pdev: *mut bindings::pci_dev) -> c_int;
@@ -242,7 +246,7 @@ extern "C" {
     );
     fn r8125_bridge_tx_busy_exception(ndev: *mut bindings::net_device);
 
-    // ── Scatter-gather + TSO (M4-perf phase 2, task 49) ─────────────────
+    // ── Scatter-gather + TSO (task 49) ──────────────────────────────────
     fn r8125_bridge_skb_data_dma_map(
         dev: *mut bindings::device,
         skb: *mut bindings::sk_buff,
@@ -279,7 +283,7 @@ extern "C" {
         bytes: c_uint,
     );
 
-    // ── PHY plumbing (M4-traffic) ────────────────────────────────────────
+    // ── PHY plumbing ─────────────────────────────────────────────────────
     fn r8125_bridge_phy_register(
         ndev: *mut bindings::net_device,
         ops: *const BridgeMdioOps,
@@ -288,7 +292,7 @@ extern "C" {
     fn r8125_bridge_phy_kick_state_machine(ndev: *mut bindings::net_device) -> c_int;
     fn r8125_bridge_phy_stop(ndev: *mut bindings::net_device);
 
-    // ── Zero-copy RX (M6 #2 v3) — page_pool + per-MTU buffers ──────────
+    // ── Zero-copy RX — page_pool + per-MTU buffers ─────────────────────
     // The pool is created per ndo_open sized for dev->mtu; `out_buf_len`
     // is the device-writable bytes per buffer (drives descriptor LEN +
     // RxMaxSize). Destroy happens after every slot is freed.
@@ -307,7 +311,7 @@ extern "C" {
     ) -> c_int;
     fn r8125_bridge_rx_free(ndev: *mut bindings::net_device, queue_id: c_uint, cpu: *mut c_void);
 
-    // RX super-call (Candidate B + #3): zero-copy napi_build_skb +
+    // RX super-call: zero-copy napi_build_skb +
     // page-pool recycle, with alloc-before-consume refill. Outputs the
     // slot's refilled (cpu, dma) so the caller updates its shadow and
     // re-posts the descriptor. On drop the outputs equal the inputs.
@@ -369,7 +373,7 @@ unsafe impl Send for NetdevState {}
 // device-owned coherent memory.
 unsafe impl Sync for NetdevState {}
 
-// ── Safe wrappers — M4-full hot path ──────────────────────────────────────
+// ── Safe wrappers — hot path ──────────────────────────────────────────────
 
 /// Enable bus-mastering. Kernel API method is safe but lives on
 /// `pci::Device<Core>` only; we re-expose it from a `&ARef<pci::Device>`
@@ -427,7 +431,7 @@ pub(crate) fn request_irq(
 /// `bindings::*` directly.
 pub(crate) const IRQF_SHARED: usize = bindings::IRQF_SHARED as usize;
 
-// ── PCI IRQ vector allocation (M6 #1 Phase A.2) ──────────────────────────
+// ── PCI IRQ vector allocation ────────────────────────────────────────────
 //
 // Kernel-Rust ships safe `pci::Device<Bound>::alloc_irq_vectors` that
 // internally registers the allocation with `devres` so
@@ -491,7 +495,7 @@ pub(crate) fn pci_irq_vector<Ctx: device::DeviceContext>(
     }
 }
 
-// ── Zero-copy RX-pool safe wrappers (M6 #2 v3) ───────────────────────────
+// ── Zero-copy RX-pool safe wrappers ──────────────────────────────────────
 //
 // A `page_pool` owns every RX buffer. Each `RxSlot` holds one page's CPU
 // base + device-visible DMA address pulled from the pool. The pool's
@@ -738,7 +742,7 @@ pub(crate) fn desc_publish_own(ring: *mut u8, idx: usize, value: Descriptor, for
     }
 }
 
-// ── RX descriptor helpers (phase 1) ───────────────────────────────────────
+// ── RX descriptor helpers ──────────────────────────────────────────────────
 
 /// Read ONLY the `opts1`/OWN word for the cheap pre-`dma_rmb()` ownership
 /// check, using the precomputed [`RxParse`] offsets (no full descriptor fetch,
@@ -805,7 +809,7 @@ pub(crate) fn desc_write_rx(ring: *mut u8, idx: usize, value: RxDescriptor, form
     }
 }
 
-// `rx_buf_ptr` was removed alongside the M6 #2 jumbo refactor. NAPI now
+// `rx_buf_ptr` was removed alongside the jumbo refactor. NAPI now
 // reads `state.rx_slot(i).cpu` directly — see `src/netdev.rs::RxSlot`.
 
 // ── sk_buff helpers — safe wrappers, counters live inside the cshim ──────
@@ -874,9 +878,43 @@ pub(crate) fn bridge_dev_addr(ndev: *mut bindings::net_device) -> [u8; 6] {
     out
 }
 
+/// System-sleep suspend: detach + quiesce the device if it was up. The cshim
+/// takes RTNL and the PCI core handles config save + D-state.
+///
+/// Gated on the `r8125_pci_pm` cfg — only reachable from the PM callbacks that
+/// require the kernel-Rust PCI PM extension (see `pci.rs`). Compiled out on a
+/// stock kernel so it raises no dead-code warning there.
+///
+/// # SAFETY: `ndev` is the registered net_device (or null after teardown; the
+/// cshim no-ops on a down/detached device). Called from the PM callback while
+/// the device is still bound.
+#[cfg(r8125_pci_pm)]
+pub(crate) fn bridge_pm_suspend(ndev: *mut bindings::net_device) {
+    if ndev.is_null() {
+        return;
+    }
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_pm_suspend(ndev) };
+}
+
+/// System-sleep resume: re-init + attach the device if it was up before suspend.
+/// Propagates a failed reopen as an error so the PM core sees the failure (the
+/// cshim leaves the device detached in that case rather than reattaching a dead
+/// interface).
+///
+/// # SAFETY: see [`bridge_pm_suspend`].
+#[cfg(r8125_pci_pm)]
+pub(crate) fn bridge_pm_resume(ndev: *mut bindings::net_device) -> Result {
+    if ndev.is_null() {
+        return Ok(());
+    }
+    // SAFETY: see fn-level contract.
+    to_result(unsafe { r8125_bridge_pm_resume(ndev) })
+}
+
 /// Suggest IRQ CPU affinity for the chip's MSI-X / MSI / INTx vector.
-/// Latency-aligned default (Candidate L of
-/// `docs/RX_OPTIMIZATION_CANDIDATES.md`). Best-effort: the kernel may
+/// Latency-aligned default (see `docs/RX_OPTIMIZATION_CANDIDATES.md`).
+/// Best-effort: the kernel may
 /// override the hint via `/proc/irq/N/smp_affinity` or `irqbalance`
 /// policy. Returns the kernel errno (0 on success).
 ///
@@ -919,7 +957,7 @@ pub(crate) fn dma_rmb() {
 }
 
 /// DMA write barrier used by [`desc_publish_own`]. Sister to `dma_rmb` —
-/// see Candidate #1 of `docs/RX_OPTIMIZATION_CANDIDATES.md`.
+/// see `docs/RX_OPTIMIZATION_CANDIDATES.md`.
 ///
 /// # SAFETY: same as `dma_rmb` — no pointer or ownership preconditions.
 /// The ordering contract is caller-side: use it between the descriptor's
@@ -1049,7 +1087,7 @@ pub(crate) fn pci_dev_raw<Ctx: device::DeviceContext>(
 ///   outlives any `net_device` that names it as parent (sysfs links).
 /// - `cookie` is opaque to the bridge; it is just the value passed back
 ///   into every vtable callback. The Rust caller is responsible for
-///   ensuring `cookie` outlives the net_device (M4-skeleton passes
+///   ensuring `cookie` outlives the net_device (the skeleton passes
 ///   null because the stub callbacks do not deref it).
 /// - `ops` is read once during alloc (the cshim copies the struct). The
 ///   function pointers inside MUST have `'static` lifetime — they refer
@@ -1106,7 +1144,7 @@ pub(crate) fn bridge_unregister_and_free(ndev: *mut bindings::net_device) {
     unsafe { r8125_bridge_unregister_and_free(ndev) };
 }
 
-/// `dev_kfree_skb_any` via the cshim — plan §6.3 (c) "drop_with_error"
+/// `dev_kfree_skb_any` via the cshim — the "drop_with_error"
 /// path. Counter `tx_dropped_error` increments inside the cshim.
 ///
 /// # SAFETY
@@ -1120,7 +1158,7 @@ pub(crate) fn skb_free_error(skb: *mut bindings::sk_buff) {
     unsafe { r8125_bridge_skb_free_error(skb) };
 }
 
-// ── Scatter-gather + TSO safe wrappers (M4-perf phase 2, task 49) ───────
+// ── Scatter-gather + TSO safe wrappers (task 49) ────────────────────────
 
 /// Combined TX offload prep. Fills descriptor `opts1`/`opts2` bits and returns
 /// the post-mutation fragment count in one FFI crossing.
@@ -1259,7 +1297,7 @@ pub(crate) fn netdev_completed_queue(ndev: *mut bindings::net_device, pkts: usiz
     unsafe { r8125_bridge_netdev_completed_queue(ndev, pkts as c_uint, bytes as c_uint) };
 }
 
-// ── PHY plumbing safe wrappers (M4-traffic) ──────────────────────────────
+// ── PHY plumbing safe wrappers ───────────────────────────────────────────
 
 /// Register the cshim's MDIO bus + phy_device for this netdev, with the
 /// Rust extern "C" callbacks the bus will use for MDIO transactions.

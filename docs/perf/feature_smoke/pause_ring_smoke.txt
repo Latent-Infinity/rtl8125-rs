@@ -1,0 +1,48 @@
+=== ethtool -a (pauseparam) ===
+Pause parameters for enp3s0:
+Autonegotiate:	on
+RX:		on
+TX:		on
+RX negotiated: on
+TX negotiated: on
+
+=== ethtool -A rx off tx off (toggle, autoneg implies renegotiation) ===
+  set_rc=0
+  recovered: carrier=1 after 0s
+  traffic after off/off: 1.44 Gbits/sec
+=== ethtool -A autoneg on rx on tx on (restore baseline) ===
+  set_rc=0
+  recovered: carrier=1
+  traffic after restore: 1.44 Gbits/sec
+=== ethtool -g (ringparam: expect 256) ===
+Ring parameters for enp3s0:
+Pre-set maximums:
+RX:			256
+RX Mini:		n/a
+RX Jumbo:		n/a
+TX:			256
+TX push buff len:	n/a
+HDS thresh:		n/a
+Current hardware settings:
+RX:			256
+RX Mini:		n/a
+RX Jumbo:		n/a
+TX:			256
+RX Buf Len:		n/a
+CQE Size:		n/a
+TX Push:		off
+RX Push:		off
+TX push buff len:	n/a
+TCP data split:		n/a
+HDS thresh:		n/a
+=== ethtool -G rx 128 (resize: expect clean -EOPNOTSUPP) ===
+netlink error: Operation not supported
+  rc=81 (nonzero=good)
+=== final state ===
+carrier=1
+Autonegotiate:	on
+RX:		on
+TX:		on
+splats=0
+(end)
+PAUSE_DONE

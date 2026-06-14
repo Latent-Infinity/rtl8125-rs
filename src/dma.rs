@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0
-//! DMA strategy for the RTL8125 (plan §6.1, §7 M3).
+//! DMA strategy for the RTL8125.
 //!
-//! ## What lands here at M3 (cold ring allocation)
+//! ## Cold ring allocation
 //!
-//! Descriptor rings only — and they live in [`ring`](crate::ring). M3 sets the
-//! device's DMA mask (via `unsafe_boundary::set_64bit_dma_mask`) and allocates
-//! the coherent rings, but moves no packets and allocates no packet buffers.
-//! The M3 gate verifies that ring allocation + ring free is balanced under
-//! `kmemleak` and `CONFIG_DMA_API_DEBUG=y`.
+//! Descriptor rings only — and they live in [`ring`](crate::ring). This sets
+//! the device's DMA mask (via `unsafe_boundary::set_64bit_dma_mask`) and
+//! allocates the coherent rings, but moves no packets and allocates no packet
+//! buffers. The gate verifies that ring allocation + ring free is balanced
+//! under `kmemleak` and `CONFIG_DMA_API_DEBUG=y`.
 //!
-//! ## Streaming-mapping plan (plan §7 M3 deliverable — documented, not yet implemented)
+//! ## Streaming-mapping design (documented, not yet implemented)
 //!
-//! Packet buffer ownership at M4 / M5 will follow the §6.3 ownership contract:
+//! Packet buffer ownership follows the ownership contract:
 //!
 //! ### RX (Driver → Device)
 //!
@@ -37,14 +37,14 @@
 //! - **Ownership: Device** until hardware clears `OWN` on completion.
 //! - Reaper (NAPI completion path) sees `OWN` cleared → calls
 //!   `dma_unmap_single(..., DataDirection::ToDevice)` → `dev_kfree_skb_any` →
-//!   resets the shadow slot. Plan §6.3 forbids a TX slot from looking empty
+//!   resets the shadow slot. The ownership contract forbids a TX slot from looking empty
 //!   while still holding a live skb pointer — the shadow slot is the type-state
 //!   that makes that impossible to express.
 //!
 //! ## Where the actual code lives
 //!
 //! - **`ring`**: the descriptor ring type, descriptor struct, canaries,
-//!   per-direction indices. Used by M3 (cold alloc) and M4+ (hot path).
+//!   per-direction indices. Used by cold alloc and the hot path.
 //! - **`unsafe_boundary::set_64bit_dma_mask`**: the one `unsafe` call needed
 //!   from probe — `dma_set_mask_and_coherent` is `unsafe fn` in the kernel
 //!   Rust API (its only safety requirement is "no concurrent DMA-mapping

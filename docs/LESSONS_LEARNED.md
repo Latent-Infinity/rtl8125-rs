@@ -97,7 +97,7 @@ Issue observed: perf and soak behavior were not identical between KVM and bare-m
 ## What remains open (as of this cycle)
 
 - Full kernel `pm_ops` for `suspend`/`resume` remains pending in `docs/UPSTREAM_REVIEW.md`.
-- Upstream-maintainer confidence on shim strategy remains dependent on netdev feedback path (`M7_PREP.md`).
+- Upstream-maintainer confidence on shim strategy remains dependent on netdev feedback path (`PREP.md`).
 - Sparse/smatch runs are pending on analyzer-equipped hosts for CI completeness.
 - Formal DCO rebase clean still required before upstream submission.
 

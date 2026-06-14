@@ -1,7 +1,7 @@
 # M0a → M1 Operator Runbook
 
 **Goal:** take the repo from "M0a captured, M1 gated" to "M1 may begin" by
-clearing every unmet criterion in [`M1_ENTRY_CRITERIA.md`](M1_ENTRY_CRITERIA.md).
+clearing every unmet criterion in [`ENTRY_CRITERIA.md`](ENTRY_CRITERIA.md).
 This is a *do-this-then-that* runbook with copy-pasteable commands, an
 acceptance check per step, and the tracker rows each step clears.
 
@@ -378,7 +378,7 @@ sudo tools/capture_m0_baseline.sh          # row 1: dmidecode now under sudo →
 bash ci/run_checks.sh                       # must stay green (exit 0)
 ```
 
-Then, in `docs/M1_ENTRY_CRITERIA.md`, set each verified row to ✅ with its
+Then, in `docs/ENTRY_CRITERIA.md`, set each verified row to ✅ with its
 evidence file, commit the `docs/baseline/` artifacts, and confirm:
 
 - 3 ✅ (`rust_toolchain.txt`) · 4 ✅ (build: `oot_rust_buildtest.txt` + load:

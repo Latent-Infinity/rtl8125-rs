@@ -1,7 +1,7 @@
 # cshim contract vs kernel netdev C contract — diff
 
 **Status (2026-05-29):** desk-research for M7 outbound-blocker #4
-(see [`M7_PRE_RFC_DOSSIER.md`](M7_PRE_RFC_DOSSIER.md) reading-list
+(see [`PRE_RFC_DOSSIER.md`](PRE_RFC_DOSSIER.md) reading-list
 checklist). Goal: surface every aspect of our cshim contract
 ([`src/netdev_bridge.h`](../src/netdev_bridge.h)) that's an artifact
 of OUR Rust safety model rather than a kernel-C requirement. Those
@@ -117,10 +117,10 @@ finishes 2026-05-30 ~03:05 UTC.
 
 ## Cross-references
 
-- [`M7_PRE_RFC_DOSSIER.md`](M7_PRE_RFC_DOSSIER.md) — outbound consultation
-- [`M7_RUST_NETDEV_LANDSCAPE.md`](M7_RUST_NETDEV_LANDSCAPE.md) — on-list survey
-- [`M7_BLOCK_CADENCE.md`](M7_BLOCK_CADENCE.md) — block:: timing calibration
-- [`M7_PREP.md`](M7_PREP.md) — three-exit decision matrix
+- [`PRE_RFC_DOSSIER.md`](PRE_RFC_DOSSIER.md) — outbound consultation
+- [`RUST_NETDEV_LANDSCAPE.md`](RUST_NETDEV_LANDSCAPE.md) — on-list survey
+- [`BLOCK_CADENCE.md`](BLOCK_CADENCE.md) — block:: timing calibration
+- [`PREP.md`](PREP.md) — three-exit decision matrix
 - [`../src/netdev_bridge.h`](../src/netdev_bridge.h) — the cshim contract
 - [`../src/napi.rs`](../src/napi.rs) — NAPI poll compliance
 - Kernel docs: [driver.html](https://docs.kernel.org/networking/driver.html),

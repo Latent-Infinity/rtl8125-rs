@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# IRQ-mode contract gate (M6 #1 Phase A.2).
+# IRQ-mode contract gate.
 #
 # `IrqMode` is the single source of truth for whether the driver uses
 # legacy INTx registers or the ISR_V2 / IMR_V2 surface. This script keeps
