@@ -528,3 +528,18 @@ indirection table in or out of the Rust-owned `rss::RssPolicy`.
   call-scoped. All RSS *policy* decisions (validation, default-collapse, reclamp)
   are pure safe Rust in `src/rss.rs` (host-tested); these wrappers only move bytes
   across the ethtool boundary.
+
+## 2026-06-16 — WoL suspend affinity-hint clear bump 89 → 90
+
+Net +1 `unsafe { ... }` block in `src/unsafe_boundary.rs`:
+
+- ADDED `bridge_irq_clear_hint(irq)` — wraps `r8125_bridge_irq_clear_hint`, which
+  calls `irq_update_affinity_hint(irq, NULL)` to drop the multi-queue affinity
+  hint before `free_irq` (free_irq WARNs — `WARN_ON_ONCE(desc->affinity_hint)` —
+  if a hint is still attached; this fixes a pre-existing WARN on every ndo_stop
+  that the kasan kernel surfaced, and is a prerequisite for the WoL suspend path).
+  SAFETY: `irq` is a vector this driver requested; the call is a no-op when no
+  hint was set. No ownership/MMIO/skb crosses the boundary. (The WoL keep-alive
+  register programming is safe Rust in `src/netdev.rs`, using existing `mmio`
+  accessors for Config1/2, PMCH, RCR, and the existing `set_wol` path — no new
+  unsafe.)

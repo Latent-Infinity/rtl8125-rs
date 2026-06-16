@@ -191,6 +191,17 @@ pub(crate) const CFG9346_UNLOCK: u8 = 0xC0;
 /// Various per-board PM / wake / LED config. r8169 clears bit 4 in
 /// rtl_hw_start_8125_common as part of "disable UPS".
 pub(crate) const CONFIG1: usize = 0x52;
+/// Config1 `PMEnable (BIT0)` — master Power-Management/Wake-on-LAN enable. The
+/// chip cannot assert PME# on a WoL match unless this is set (r8169
+/// `__rtl8169_set_wol` sets it iff wolopts).
+pub(crate) const CONFIG1_PMENABLE: u8 = 1 << 0;
+
+// ── Config2 (8-bit at 0x53) — PME status ─────────────────────────────────
+/// `PMSTS_En (BIT5)` arms PME-status reporting so the chip can assert PME# on a
+/// Wake-on-LAN match while in D3 (vendor `rtl8125_powerdown_pll`). Set only on
+/// the WoL suspend path; left clear in normal operation.
+pub(crate) const CONFIG2: usize = 0x53;
+pub(crate) const CONFIG2_PMSTS_EN: u8 = 1 << 5;
 
 // ── Config3 (8-bit at 0x54) — L2/L3 readiness ────────────────────────────
 /// r8169 `rtl_pcie_state_l2l3_disable` clears `Rdy_to_L23 (BIT(1))` in
@@ -309,6 +320,15 @@ pub(crate) const OCPAR_FLAG: u32 = 0x8000_0000;
 pub(crate) const OCP_STD_PHY_BASE: u32 = 0xA400;
 /// MII page-select register (writing this picks an alternate OCP page).
 pub(crate) const MII_PAGE_SELECT: u8 = 0x1F;
+
+// ── PMCH (8-bit at 0x6F) — D3 PLL power gate (Wake-on-LAN keep-alive) ──────
+// Setting these keeps the chip PLL (and thus the internal PHY) powered while the
+// device is in D3, so a magic packet can reach the wake detector. r8169
+// `rtl_set_d3_pll_down(!wolopts)` sets both for the 8125 default case when WoL is
+// armed; clearing D3COLD lets the PLL drop in D3cold for power saving otherwise.
+pub(crate) const PMCH: usize = 0x6F;
+pub(crate) const PMCH_D3HOT_NO_PLL_DOWN: u8 = 1 << 6;
+pub(crate) const PMCH_D3COLD_NO_PLL_DOWN: u8 = 1 << 7;
 
 // ── MDIO Clause-45 access (MMD) — mirrors `r8169_mdio_read_reg_c45` ──────
 //

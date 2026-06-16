@@ -324,6 +324,26 @@ impl<'a> Regs<'a> {
         self.bar.write8(value, regs::CONFIG1);
     }
 
+    // ── PMCH (8-bit at 0x6F) — D3 PLL power gate (WoL keep-alive) ────────
+
+    pub(crate) fn pmch(&self) -> u8 {
+        self.bar.read8(regs::PMCH)
+    }
+
+    pub(crate) fn set_pmch(&self, value: u8) {
+        self.bar.write8(value, regs::PMCH);
+    }
+
+    // ── Config2 (8-bit at 0x53) — PME status (WoL) ──────────────────────
+
+    pub(crate) fn config2(&self) -> u8 {
+        self.bar.read8(regs::CONFIG2)
+    }
+
+    pub(crate) fn set_config2(&self, value: u8) {
+        self.bar.write8(value, regs::CONFIG2);
+    }
+
     // ── Config3 (8-bit at 0x54) — L2/L3 readiness ───────────────────────
 
     pub(crate) fn config3(&self) -> u8 {

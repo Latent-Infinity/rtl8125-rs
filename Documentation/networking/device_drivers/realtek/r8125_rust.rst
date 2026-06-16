@@ -143,9 +143,13 @@ Limitations
   - **No AF_XDP zero-copy yet.** Copy-mode AF_XDP works (it follows from
     advertising ``BASIC | REDIRECT``); zero-copy is follow-up work and its
     ``xdp_features`` bit is not advertised.
-  - **System suspend / resume** is gated behind a kernel-Rust PCI PM
-    extension (built with ``make PCI_PM=1`` against a patched kernel);
-    the default in-tree build does not register ``pm`` ops.
+  - **System suspend / resume and Wake-on-LAN wake** are gated behind a
+    kernel-Rust PCI PM extension (built with ``make PCI_PM=1`` against a
+    patched kernel); the default in-tree build does not register ``pm`` ops.
+    With that build, magic-packet wake from S3 is validated (the chip PLL is
+    kept alive in D3 via ``PMCH``); the default build still arms the chip WoL
+    bits via ``ethtool -s wol g`` but cannot install the suspend hook that
+    keeps the PHY alive.
 
 Performance
 ===========

@@ -253,6 +253,20 @@ struct r8125_bridge_ops {
 	void (*set_wol)(void *priv, u32 wolopts);
 
 	/*
+	 * wol_suspend_arm(priv, wolopts) — WoL-aware suspend arming.
+	 * ──────────────────────────────
+	 * Pre   : RTNL held; PM suspend has detached the netdev and disabled NAPI
+	 *         but intentionally has NOT run the normal stop/phy_stop path;
+	 *         wolopts != 0 (a wake source is armed).
+	 * Post  : the chip is armed for Wake-on-LAN in D3 — Config3/5 wake bits +
+	 *         Config1.PMEnable + Config2.PMSTS_En + RX accept filter open +
+	 *         PMCH NO_PLL_DOWN so the internal PHY stays powered in D3. The PCI
+	 *         core arms PME on the following D3 transition (device_may_wakeup
+	 *         was set by set_wol). Resume runs a full reopen.
+	 */
+	void (*wol_suspend_arm)(void *priv, u32 wolopts);
+
+	/*
 	 * read_reg(priv, offset) — read one 32-bit MMIO register for `ethtool -d`.
 	 * The C side loops to fill the ethtool buffer, so no raw buffer crosses
 	 * the Rust boundary.
@@ -422,6 +436,7 @@ void r8125_bridge_unregister_and_free(struct net_device *ndev);
  * `free_irq`.
  */
 int r8125_bridge_irq_pin_cpu(unsigned int irq, int cpu);
+void r8125_bridge_irq_clear_hint(unsigned int irq);
 
 /*
  * Multi-queue affinity-spread inputs. The Rust side's host-tested

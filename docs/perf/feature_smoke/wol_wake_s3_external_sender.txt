@@ -122,3 +122,42 @@ Also surfaced: the existing rtcwake pm_suspend path itself trips the free_irq WA
 on this kasan kernel (the WARN is inside the unchanged bridge_ndo_stop, not the
 WoL code) — worth folding into the W2 kernel-Rust PCI work (reset_prepare/done +
 a lighter suspend quiesce).
+
+================================================================================
+RESOLVED — WoL wake-from-S3 WORKS (2026-06-16, PM-patched 7.0.0-kasan + PCI_PM=1)
+================================================================================
+srcversion 6A3603113298E8C6D1B2F1F.
+
+Root cause of the earlier failures: the suspend powered the (chip-internal) PHY
+down. The earlier attempts tried to keep it alive by dropping the link speed via
+phylib (worker frozen) or direct MDIO after a full stop (PHY already powered down
++ aneg couldn't re-link before S3). The ACTUAL keep-alive mechanism is the
+r8169-mainline `__rtl8169_set_wol` recipe:
+
+  - Config1.PMEnable (BIT0)  — master chip PME enable (the chip cannot assert
+    PME# on a WoL match without it; our set_wol never set it).
+  - Config2.PMSTS_En (BIT5)  — PME-status reporting.
+  - PMCH (0x6F) |= D3HOT_NO_PLL_DOWN(BIT6) | D3COLD_NO_PLL_DOWN(BIT7)
+    — `rtl_set_d3_pll_down(false)`: keep the chip PLL (hence the internal PHY)
+      POWERED across D3. THIS is what holds the PHY up; no link-speed change is
+      needed (so the autoneg-timing hazard disappears entirely).
+  - RxConfig accept (bcast/mcast/myphys) so the wake detector sees frames.
+
+The suspend is a LIGHT quiesce (napi_disable only; NO bridge_ndo_stop / phy_stop /
+free_irq), so the PHY is never powered down. Resume rebalances NAPI then does a
+full stop+reopen to clear the D3-reset chip state. A separate prerequisite fix:
+clear the IRQ affinity hint before free_irq (irq_update_affinity_hint NULL) — the
+kasan kernel WARNed on every ndo_stop otherwise.
+
+Results (external sender = controller enp4s0 igc -> gateway enp3s0, segment A):
+  WoL armed (ethtool -s enp3s0 wol g):
+    cycle 1: carrier-in-S3 = 1; magic@t+19s -> woke t+28s  (9s after magic)
+    cycle 2: carrier-in-S3 = 1; magic@t+16s -> woke t+25s  (9s after magic)
+    cycle 3: carrier-in-S3 = 1; magic@t+14s -> woke t+23s  (9s after magic)
+    3/3 SUCCESS, 0 KASAN/WARN/BUG across all cycles.
+  WoL disabled (ethtool -s enp3s0 wol d):  carrier-in-S3 = 0; woke only on the
+    240s RTC safety net — the magic packet did NOT wake it. Correct: the non-WoL
+    path takes the full stop (PHY down), so there is no spurious wake.
+
+W1.3 COMPLETE: Wake-on-LAN magic-packet wake from real S3 deep sleep, validated
+end-to-end with an external sender on the cross-machine rig.

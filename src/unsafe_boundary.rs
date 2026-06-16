@@ -211,6 +211,10 @@ pub(crate) struct BridgeOps {
     /// `ethtool set_wol` — program the chip WoL arm state. `wolopts` is
     /// pre-validated by the C side (only supported `WAKE_*` bits).
     pub set_wol: extern "C" fn(cookie: *mut c_void, wolopts: u32),
+    /// WoL-aware suspend arming, called from the PM suspend callback after the
+    /// light NAPI-only quiesce: arms the chip WoL + PME, opens the RX accept
+    /// filter, and keeps the internal PHY powered in D3 via PMCH NO_PLL_DOWN.
+    pub wol_suspend_arm: extern "C" fn(cookie: *mut c_void, wolopts: u32),
     /// `ethtool -d` register dump — read one 32-bit MMIO register by byte
     /// offset. The C side loops to fill its own buffer (no raw buffer crosses
     /// the boundary).
@@ -266,6 +270,7 @@ extern "C" {
     #[cfg(r8125_pci_pm)]
     fn r8125_bridge_pm_resume(ndev: *mut bindings::net_device) -> c_int;
     fn r8125_bridge_irq_pin_cpu(irq: u32, cpu: c_int) -> c_int;
+    fn r8125_bridge_irq_clear_hint(irq: u32);
     fn r8125_bridge_num_online_cpus() -> c_uint;
     fn r8125_bridge_node_base_cpu(pdev: *mut bindings::pci_dev) -> c_int;
     fn r8125_bridge_dma_rmb();
@@ -1008,6 +1013,17 @@ pub(crate) fn bridge_pm_resume(ndev: *mut bindings::net_device) -> Result {
 pub(crate) fn bridge_irq_pin_cpu(irq: u32, cpu: c_int) -> c_int {
     // SAFETY: see fn-level contract.
     unsafe { r8125_bridge_irq_pin_cpu(irq, cpu) }
+}
+
+/// Clear any IRQ affinity hint before `free_irq` (which WARNs if one is still
+/// attached). A no-op when no hint was set, so teardown calls it for every
+/// vector unconditionally.
+///
+/// # SAFETY: trivial — wraps `irq_update_affinity_hint(irq, NULL)`; `irq` is a
+/// vector this driver requested. No Rust lifetime concerns.
+pub(crate) fn bridge_irq_clear_hint(irq: u32) {
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_irq_clear_hint(irq) };
 }
 
 /// Number of online CPUs — fan-out width for the multi-queue affinity spread

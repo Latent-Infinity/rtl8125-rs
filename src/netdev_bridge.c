@@ -8,7 +8,7 @@
  * has no stable Rust API today: net_device + net_device_ops + NAPI +
  * sk_buff plumbing.
  *
- * Hard cap: 960 LOC including comments. The per-CPU netstats, IRQ-affinity,
+ * Hard cap: 1010 LOC including comments. The per-CPU netstats, IRQ-affinity,
  * and TX-queue-len additions plus the per-MTU zero-copy RX path fit after dead
  * RX helpers moved out; queue-id plumbing and the multi-queue NAPI lifecycle
  * helpers raised the cap from 540, then 615. Raised to 700 for the upstream
@@ -20,7 +20,8 @@
  * the r8125_pci_pm-gated Rust callbacks), then 880 for the per-skb
  * ndo_features_check offload veto and phy_do_ioctl_running wiring, then 910 for
  * the live ndo_set_mac_address RAR reprogram + tally CounterReset, then 960 for
- * the netdev-genl per-queue statistics (netdev_stat_ops).
+ * the netdev-genl per-queue statistics (netdev_stat_ops), then 1010 for the WoL
+ * suspend arming branch + the IRQ affinity-hint clear helper.
  * See cshim/README.md.
  *
  * Every ndo callback below is a thin delegation to the Rust vtable.
@@ -654,8 +655,10 @@ void r8125_bridge_unregister_and_free(struct net_device *ndev)
  * respect. We just provide a sensible default.
  *
  * `irq_set_affinity_and_hint` returns 0 on success; on failure we
- * log and proceed (no fatal). The hint is automatically cleared by
- * the kernel when `free_irq` runs.
+ * log and proceed (no fatal). The hint MUST be cleared (see
+ * `r8125_bridge_irq_clear_hint`) before `free_irq`, which WARNs
+ * (kernel/irq/manage.c `WARN_ON_ONCE(desc->affinity_hint)`) if a hint
+ * is still attached.
  */
 int r8125_bridge_irq_pin_cpu(unsigned int irq, int cpu)
 {
@@ -667,6 +670,17 @@ int r8125_bridge_irq_pin_cpu(unsigned int irq, int cpu)
 	 * `-Wframe-larger-than=1024` on `NR_CPUS=8192` builds).
 	 */
 	return irq_set_affinity_and_hint(irq, cpumask_of(cpu));
+}
+
+/*
+ * Drop any IRQ affinity hint set by `r8125_bridge_irq_pin_cpu` before
+ * `free_irq`. free_irq WARNs if a hint is still attached; clearing it is a
+ * no-op when none was set, so the teardown path can call this unconditionally
+ * for every vector it is about to free.
+ */
+void r8125_bridge_irq_clear_hint(unsigned int irq)
+{
+	irq_update_affinity_hint(irq, NULL);
 }
 
 /*
@@ -829,20 +843,56 @@ int r8125_bridge_reopen(struct net_device *ndev)
  */
 void r8125_bridge_pm_suspend(struct net_device *ndev)
 {
+	struct r8125_bridge *b = netdev_priv(ndev);
+
 	rtnl_lock();
 	if (netif_running(ndev)) {
+		u32 wol = b->ops.get_wol(b->priv);
+
 		netif_device_detach(ndev);
-		bridge_ndo_stop(ndev);
+		if (wol) {
+			/*
+			 * Wake-on-LAN keep-alive path. A full stop powers the PHY
+			 * down (phy_stop) — no magic packet could then reach the
+			 * wake detector, which is why the earlier attempts woke
+			 * only on the RTC safety net. So do a LIGHT quiesce: stop
+			 * NAPI but leave the rings, IRQ, RX engine, and (critically)
+			 * the PHY powered. wol_suspend_arm then applies the r8169
+			 * __rtl8169_set_wol recipe: chip WoL + PME bits, RX accept,
+			 * and PMCH NO_PLL_DOWN so the internal PHY stays alive in D3.
+			 * The PCI core enters D3 with PME (device_may_wakeup was set
+			 * by set_wol).
+			 */
+			bridge_napi_disable_all(b);
+			b->ops.wol_suspend_arm(b->priv, wol);
+			b->wol_suspended = true;
+		} else {
+			bridge_ndo_stop(ndev);
+			b->wol_suspended = false;
+		}
 	}
 	rtnl_unlock();
 }
 
 int r8125_bridge_pm_resume(struct net_device *ndev)
 {
+	struct r8125_bridge *b = netdev_priv(ndev);
 	int rc = 0;
 
 	rtnl_lock();
 	if (netif_running(ndev)) {
+		if (b->wol_suspended) {
+			/*
+			 * The WoL keep-alive suspend left NAPI disabled but the
+			 * rings/IRQ/PHY intact; D3 reset the chip's operational
+			 * state. Re-balance NAPI, then do a full stop+reopen to
+			 * cleanly tear the stale state down and re-init at full
+			 * speed (a fresh phy_connect restores the link).
+			 */
+			b->wol_suspended = false;
+			bridge_napi_enable_all(b);
+			bridge_ndo_stop(ndev);
+		}
 		rc = bridge_ndo_open(ndev);
 		/* Only re-expose the device to the stack if re-init succeeded;
 		 * a failed reopen must surface as a resume error, not a silently

@@ -93,6 +93,14 @@ struct r8125_bridge {
 	 */
 	u32 msg_enable;
 
+	/* Set by the PM suspend callback when it took the WoL keep-alive path (a
+	 * light quiesce that leaves the PHY powered + the rings/IRQ intact, instead
+	 * of a full stop). The resume callback uses it to do a full stop+reopen
+	 * cycle (the chip was reset in D3) rather than the plain reopen. Touched
+	 * only under RTNL in the PM callbacks.
+	 */
+	bool wol_suspended;
+
 	/* PHY MCU firmware version string (from rtl8125b-2.fw), set by Rust after
 	 * a successful firmware apply; reported via ethtool -i. NUL-terminated
 	 * (33rd byte always 0). Empty if no firmware was loaded.

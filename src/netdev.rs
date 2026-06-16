@@ -959,6 +959,35 @@ extern "C" fn rust_set_wol(cookie: *mut c_void, wolopts: u32) {
     state_from(cookie).regs().set_wol(wolopts);
 }
 
+/// WoL-aware suspend arming (the r8169-mainline `__rtl8169_set_wol` recipe). Run
+/// from the PM suspend callback after the light NAPI quiesce, with the PHY still
+/// powered (no `phy_stop`): arm the chip wake bits (`set_wol`), the master
+/// `Config1.PMEnable`, and `Config2.PMSTS_En`; open the RX accept filter so the
+/// wake detector sees frames; and — the key step — keep the chip PLL (hence the
+/// internal PHY) alive across D3 via `PMCH` (`rtl_set_d3_pll_down(false)`) so a
+/// magic packet reaches the detector. The PCI core then enters D3 with PME
+/// (device_may_wakeup was set by the ethtool set_wol path). The link stays at its
+/// current speed — the PLL-keep-alive is what holds the PHY up, so no speed change
+/// (and its autoneg-timing hazard) is needed. Resume's full re-open restores the
+/// normal power state.
+extern "C" fn rust_wol_suspend_arm(cookie: *mut c_void, wolopts: u32) {
+    let state = state_from(cookie);
+    let regs = state.regs();
+    regs.set_wol(wolopts);
+    regs.unlock_config_regs();
+    regs.set_config1(regs.config1() | regs::CONFIG1_PMENABLE);
+    regs.set_config2(regs.config2() | regs::CONFIG2_PMSTS_EN);
+    // Keep the PLL/PHY powered in D3hot and D3cold (rtl_set_d3_pll_down(false)).
+    regs.set_pmch(regs.pmch() | regs::PMCH_D3HOT_NO_PLL_DOWN | regs::PMCH_D3COLD_NO_PLL_DOWN);
+    regs.lock_config_regs();
+    regs.set_rcr(
+        regs.rcr()
+            | regs::RCR_ACCEPT_BROADCAST
+            | regs::RCR_ACCEPT_MULTICAST
+            | regs::RCR_ACCEPT_MY_PHYS,
+    );
+}
+
 /// `ethtool -d` — read one 32-bit MMIO register by byte offset.
 extern "C" fn rust_read_reg(cookie: *mut c_void, offset: u32) -> u32 {
     state_from(cookie).regs().read_dword(offset as usize)
@@ -989,6 +1018,7 @@ pub(crate) const M4_FULL_OPS: BridgeOps = BridgeOps {
     tally_reset: rust_tally_reset,
     get_wol: rust_get_wol,
     set_wol: rust_set_wol,
+    wol_suspend_arm: rust_wol_suspend_arm,
     read_reg: rust_read_reg,
     set_mac_filter: rust_set_mac_filter,
     xdp_xmit_one: rust_xdp_xmit_one,
@@ -1067,6 +1097,8 @@ extern "C" fn skel_get_wol(_cookie: *mut c_void) -> u32 {
 }
 #[allow(dead_code)]
 extern "C" fn skel_set_wol(_cookie: *mut c_void, _wolopts: u32) {}
+#[allow(dead_code)]
+extern "C" fn skel_wol_suspend_arm(_cookie: *mut c_void, _wolopts: u32) {}
 
 #[allow(dead_code)]
 extern "C" fn skel_read_reg(_cookie: *mut c_void, _offset: u32) -> u32 {
@@ -1106,6 +1138,7 @@ pub(crate) const M4_SKELETON_OPS: BridgeOps = BridgeOps {
     tally_reset: skel_tally_dump,
     get_wol: skel_get_wol,
     set_wol: skel_set_wol,
+    wol_suspend_arm: skel_wol_suspend_arm,
     read_reg: skel_read_reg,
     set_mac_filter: skel_set_mac_filter,
     xdp_xmit_one: skel_xdp_xmit_one,
@@ -1511,10 +1544,16 @@ fn register_irq_handler(state: &NetdevState, cookie: *mut c_void) -> Result<()> 
 /// "trying to free already-free IRQ" WARN.
 fn free_irq_if_registered(state: &NetdevState) {
     let cookie = cookie_from_state(state);
+    // Clear any affinity hint set by the multi-queue spread before free_irq —
+    // free_irq WARNs (WARN_ON_ONCE(desc->affinity_hint)) if a hint is still
+    // attached. Clearing is a no-op when none was set, so do it unconditionally
+    // for every vector we are about to release.
     if state.irq.link_requested.inner.swap(false, Ordering::AcqRel) {
+        ub::bridge_irq_clear_hint(state.irq.link_num);
         ub::free_irq(state.irq.link_num, cookie);
     }
     if state.irq.tx_requested.inner.swap(false, Ordering::AcqRel) {
+        ub::bridge_irq_clear_hint(state.irq.tx_num);
         ub::free_irq(state.irq.tx_num, cookie);
     }
     // Release RX vectors high→low (extras before rx0), mirroring the request
@@ -1524,6 +1563,7 @@ fn free_irq_if_registered(state: &NetdevState) {
             .inner
             .swap(false, Ordering::AcqRel)
         {
+            ub::bridge_irq_clear_hint(state.irq.rx_nums[i]);
             ub::free_irq(state.irq.rx_nums[i], cookie);
         }
     }

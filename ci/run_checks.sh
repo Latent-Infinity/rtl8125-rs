@@ -36,6 +36,9 @@ echo
 echo "== ethtool RSS control-plane contract =="
 bash "$CI/check_rss_ethtool.sh" || rc=1
 echo
+echo "== Wake-on-LAN suspend-path contract =="
+bash "$CI/check_wol_suspend.sh" || rc=1
+echo
 echo "== multi-queue RSS hazard harness contract =="
 bash "$CI/check_rss_multiqueue_hazard.sh" || rc=1
 echo
