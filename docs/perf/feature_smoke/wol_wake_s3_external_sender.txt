@@ -1,0 +1,124 @@
+WoL wake-from-S3 — external-sender test (cross-machine rig)  [#56]
+==================================================================
+Date:     2026-06-16
+Result:   NEGATIVE (root cause identified) — WoL wake does NOT work with the
+          current driver; the PHY powers down on S3 entry.
+
+Rig (new cross-machine topology, replaces the gateway netns loopback)
+--------------------------------------------------------------------
+Segment A: gateway enp3s0 (RTL8125, r8125_rust DUT, 10.0.0.2)
+           <-> controller enp4s0 (Intel I226-V igc, 10.0.0.1)   [WoL sender]
+Segment B: guest enp5s0 (RTL8125, r8125_rust DUT, 10.0.2.2)
+           <-> gateway enp4s0 (Intel I226-V igc, 10.0.2.1)
+Both links 2.5G, 0% loss. Gateway mgmt is over wifi/tailscale (independent of
+the test ports), so the DUT can suspend without losing remote access.
+
+Setup
+-----
+Gateway kernel 7.0.0-22-generic (clean, NOT PM-patched), r8125_rust loaded on
+enp3s0 (unbound from r8169). WoL armed:
+  ethtool enp3s0 -> Supports Wake-on: umbg ; Wake-on: g
+  /sys/class/net/enp3s0/device/power/wakeup -> enabled
+Suspend depth: /sys/power/mem_sleep = s2idle [deep]  (real S3).
+
+Test
+----
+1. Schedule S3 suspend on the gateway (rtcwake -m mem -s 240; the 240s RTC is a
+   safety net so the box always returns even if WoL fails).
+2. Confirm asleep (tailscale ping fails).
+3. While asleep: controller enp4s0 carrier = 0  <-- the smoking gun.
+4. Send magic-packet burst from controller enp4s0 to 38:05:25:36:a6:1d
+   (UDP broadcast :9, payload FF*6 + MAC*16).
+5. Measure wake time.
+
+Result
+------
+  magic sent at  t+19s
+  gateway woke at t+266s  (= 247s after magic; RTC safety fires ~248s)
+  VERDICT: woke ONLY from the RTC safety net, NOT from the magic packet.
+
+Root cause
+----------
+The PHY powers down on S3 entry, so the magic packet hits a dead link:
+  - controller enp4s0 carrier dropped to 0 the moment the gateway slept
+    (its link partner = gateway enp3s0 PHY stopped driving link pulses).
+  - gateway dmesg at suspend: "PM: suspend entry (deep)" immediately followed by
+    "r8125_rust 0000:03:00.0 enp3s0: Link is Down".
+The current PM suspend callback (r8125_bridge_pm_suspend, netdev_bridge.c) does a
+full bridge_ndo_stop() on suspend — which tears down the rings and powers down
+the PHY. That is correct for plain rtcwake suspend/resume (validated, 6 cycles)
+but fatal for WoL: a magic packet can only wake the chip if the PHY stays alive.
+
+Note: WoL *arming* is fully implemented and correct (set_wol programs Config3
+magic bit / Config5 / MAC-OCP magic enable; ethtool path calls
+device_set_wakeup_enable -> PCI core arms PME). The gap is purely the
+suspend-time PHY-keep-alive.
+
+Fix (the #56 "PHY-alive suspend path")
+--------------------------------------
+When WoL is armed, the suspend callback must keep the PHY powered at a low link
+speed (10/100M) and put the chip in WoL-listen mode, instead of a full ndo_stop.
+Reference sequence available in the vendor driver
+(references/realtek-r8125-official/src/r8125_n.c):
+  rtl8125_powerdown_pll(dev, from_suspend) — WoL-aware PLL power-down
+  rtl8125_keep_wol_link_speed / rtl8125_set_wol_link_speed — force 10/100M so the
+  PHY stays alive at low power to receive the magic packet.
+Prerequisites: the PM-patched kernel (7.0.0-kasan, where the r8125_pci_pm cfg /
+pm_ops are wired) + a `make PCI_PM=1` build. The gateway is currently on the
+unpatched 7.0.0-22-generic, so the pm_ops did not even run this test — the link
+drop here is the *generic* PCI suspend powering the device down.
+
+Recovery
+--------
+Gateway resumed cleanly on the RTC safety; enp3s0 came back on r8125_rust
+(transient 100M downshift on resume, recovered to 2.5G after an autoneg restart),
+WoL still armed, segment A 0% loss. No crash / no driver teardown failure.
+
+================================================================================
+Implementation attempt #1 (2026-06-16, PM-patched 7.0.0-kasan + make PCI_PM=1)
+================================================================================
+Confirmed working: the kernel-Rust PCI pm_ops ARE wired and run — the dmesg trace
+shows pci_pm_suspend -> R8125Driver suspend_callback -> r8125_bridge_pm_suspend.
+So the suspend/resume callbacks fire on the patched kernel as designed.
+
+First approach tried: in pm_suspend, after the normal bridge_ndo_stop, re-arm the
+chip WoL (set_wol) and bring the PHY back at <=100M via phylib (phy_set_max_speed
++ kick); on resume tear it down + restore 2.5G + full open. Result: STILL woke
+only on the RTC safety; controller carrier still 0 while asleep. Three concrete
+blockers were found and this attempt was reverted (kept the validated rtcwake
+pm_suspend clean):
+
+1. free_irq WARN (kernel/irq/manage.c:1905) — a full bridge_ndo_stop (which
+   frees the MSI IRQ) is too heavy to run inside the PM-suspend (async worker)
+   context. The WoL suspend must be a LIGHT quiesce: no free_irq, no PHY
+   power-down — matching the vendor, which never does a full stop on WoL suspend.
+
+2. phylib's link/state-machine worker is FROZEN during system suspend, so the PHY
+   cannot renegotiate to a low speed via phylib (phy_set_max_speed + the worker)
+   before S3 commits (~0.8s window; autoneg needs ~2-3s). The vendor drives the
+   low-speed link with DIRECT MDIO writes (MII_ADVERTISE 10/100 only, MII_CTRL1000
+   /OCP 0xA5D4 cleared, BMCR autoneg-restart) so the PHY hardware establishes the
+   link autonomously — no worker needed. We must port rtl8125_set_wol_link_speed
+   via our raw MDIO accessors, not phylib.
+
+3. phy_set_max_speed() is not reversible: clamping to SPEED_100 removes the 2.5G/1G
+   bits from phydev->supported, and raising the max later cannot re-add them — the
+   link stayed stuck at 100M until a fresh driver reload re-read PHY abilities.
+
+Correct implementation (next focused effort), all chip/MDIO, not phylib:
+  - WoL suspend = light quiesce (detach, napi_disable, tx_disable, mask IRQs, stop
+    DMA engines) WITHOUT free_irq and WITHOUT phy power-down; arm chip WoL
+    (set_wol + Config2 PMSTS_En + RxConfig accept); force low link speed via direct
+    MDIO (port rtl8125_set_wol_link_speed); leave PHY powered.
+  - WoL resume = re-init chip data path (D3 reset it) + restore full-speed
+    advertising via direct MDIO + re-aneg; PHY never disconnected.
+  Reference: references/realtek-r8125-official/src/r8125_n.c
+  (rtl8125_powerdown_pll / set_wol_link_speed / set_hw_wol / powerup_pll).
+  Note: this is a heavier port than a phylib tweak — it needs a chip-level
+  suspend/resume that bypasses phylib for the WoL link, plus its own KASAN/rtcwake
+  re-validation.
+
+Also surfaced: the existing rtcwake pm_suspend path itself trips the free_irq WARN
+on this kasan kernel (the WARN is inside the unchanged bridge_ndo_stop, not the
+WoL code) — worth folding into the W2 kernel-Rust PCI work (reset_prepare/done +
+a lighter suspend quiesce).

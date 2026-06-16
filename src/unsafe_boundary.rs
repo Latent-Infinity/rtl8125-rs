@@ -189,6 +189,36 @@ pub(crate) struct BridgeOps {
     /// buffer and passes its DMA address; Rust drives the MMIO dump handshake
     /// and returns 0 on success, -1 on timeout. C then reads the dumped struct.
     pub tally_dump: extern "C" fn(cookie: *mut c_void, dma_addr: u64) -> c_int,
+    /// Reset the on-die tally counters (issued once at open for a clean
+    /// per-session baseline). Same DMA-address handshake as `tally_dump`.
+    pub tally_reset: extern "C" fn(cookie: *mut c_void, dma_addr: u64) -> c_int,
+    /// `ethtool get_wol` — active `WAKE_*` mask read back from the chip.
+    pub get_wol: extern "C" fn(cookie: *mut c_void) -> u32,
+    /// `ethtool set_wol` — program the chip WoL arm state. `wolopts` is
+    /// pre-validated by the C side (only supported `WAKE_*` bits).
+    pub set_wol: extern "C" fn(cookie: *mut c_void, wolopts: u32),
+    /// `ethtool -d` register dump — read one 32-bit MMIO register by byte
+    /// offset. The C side loops to fill its own buffer (no raw buffer crosses
+    /// the boundary).
+    pub read_reg: extern "C" fn(cookie: *mut c_void, offset: u32) -> u32,
+    /// Reprogram the chip's RX unicast filter (RAR) from the current
+    /// `net_device` address. Called on a live `ndo_set_mac_address` while the
+    /// interface is running so the hardware filter tracks the new address
+    /// without waiting for the next open.
+    pub set_mac_filter: extern "C" fn(cookie: *mut c_void),
+    /// XDP_TX producer — enqueue one already-`DMA_TO_DEVICE`-mapped `xdp_frame`
+    /// on the TX ring. Called from the C XDP verdict path under the txq lock.
+    /// `frame` is the `xdp_frame*` the reaper returns via `xdp_return_frame`.
+    /// Returns 0 on enqueue, `-ENOSPC` if the ring is full.
+    pub xdp_xmit_one: extern "C" fn(
+        cookie: *mut c_void,
+        frame_dma: u64,
+        frame_len: u32,
+        frame: *mut c_void,
+    ) -> c_int,
+    /// Ring the TX doorbell once at NAPI-poll end if any XDP_TX frame was
+    /// enqueued this poll. Called from `r8125_bridge_xdp_finalize`.
+    pub xdp_tx_flush: extern "C" fn(cookie: *mut c_void),
 }
 
 // Bindgen emits `pci_dev` / `net_device` / `sk_buff` as opaque
@@ -291,6 +321,23 @@ extern "C" {
     fn r8125_bridge_phy_connect_and_reset(ndev: *mut bindings::net_device) -> c_int;
     fn r8125_bridge_phy_kick_state_machine(ndev: *mut bindings::net_device) -> c_int;
     fn r8125_bridge_phy_stop(ndev: *mut bindings::net_device);
+    fn r8125_bridge_phy_modify_paged(
+        ndev: *mut bindings::net_device,
+        page: u16,
+        reg: u16,
+        mask: u16,
+        set: u16,
+    );
+    fn r8125_bridge_phy_write_paged(ndev: *mut bindings::net_device, page: u16, reg: u16, val: u16);
+    fn r8125_bridge_phy_write_mmd(ndev: *mut bindings::net_device, devad: u16, reg: u16, val: u16);
+    fn r8125_bridge_phy_modify_mmd(
+        ndev: *mut bindings::net_device,
+        devad: u16,
+        reg: u16,
+        mask: u16,
+        set: u16,
+    );
+    fn r8125_bridge_set_fw_version(ndev: *mut bindings::net_device, ver: *const u8);
 
     // ── Zero-copy RX — page_pool + per-MTU buffers ─────────────────────
     // The pool is created per ndo_open sized for dev->mtu; `out_buf_len`
@@ -303,6 +350,8 @@ extern "C" {
         out_buf_len: *mut u32,
     ) -> c_int;
     fn r8125_bridge_rx_pool_destroy(ndev: *mut bindings::net_device, queue_id: c_uint);
+    fn r8125_bridge_xdp_finalize(ndev: *mut bindings::net_device, queue_id: c_uint);
+    fn r8125_bridge_xdp_return_frame(frame: *mut c_void);
     fn r8125_bridge_rx_alloc(
         ndev: *mut bindings::net_device,
         queue_id: c_uint,
@@ -613,6 +662,27 @@ pub(crate) fn bridge_rx_one_packet(
         )
     };
     (new_cpu, new_dma)
+}
+
+/// Flush the XDP redirect bulk queue once at the end of a NAPI poll (no-op if no
+/// frame was redirected this poll). Cheap to call unconditionally.
+///
+/// # SAFETY: `ndev` is the registered net_device; `queue_id` is bounds-checked
+/// by the cshim. Called from NAPI poll context.
+pub(crate) fn bridge_xdp_finalize(ndev: *mut bindings::net_device, queue_id: u32) {
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_xdp_finalize(ndev, queue_id as c_uint) };
+}
+
+/// Return an `xdp_frame` to its origin page_pool at TX completion (the reaper's
+/// XDP_TX disposition). Wraps the kernel `xdp_return_frame`, which uses the
+/// frame's captured mem model to route the page back to the RX page_pool.
+///
+/// # SAFETY: `frame` is the exact `xdp_frame*` a prior `xdp_xmit_one` stored in
+/// the TX shadow and has not yet been returned; it is returned exactly once.
+pub(crate) fn xdp_return_frame(frame: *mut c_void) {
+    // SAFETY: see fn-level contract — single-owner, returned once.
+    unsafe { r8125_bridge_xdp_return_frame(frame) };
 }
 
 /// `netif_running(ndev)` — is the interface administratively up? Used by
@@ -1351,6 +1421,55 @@ pub(crate) fn bridge_phy_kick_state_machine(ndev: *mut bindings::net_device) -> 
 pub(crate) fn bridge_phy_stop(ndev: *mut bindings::net_device) {
     // SAFETY: see fn-level contract.
     unsafe { r8125_bridge_phy_stop(ndev) };
+}
+
+// PHY errata register access via the phylib paged/MMD accessors. Driven by the
+// host-tested `crate::phy_config` table during PHY bring-up (after connect/reset,
+// before phy_start). The cshim guards a null phydev; best-effort like r8169.
+//
+// # SAFETY (all four): `ndev` is the registered net_device; the cshim derives
+// b->phydev and no-ops if absent. Called single-threaded during open before the
+// PHY state machine is started.
+pub(crate) fn phy_modify_paged(
+    ndev: *mut bindings::net_device,
+    page: u16,
+    reg: u16,
+    mask: u16,
+    set: u16,
+) {
+    // SAFETY: see block contract.
+    unsafe { r8125_bridge_phy_modify_paged(ndev, page, reg, mask, set) };
+}
+
+pub(crate) fn phy_write_paged(ndev: *mut bindings::net_device, page: u16, reg: u16, val: u16) {
+    // SAFETY: see block contract.
+    unsafe { r8125_bridge_phy_write_paged(ndev, page, reg, val) };
+}
+
+pub(crate) fn phy_write_mmd(ndev: *mut bindings::net_device, devad: u16, reg: u16, val: u16) {
+    // SAFETY: see block contract.
+    unsafe { r8125_bridge_phy_write_mmd(ndev, devad, reg, val) };
+}
+
+pub(crate) fn phy_modify_mmd(
+    ndev: *mut bindings::net_device,
+    devad: u16,
+    reg: u16,
+    mask: u16,
+    set: u16,
+) {
+    // SAFETY: see block contract.
+    unsafe { r8125_bridge_phy_modify_mmd(ndev, devad, reg, mask, set) };
+}
+
+/// Record the applied PHY MCU firmware version (32-byte version field) for
+/// `ethtool -i`. The cshim copies exactly 32 bytes + NUL-terminates.
+///
+/// # SAFETY: `ndev` is the registered net_device; `ver` points to a 32-byte
+/// array (the cshim reads exactly 32 bytes). Called single-threaded at open.
+pub(crate) fn set_fw_version(ndev: *mut bindings::net_device, ver: &[u8; 32]) {
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_set_fw_version(ndev, ver.as_ptr()) };
 }
 
 #[inline]

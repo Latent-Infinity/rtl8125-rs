@@ -174,11 +174,18 @@ void r8125_bridge_skb_rx_csum_set(struct sk_buff *skb, u32 desc_opts1)
 
 void r8125_bridge_account_tx(struct net_device *ndev, unsigned int bytes)
 {
+	struct r8125_bridge *b = netdev_priv(ndev);
+
 	/* Per-CPU tx_packets/tx_bytes via the NETDEV_PCPU_STAT_TSTATS
 	 * setup at bridge_alloc. r8169 uses the same helper at
 	 * rtl8169_tx_handler (r8169_main.c:4769).
 	 */
 	dev_sw_netstats_tx_add(ndev, 1, bytes);
+	/* Single TX queue: per-queue counters for netdev_stat_ops, single-writer
+	 * (TX-completion NAPI), kept next to the device total.
+	 */
+	b->tx_packets++;
+	b->tx_bytes += bytes;
 }
 
 /* ── Scatter-gather + TSO ────────────────────────────────────────────── */

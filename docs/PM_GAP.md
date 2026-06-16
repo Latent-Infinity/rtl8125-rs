@@ -193,30 +193,42 @@ wake it otherwise). dmesg per cycle: `PM: suspend entry (deep)` → our callback
 `PM: suspend exit`. Interface-down cycle no-ops cleanly (callback sees
 `!netif_running`). 6 cycles, 0 splats, traffic resumes every time.
 
-### WoL — NOT advertised (chip-arming sequence prototyped, not wired)
+### WoL — control surface advertised + validated; deep-S3 wake path pending
 
-**Decision (2026-06-13): the ethtool WoL surface is intentionally not wired.**
-An earlier pass implemented + validated the magic-packet chip arming (Cfg9346 →
-OCP 0xC0B6 BIT0 → Config3.MagicPacket), and `ethtool -s wol g/d` round-tripped
-on the gateway (`Wake-on: g`, PCI `power/wakeup=enabled`; unsupported modes
-rejected). That validated only the *arming*, not an actual wake — and the
-end-to-end wake has two unmet prerequisites, so advertising `WAKE_MAGIC` would
-promise a wake the driver cannot deliver. The surface was therefore reverted;
-`get_wol`/`set_wol` are tracked **PLANNED** in the surface inventory. The
-arming-validation evidence is kept at
-`docs/perf/pm_validation_20260613/wol_test.out` for the follow-up.
+**Status (2026-06-14): the ethtool WoL control surface is implemented,
+advertised, and validated.** `get_wol`/`set_wol` support the magic packet plus
+unicast / broadcast / multicast wake frames (`Supports Wake-on: umbg`; WAKE_PHY
+is not wired — Config3.LinkUp is reserved on RTL8125B). Implementation:
 
-**Prerequisites for advertising `WAKE_MAGIC` (both must be met):**
+- `src/regs.rs` / `src/layout.rs` (host-tested `wol_config3`/`wol_config5`/
+  `wol_from_config`) / `src/mmio.rs` `set_wol`/`wol_opts` — the vendor
+  `rtl8125_set_hw_wol` sequence: Cfg9346-unlock → OCP 0xC0B6 BIT0 (magic V3) →
+  Config3.MagicPacket → Config5 UWF/MWF/BWF + LanWake → Cfg9346-lock.
+- `BridgeOps` `get_wol`/`set_wol` → `netdev_bridge_ethtool.c` `bridge_get_wol`/
+  `bridge_set_wol` (rejects unsupported `WAKE_*` with -EINVAL,
+  `device_set_wakeup_enable` on the PCI dev so the PM core arms PME).
 
-1. *Suspend keeps the PHY alive.* The current PM suspend path runs the full
-   `ndo_stop` (phy_stop), so the link drops in S3 and a magic packet can't be
-   received. A real wake needs the vendor `powerdown_pll(from_suspend)`
-   behaviour — renegotiate to a WoL link speed and keep the PHY powered, only
-   when WoL is armed — coupled into the `r8125_pci_pm` suspend path.
-2. *A rig that can test the wake.* The gateway's loopback topology (enp3s0 ↔
-   enp4s0) can't self-test it: during S3 the magic-packet sender sleeps with the
-   box. This needs an **external** sender on enp3s0's L2 segment.
+Validated on the gateway: `wol g` (magic) and `wol ubg` (broader modes) arm with
+PCI `power/wakeup=enabled`; `wol d` disarms; `wol a` (ARP) rejected; 0 splats.
+Evidence: `docs/perf/feature_smoke/batch3_wol.txt`.
 
-Until both are done and an actual magic-packet wake is observed, WoL stays
-unadvertised. (Vendor C and mainline r8169 both couple WoL programming with the
-suspend/PHY-power path for exactly this reason.)
+**Still pending — the deep-S3 wake path itself** (tracked separately):
+
+The *arming* is done, but an actual magic-packet wake from S3 needs a
+vendor-`powerdown_pll(from_suspend)`-style low-power mode that, when WoL is
+armed, keeps the PHY linked **and** the chip's wake-frame RX detection alive
+across D3 (with correct resume re-init) — instead of the normal
+`ndo_stop`, which both `phy_stop`s and quiesces the RX engine. That is intricate,
+chip-specific power-management code, and it is **not validatable on the available
+rigs**: the gateway loopback's magic-packet sender sleeps with the box during
+S3, and the KVM only does s2idle (no PME-from-D3). It is therefore not
+implemented blind — shipping unvalidated chip-power code is exactly what this
+project's quality bar avoids. It needs an external-sender rig (a separate host on
+enp3s0's L2 segment) to develop + validate against.
+
+Note: on a platform where the PCI core's default D3+PME handling keeps the device
+powered for wake (the common WoL mechanism), the advertised control surface +
+`device_set_wakeup_enable` may already drive a wake in the **default** (no
+driver-PM) build, since nothing tears the PHY down — but this too is unverified
+without an external sender. (Vendor C and mainline r8169 couple WoL with the
+suspend/PHY-power path for exactly these reasons.)

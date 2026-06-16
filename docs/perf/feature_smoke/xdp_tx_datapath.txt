@@ -1,0 +1,87 @@
+XDP_TX datapath validation (Rust TX-ring producer, frame disposition, KASAN soak)
+=================================================================================
+Date:        2026-06-15
+Host:        gateway (bare metal), kernel 7.0.0-kasan (KASAN on — memory-safety soak)
+Driver:      r8125_rust, srcversion 946ECE3CB0A491121261E78
+Interface:   enp3s0 (DUT) in netns dut, peer 10.0.0.1 in netns peer (gw_loopback)
+Program:     /tmp/xdp_tx.o — SEC("xdp") { return XDP_TX; } (verbatim reflector),
+             clang -O2 -target bpf; verified via llvm-objdump: w0 = 0x3 (XDP_TX); exit
+Rig note:    peer<->dut ARP pinned `nud permanent` both ways — with an XDP prog
+             attached the stack never answers ARP (every frame is consumed by XDP),
+             so dynamic resolution would go STALE and the sender would stop.
+
+xdp_features advertised (authoritative, via netdev-genl dev-get)
+---------------------------------------------------------------
+  $ ynl ... --do dev-get --json '{"ifindex": 55}'
+  {'ifindex': 55,
+   'xdp-features': {'redirect', 'basic'},
+   'xdp-rx-metadata-features': set(), ...}
+BASIC (attach + XDP_PASS/DROP/TX/ABORTED) and REDIRECT are advertised; NDO_XMIT
+and XSK bits are correctly absent (not implemented). The advertised set is now
+honest — XDP_TX works (below), so BASIC is truthful.
+
+XDP_TX reflection works (on-the-wire proof)
+-------------------------------------------
+The sw counters (ip -s link, ethtool -S) are deliberately blind to XDP-consumed
+and XDP_TX frames (no dev_sw_netstats / disposition-counter touch on the CONSUMED
+path), so reflection is proved on the wire: count ICMP echo-requests seen by the
+peer (its own outgoing + any reflected back by the DUT).
+
+  control (no prog), peer sends 15:   16 echo-requests on the wire (outgoing only)
+  XDP_TX attached,   peer sends 15:   31 echo-requests on the wire (~2x = reflected)
+
+Each frame the peer sends arrives at the DUT, is converted to an xdp_frame,
+DMA-mapped TO_DEVICE, enqueued on the Rust TX ring (ops.xdp_xmit_one under the
+txq lock), doorbelled once at poll end (ops.xdp_tx_flush), and reflected back out
+enp3s0 — visible as the doubled echo-request count.
+
+Memory-safety soak (R1: the #1 use-after-free risk — page recycle path)
+-----------------------------------------------------------------------
+30 s peer flood-ping (ping -f -w 30) into the DUT, every frame reflected via XDP_TX:
+  frames reflected (XDP_TX cycles): 2722
+  TX ring (256 slots) wrapped:      10x  (slots reused → shadow_kind reset exercised)
+  dmesg KASAN / WARN / BUG / use-after-free / double-free / slab-corrupt:  NONE
+
+The full page lifecycle is KASAN-clean across ring reuse:
+  RX page_pool page -> xdp_convert_buff_to_frame -> dma_map_single(TO_DEVICE)
+  -> Rust ring enqueue (TxSlotKind::Xdp) -> hardware TX -> reaper: dma_unmap +
+  xdp_return_frame (returns the page to the origin page_pool via the frame's
+  captured mem model) + shadow_kind reset to Skb.
+
+Disposition invariant preserved
+-------------------------------
+XDP_TX never goes through rust_xmit, so it is intentionally absent from the skb
+disposition invariant (tx_received == tx_consumed + tx_busy_exception +
+tx_dropped_error) and from BQL / byte-budget accounting. During the test the skb
+counters moved only for the handful of stack frames, never for XDP_TX frames —
+the invariant held throughout.
+
+No-prog fast-path regression
+----------------------------
+forward TX (dut->peer) -P16, no prog: 2.34 sender / 2.33 Gbit/s receiver
+  == the 2.34 baseline. The added per-slot shadow_kind (AtomicU8) + the reaper's
+  one tag-load-and-branch per completion cost nothing measurable; the producer
+  fast path (ndo_start_xmit) is unchanged.
+
+Attach/detach lifecycle
+-----------------------
+attach XDP_TX (native driver mode, id 139) -> reflects; detach (xdp off) ->
+prog count 0, ping restored (dut<->peer 0% loss), dmesg clean.
+
+Concurrency note
+----------------
+The NAPI-context XDP_TX producer takes the txq lock (__netif_tx_lock) so it
+serialises against the process-context ndo_start_xmit (both advance tx.head /
+write head-region descriptors); the reaper (tail) stays lockless against both via
+the OWN bit. The reaper-vs-producer interleave is exercised by the soak above;
+simultaneous stack-TX + XDP_TX cannot be driven on this single-prog reflector rig
+(an attached prog consumes the control channel), so that path is design-verified
+(same lock as the core holds for ndo_start_xmit) rather than load-measured here.
+
+Scope
+-----
+This completes the XDP RX/TX datapath: PASS/DROP/ABORTED/REDIRECT (RX read path,
+xdp_rx_readpath.txt) + XDP_TX (here). Not yet implemented: ndo_xdp_xmit (the
+redirect-target side, NETDEV_XDP_ACT_NDO_XMIT), RX multi-buffer for jumbo+XDP,
+and AF_XDP zero-copy — their xdp_features bits stay clear. Copy-mode AF_XDP is
+unlocked for free now that BASIC|REDIRECT is advertised.

@@ -24,6 +24,9 @@ echo
 echo "== RX skb-build hot path =="
 bash "$CI/check_rx_skb_build.sh" || rc=1
 echo
+echo "== native XDP contract =="
+bash "$CI/check_xdp_contract.sh" || rc=1
+echo
 echo "== full-RSS queue-aware bridge contract =="
 bash "$CI/check_rss_queue_contract.sh" || rc=1
 echo

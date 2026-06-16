@@ -12,6 +12,7 @@
 #include <linux/percpu.h>
 #include <linux/phy.h>
 #include <linux/workqueue.h>
+#include <net/xdp.h>
 
 /* The disposition counters live in per-CPU storage so the hot-path
  * `this_cpu_inc()` is a single decorated INC instruction with no cache-
@@ -45,6 +46,29 @@ struct r8125_bridge_rx_queue {
 	unsigned int rx_max_len;		/* device-writable bytes per buffer */
 	unsigned int rx_order;		/* page allocation order            */
 	size_t rx_buf_total;		/* PAGE_SIZE << rx_order            */
+
+	/* Per-queue RX stats for netdev_stat_ops (netdev-genl per-queue stats).
+	 * Single-writer (this queue's NAPI); read via READ_ONCE. Incremented next
+	 * to dev_sw_netstats_rx_add so the per-queue sum matches the device total.
+	 */
+	u64 rx_packets;
+	u64 rx_bytes;
+
+	/* XDP (netdev_bridge_xdp.c). xdp_rxq is registered with the page_pool
+	 * memory model while the queue is up. xdp_redirect_pending is set by an
+	 * XDP_REDIRECT during the poll and drives a single xdp_do_flush at poll
+	 * end. The attached program is a single device-wide RCU pointer in
+	 * struct r8125_bridge (xdp_prog), read with rcu_dereference_bh() in the
+	 * NAPI hot path and replaced under RTNL by ndo_bpf.
+	 */
+	struct xdp_rxq_info xdp_rxq;
+	bool xdp_rxq_registered;
+	bool xdp_redirect_pending;
+	/* Set by an XDP_TX verdict during the poll; drives a single TX doorbell
+	 * (ops.xdp_tx_flush) at poll end so the posted XDP_TX descriptors are
+	 * signalled to hardware exactly once per poll.
+	 */
+	bool xdp_tx_pending;
 };
 
 struct r8125_bridge {
@@ -63,6 +87,32 @@ struct r8125_bridge {
 	struct phy_device *phydev;
 	struct r8125_bridge_mdio_ops mdio_ops;
 	bool phy_connected;
+
+	/* ethtool -s msglvl: netif_msg_* bitmask. Reported by get_msglevel,
+	 * updated by set_msglevel. Same model as r8169's tp->msg_enable.
+	 */
+	u32 msg_enable;
+
+	/* PHY MCU firmware version string (from rtl8125b-2.fw), set by Rust after
+	 * a successful firmware apply; reported via ethtool -i. NUL-terminated
+	 * (33rd byte always 0). Empty if no firmware was loaded.
+	 */
+	char fw_version[33];
+
+	/* Attached XDP program (NULL = none), device-wide. Replaced under RTNL in
+	 * ndo_bpf with rcu_replace_pointer_rtnl(); the NAPI hot path dereferences
+	 * it with rcu_dereference_bh(). One ref is held here; bpf_prog_put on the
+	 * replaced program is RCU-deferred so the NAPI reader cannot use a freed
+	 * program.
+	 */
+	struct bpf_prog __rcu *xdp_prog;
+
+	/* Per-queue (single TX queue) TX stats for netdev_stat_ops. Single-writer
+	 * (the TX-completion NAPI); read via READ_ONCE. Incremented next to
+	 * dev_sw_netstats_tx_add so the per-queue value matches the device total.
+	 */
+	u64 tx_packets;
+	u64 tx_bytes;
 
 	/* ndo_tx_timeout runs in the netdev-watchdog timer (atomic) context, so
 	 * the actual chip reset (stop+open, which sleeps) is deferred to this work
@@ -102,5 +152,21 @@ extern const struct ethtool_ops r8125_bridge_ethtool_ops;
  */
 int  r8125_bridge_counters_alloc(struct r8125_bridge *b);
 void r8125_bridge_counters_free(struct r8125_bridge *b);
+
+/* XDP datapath glue (netdev_bridge_xdp.c). xdp_run is the per-packet verdict
+ * called from rx_one_packet; the rest manage the xdp_rxq lifecycle, the
+ * end-of-poll redirect flush, and ndo_bpf attach/detach.
+ */
+int  r8125_bridge_xdp_run(struct net_device *ndev,
+			  struct r8125_bridge_rx_queue *q, void *buf,
+			  unsigned int *off, unsigned int *len);
+void r8125_bridge_xdp_finalize(struct net_device *ndev, unsigned int queue_id);
+int  r8125_bridge_xdp_rxq_reg(struct net_device *ndev, unsigned int queue_id);
+void r8125_bridge_xdp_rxq_unreg(struct net_device *ndev, unsigned int queue_id);
+int  r8125_bridge_ndo_bpf(struct net_device *ndev, struct netdev_bpf *bpf);
+/* Called from the Rust TX reaper (via the unsafe boundary) to return an
+ * XDP_TX frame's page to its origin page_pool at TX completion.
+ */
+void r8125_bridge_xdp_return_frame(void *frame);
 
 #endif /* _R8125_NETDEV_BRIDGE_INTERNAL_H */

@@ -154,3 +154,27 @@ must justify:
   the canonical patch-submission checklist.
 - `Documentation/networking/index.rst` -- where the RST under
   `device_drivers/realtek/` slots into the kernel docs build.
+
+## Deferred ethtool/netdev surfaces (mainline r8169 parity)
+
+These surfaces are intentionally DEFERred (tracked by
+`ci/check_surface_inventory.sh`), because mainline `r8169` does not expose them
+for the RTL8125, so implementing them would add non-standard surface a reviewer
+would question — or, for the resize/legacy cases, add risk mainline avoids:
+
+- `get_rxnfc` / `set_rxnfc` -- RX flow classification / n-tuple. Mainline r8169
+  has no `get_rxnfc`/`set_rxnfc`; RSS hash config + the indirection table are
+  already exposed via `get_rxfh`/`set_rxfh` + `get_channels`. Deferred.
+- `get_eeprom` -- EEPROM dump. Mainline r8169 exposes no `get_eeprom`/
+  `get_eeprom_len`; the 8125 EEPROM access sequence is error-prone and low value
+  for upstream. Deferred.
+- `set_ringparam` -- live ring resize. Mainline r8169 keeps the descriptor ring
+  depth fixed (only `get_ringparam`); a live resize needs RX page-pool / NAPI /
+  DMA-ring / BQL rollback that mainline itself avoids. Deferred; `set_ringparam`
+  returns -EOPNOTSUPP cleanly.
+- `netpoll` (`ndo_poll_controller`) -- legacy. The netpoll core polls NAPI
+  instances directly when `ndo_poll_controller` is absent, so netconsole still
+  functions; an explicit synchronous IRQ replay is awkward with the Rust-owned
+  IRQ path. Deferred, consistent with modern drivers dropping it.
+- `coalesce` -- mainline returns `-EOPNOTSUPP` for the 8125 (V2 INT_MITI timer
+  uncharacterized). See the gap-closure plan. Deferred.

@@ -1,0 +1,53 @@
+XDP RX read-path validation (native driver-mode attach, verdicts, no-prog regression)
+=====================================================================================
+Date:        2026-06-15
+Host:        gateway (bare metal), kernel 7.0.0-kasan (KASAN on — memory-safety soak)
+Driver:      r8125_rust, srcversion E33B535B2DC6970EA81B74B
+Interface:   enp3s0 (DUT) in netns dut, peer 10.0.0.1 in netns peer (gw_loopback)
+Programs:    /tmp/xdp_drop.o (returns XDP_DROP), /tmp/xdp_pass.o (returns XDP_PASS),
+             both compiled clang -O2 -target bpf, SEC("xdp"), verified via llvm-objdump:
+               drop: w0 = 0x1 (XDP_DROP); exit
+               pass: w0 = 0x2 (XDP_PASS); exit
+
+Key question answered
+---------------------
+Native (driver-mode) XDP attach SUCCEEDS even though the driver does NOT advertise
+ndev->xdp_features. iproute attaches in mode "xdp" (driver), not "xdpgeneric":
+
+  # ip link set dev enp3s0 xdp obj /tmp/xdp_drop.o sec xdp   -> OK
+  54: enp3s0: <...> xdp qdisc fq_codel state UP ...
+      prog/xdp id 91 name prog tag b30cf65b7e0fa9c7 jited ...
+
+xdp_features advertisement is therefore NOT a prerequisite for native single-buffer
+XDP; it gates feature *introspection* and the verifier's multi-buffer / TX checks.
+We keep it unadvertised until XDP_TX lands so the advertised set stays honest.
+
+Verdict behavior
+----------------
+baseline (no prog):           dut->peer ping  3/3 received, 0% loss      PASS
+XDP_DROP attached:            dut<->peer ping  0/3 received, 100% loss   PASS (frames dropped at RX)
+XDP_PASS attached (id 103):   dut->peer ping  3/3 received, 0% loss      PASS (frames pass through)
+detach (xdp off):             prog/xdp count 0; ping 2/2 received        PASS (clean restore)
+
+No-prog fast-path throughput (single READ_ONCE branch, predicted not-taken)
+--------------------------------------------------------------------------
+forward TX (dut->peer) -P16:  2.35 sender / 2.34 Gbit/s receiver   == 2.34 baseline, no regression
+reverse RX (peer->dut) -P16:  1.46 Gbit/s                          == ~1.44 RX baseline, no regression
+(RX direction is inherently slower than TX on this KASAN gateway; both match prior
+ no-XDP numbers recorded in docs/perf/feature_smoke and docs/perf/runs.)
+
+Memory safety
+-------------
+dmesg cleared before the cycle; after attach/drop/pass/detach + both iperf runs:
+no WARN, no BUG, no KASAN report, no call trace, no use-after-free. The page-pool
+recycle path (page_pool_put_page on DROP/ABORTED) and xdp_rxq lifecycle
+(reg in rx_pool_create, unreg in rx_pool_destroy) are KASAN-clean.
+
+Scope
+-----
+This validates the RX read path: XDP_PASS / XDP_DROP / XDP_ABORTED / XDP_REDIRECT
+verdict handling, xdp_rxq registration against the page_pool memory model, and the
+no-program fast path. XDP_TX (the Rust TX-ring producer) is the next sub-batch;
+until it lands XDP_TX is treated as ABORTED and xdp_features stays unadvertised.
+XDP_REDIRECT exercises xdp_do_redirect + end-of-poll xdp_do_flush but was not
+load-tested here (needs a redirect target prog; verdict path is in place).

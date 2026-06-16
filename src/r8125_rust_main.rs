@@ -70,6 +70,8 @@ mod napi;
 mod netdev;
 mod pci;
 mod phy;
+mod phy_config;
+mod phy_fw;
 mod pm;
 mod regs;
 mod ring;

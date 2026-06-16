@@ -198,6 +198,9 @@ pub(crate) const CONFIG1: usize = 0x52;
 /// Required by all 8125 hw_start paths.
 pub(crate) const CONFIG3: usize = 0x54;
 pub(crate) const CONFIG3_RDY_TO_L23: u8 = 0x02;
+/// Config3 `MagicPacket (BIT5)` — arm Wake-on-LAN magic-packet reception.
+/// Vendor `rtl8125_set_hw_wol` sets this (Cfg9346-unlocked) for `WAKE_MAGIC`.
+pub(crate) const CONFIG3_MAGIC: u8 = 1 << 5;
 
 // ── Config5 (8-bit at 0x56) — ASPM enable bit ────────────────────────────
 /// r8169 `rtl_hw_aspm_clkreq_enable(false)` clears `ASPM_en (BIT(0))` in
@@ -205,6 +208,13 @@ pub(crate) const CONFIG3_RDY_TO_L23: u8 = 0x02;
 /// transmit bursts. Must be done while Cfg9346 is unlocked.
 pub(crate) const CONFIG5: usize = 0x56;
 pub(crate) const CONFIG5_ASPM_EN: u8 = 0x01;
+/// Config5 Wake-on-LAN wake-frame enables (vendor `rtl8125_set_hw_wol`):
+/// LanWake (master, WAKE_ANY), UWF/BWF/MWF for unicast/broadcast/multicast
+/// wake frames. Programmed Cfg9346-unlocked.
+pub(crate) const CONFIG5_LANWAKE: u8 = 1 << 1;
+pub(crate) const CONFIG5_UWF: u8 = 1 << 4;
+pub(crate) const CONFIG5_MWF: u8 = 1 << 5;
+pub(crate) const CONFIG5_BWF: u8 = 1 << 6;
 
 // ── RSS + per-queue config (8125-only, 32-bit / 16-bit) ──────────────────
 /// `RSS_CTRL_8125` (0x4500, 32-bit) — multi-queue receive-side-scaling.
@@ -248,6 +258,13 @@ pub(crate) const MMIO_0X382_VAL: u16 = 0x221b;
 /// `netdev_bridge.c`.
 pub(crate) const MAC_OCP_L1_EXIT_TRIGGERS: u32 = 0xC0AC;
 pub(crate) const MAC_OCP_L1_EXIT_TRIGGERS_MASK: u16 = 0x1F80;
+
+// ── WoL magic-packet V3 enable (OCP 0xC0B6) ──────────────────────────────
+/// Vendor `rtl8125_enable_magic_packet` (HwSuppMagicPktVer V3 = RTL8125B/
+/// MAC_VER_63) sets `BIT0` of MAC OCP 0xC0B6 to arm magic-packet detection;
+/// clearing it disarms. Paired with [`CONFIG3_MAGIC`].
+pub(crate) const MAC_OCP_MAGIC_V3: u32 = 0xC0B6;
+pub(crate) const MAC_OCP_MAGIC_V3_EN: u16 = 1 << 0;
 
 // ── MAC OCP — internal MAC register-set access (8125 family) ─────────────
 //
@@ -336,6 +353,10 @@ pub(crate) const TXCFG_M4_BASELINE: u32 =
 pub(crate) const COUNTER_ADDR_LOW: usize = 0x10;
 pub(crate) const COUNTER_ADDR_HIGH: usize = 0x14;
 pub(crate) const COUNTER_DUMP: u32 = 0x8;
+/// `CounterReset (BIT0)` of CounterAddrLow — zero the on-die tally block. Issued
+/// once at open (after RX is enabled) so the extended counters start from a
+/// clean per-session baseline; matches r8169/vendor `CounterReset`.
+pub(crate) const COUNTER_RESET: u32 = 0x1;
 
 // ── MAR — Multicast hash filter (MAR0..MAR7 at 0x08, two 32-bit words) ────
 // `ndo_set_rx_mode` programs the 64-bit multicast hash here (ether_crc>>26 bit

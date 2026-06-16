@@ -8,7 +8,7 @@
  * has no stable Rust API today: net_device + net_device_ops + NAPI +
  * sk_buff plumbing.
  *
- * Hard cap: 820 LOC including comments. The per-CPU netstats, IRQ-affinity,
+ * Hard cap: 960 LOC including comments. The per-CPU netstats, IRQ-affinity,
  * and TX-queue-len additions plus the per-MTU zero-copy RX path fit after dead
  * RX helpers moved out; queue-id plumbing and the multi-queue NAPI lifecycle
  * helpers raised the cap from 540, then 615. Raised to 700 for the upstream
@@ -17,7 +17,10 @@
  * surfacing the drop counters. Raised to 760 for ndo_set_rx_mode, then 800 for
  * the hardware tally-dump path, then 820 for the system-sleep PM
  * detach/reattach helpers (r8125_bridge_pm_suspend / _resume, reached only via
- * the r8125_pci_pm-gated Rust callbacks).
+ * the r8125_pci_pm-gated Rust callbacks), then 880 for the per-skb
+ * ndo_features_check offload veto and phy_do_ioctl_running wiring, then 910 for
+ * the live ndo_set_mac_address RAR reprogram + tally CounterReset, then 960 for
+ * the netdev-genl per-queue statistics (netdev_stat_ops).
  * See cshim/README.md.
  *
  * Every ndo callback below is a thin delegation to the Rust vtable.
@@ -31,12 +34,25 @@
 #include <linux/cpumask.h>
 #include <linux/dma-mapping.h>
 #include <linux/etherdevice.h>
+#include <linux/if_vlan.h>
 #include <linux/interrupt.h>
+#include <linux/phy.h>
 #include <linux/rtnetlink.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
+#include <net/netdev_queues.h>
 #include <asm/barrier.h>
+
+/*
+ * TX-descriptor transport-offset limits for the checksum-v2 engine (RTL8125B
+ * is MAC_VER_63 = csum v2). Ported from r8169 GTTCPHO_MAX / TCPHO_MAX: a TCP
+ * header offset beyond these cannot be encoded in the descriptor, so
+ * ndo_features_check drops TSO / checksum offload for such skbs and lets the
+ * stack do it in software.
+ */
+#define R8125_GTTCPHO_MAX	0x7f
+#define R8125_TCPHO_MAX		0x3ff
 
 /*
  * Raised from 64 (r8169 default) to 128: at MTU-1500 line rate (~166k pps)
@@ -104,6 +120,12 @@ static int bridge_ndo_open(struct net_device *ndev)
 		bridge_napi_disable_all(b);
 		return rc;
 	}
+	/* Zero the on-die tally counters now that RX is enabled, so the extended
+	 * statistics (octets, collisions, pause frames) accumulate from a clean
+	 * per-session baseline. Non-fatal: stats are best-effort.
+	 */
+	if (b->tally_vaddr)
+		b->ops.tally_reset(b->priv, b->tally_dma);
 	/* Rust open() performs the hardware bring-up and decides when the
 	 * TX queue is ready. Carrier follows the PHY link-state callback.
 	 */
@@ -170,6 +192,51 @@ static netdev_features_t bridge_ndo_fix_features(struct net_device *ndev,
 		features &= ~NETIF_F_CSUM_MASK;
 	}
 	return features;
+}
+
+/*
+ * `ndo_features_check` — per-skb offload veto, ported from
+ * `rtl8169_features_check`. RTL8125B uses the checksum-v2 engine, whose TX
+ * descriptor encodes the transport-header offset in a limited field. For a GSO
+ * skb whose TCP header sits beyond GTTCPHO_MAX, or a CHECKSUM_PARTIAL skb whose
+ * header sits beyond TCPHO_MAX (or a runt < ETH_ZLEN), the chip would emit
+ * malformed segments, so strip the offending offload and let the stack handle
+ * it. fix_features (MTU rule) handles the jumbo case separately.
+ */
+static netdev_features_t bridge_ndo_features_check(struct sk_buff *skb,
+						   struct net_device *ndev,
+						   netdev_features_t features)
+{
+	if (skb_is_gso(skb)) {
+		if (skb_transport_offset(skb) > R8125_GTTCPHO_MAX)
+			features &= ~NETIF_F_ALL_TSO;
+	} else if (skb->ip_summed == CHECKSUM_PARTIAL) {
+		if (skb->len < ETH_ZLEN)
+			features &= ~NETIF_F_CSUM_MASK;
+		if (skb_transport_offset(skb) > R8125_TCPHO_MAX)
+			features &= ~NETIF_F_CSUM_MASK;
+	}
+
+	return vlan_features_check(skb, features);
+}
+
+/*
+ * ndo_set_mac_address. eth_mac_addr validates + stores the new address in
+ * ndev->dev_addr; if the interface is running we must also reprogram the chip's
+ * RX unicast filter (RAR) immediately, otherwise the hardware keeps filtering on
+ * the old address until the next open. Mirrors mainline rtl_set_mac_address.
+ * Runs under RTNL.
+ */
+static int bridge_ndo_set_mac_address(struct net_device *ndev, void *p)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+	int rc = eth_mac_addr(ndev, p);
+
+	if (rc)
+		return rc;
+	if (netif_running(ndev))
+		b->ops.set_mac_filter(b->priv);
+	return 0;
 }
 
 static int bridge_ndo_set_features(struct net_device *ndev,
@@ -302,18 +369,64 @@ static void bridge_ndo_set_rx_mode(struct net_device *ndev)
 	b->ops.set_rx_mode(b->priv, accept, mc0, mc1);
 }
 
+/*
+ * Per-queue statistics for the netdev-genl qstats API (netdev_stat_ops). The
+ * device totals come from dev_sw_netstats (ndo_get_stats64); here we report the
+ * same packets/bytes split per RX queue and for the single TX queue, so the
+ * base + per-queue sum matches the device total. base_stats are zero — the queue
+ * set is fixed, so no traffic is attributed outside a live queue. Only packets +
+ * bytes are tracked; the other fields stay at their ~0 "unset" init.
+ */
+static void bridge_get_queue_stats_rx(struct net_device *ndev, int idx,
+				      struct netdev_queue_stats_rx *stats)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+	struct r8125_bridge_rx_queue *q = &b->rxq[idx];
+
+	stats->packets = READ_ONCE(q->rx_packets);
+	stats->bytes = READ_ONCE(q->rx_bytes);
+}
+
+static void bridge_get_queue_stats_tx(struct net_device *ndev, int idx,
+				      struct netdev_queue_stats_tx *stats)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+
+	stats->packets = READ_ONCE(b->tx_packets);
+	stats->bytes = READ_ONCE(b->tx_bytes);
+}
+
+static void bridge_get_base_stats(struct net_device *ndev,
+				  struct netdev_queue_stats_rx *rx,
+				  struct netdev_queue_stats_tx *tx)
+{
+	rx->packets = 0;
+	rx->bytes = 0;
+	tx->packets = 0;
+	tx->bytes = 0;
+}
+
+static const struct netdev_stat_ops bridge_stat_ops = {
+	.get_queue_stats_rx	= bridge_get_queue_stats_rx,
+	.get_queue_stats_tx	= bridge_get_queue_stats_tx,
+	.get_base_stats		= bridge_get_base_stats,
+};
+
 static const struct net_device_ops bridge_ops = {
 	.ndo_open		= bridge_ndo_open,
 	.ndo_stop		= bridge_ndo_stop,
 	.ndo_start_xmit		= bridge_ndo_start_xmit,
 	.ndo_change_mtu		= bridge_ndo_change_mtu,
 	.ndo_fix_features	= bridge_ndo_fix_features,
+	.ndo_features_check	= bridge_ndo_features_check,
 	.ndo_set_features	= bridge_ndo_set_features,
-	.ndo_set_mac_address	= eth_mac_addr,
+	.ndo_eth_ioctl		= phy_do_ioctl_running,
+	.ndo_set_mac_address	= bridge_ndo_set_mac_address,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_tx_timeout		= bridge_ndo_tx_timeout,
 	.ndo_get_stats64	= bridge_ndo_get_stats64,
 	.ndo_set_rx_mode	= bridge_ndo_set_rx_mode,
+	.ndo_bpf		= r8125_bridge_ndo_bpf,
 };
 
 /* ── Lifecycle ─────────────────────────────────────────────────────── */
@@ -339,6 +452,7 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	SET_NETDEV_DEV(ndev, &pdev->dev);
 	ndev->netdev_ops = &bridge_ops;
 	ndev->ethtool_ops = &r8125_bridge_ethtool_ops;
+	ndev->stat_ops = &bridge_stat_ops;
 	ndev->needs_free_netdev = false; /* we free explicitly */
 	/* The chip repopulates IDR0..IDR5 from on-chip storage after reset, but a
 	 * fresh/uninitialised chip (or one left zeroed by a prior reset) can hand
@@ -364,6 +478,11 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	 */
 	ndev->min_mtu = ETH_MIN_MTU;
 	ndev->max_mtu = 9000;
+
+	/* The unicast filter is reprogrammed live by ndo_set_mac_address, so the
+	 * stack may change the address while the interface is up.
+	 */
+	ndev->priv_flags |= IFF_LIVE_ADDR_CHANGE;
 
 	/* Arm the TX watchdog so a wedged TX queue is detected and recovered
 	 * (bridge_ndo_tx_timeout -> reset_work -> r8125_bridge_reopen).
@@ -410,6 +529,21 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 			    NETIF_F_HW_VLAN_CTAG_RX |
 			    NETIF_F_RXHASH;
 	ndev->features = ndev->hw_features;
+	/* The driver mandates a 64-bit DMA mask at probe (set_64bit_dma_mask,
+	 * probe fails otherwise), so the device can DMA to high memory. Advertise
+	 * it like mainline r8169; it is a fixed capability, not user-toggleable, so
+	 * it lives in features (not hw_features).
+	 */
+	ndev->features |= NETIF_F_HIGHDMA;
+	/* XDP: BASIC (attach + XDP_PASS/DROP/TX/ABORTED) and REDIRECT are both
+	 * implemented (netdev_bridge_xdp.c). XDP_TX enqueues on the Rust TX ring
+	 * via ops.xdp_xmit_one; REDIRECT goes through xdp_do_redirect + a once-per-
+	 * poll xdp_do_flush. NDO_XMIT (ndo_xdp_xmit, the redirect-target side) and
+	 * XSK zero-copy are not implemented yet, so their bits stay clear — the
+	 * advertised set is exactly what works. Advertising BASIC|REDIRECT also
+	 * unlocks copy-mode AF_XDP for free.
+	 */
+	ndev->xdp_features = NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT;
 	ndev->vlan_features = NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
 			      NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6;
 
@@ -425,6 +559,9 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	 * opt-in raises it. All MAX NAPI instances are created regardless.
 	 */
 	b->active_rx_queues = 1;
+	b->msg_enable = netif_msg_init(-1, NETIF_MSG_DRV | NETIF_MSG_PROBE |
+					   NETIF_MSG_LINK | NETIF_MSG_IFUP |
+					   NETIF_MSG_IFDOWN);
 	INIT_WORK(&b->reset_work, bridge_reset_work);
 
 	if (r8125_bridge_counters_alloc(b)) {

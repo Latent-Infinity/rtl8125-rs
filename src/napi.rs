@@ -270,17 +270,38 @@ fn process_tx_completions(state: &NetdevState) -> (usize, usize, usize) {
             // xmit overwrites it.
             state.tx.shadow_len[slot].store(0, Ordering::Release);
         }
-        let raw_skb = state.tx.shadow[slot].swap(ptr::null_mut(), Ordering::AcqRel);
-        if let Some(skb) = crate::skb::DriverOwnedSkb::from_raw_nullable(raw_skb) {
-            // LastFrag of a logical packet — reclaim the disposition
-            // obligation from the shadow and hand the skb back to NAPI
-            // (stats drain happens inside `consume_tx`). The DMA unmap
-            // for THIS slot already happened above; for SG packets the
-            // intermediate slots' unmaps happened in earlier loop iters.
-            completed_budget_bytes +=
-                state.tx.shadow_budget_len[slot].swap(0, Ordering::AcqRel) as usize;
-            completed_bytes += skb.consume_tx(ndev);
-            completed_pkts += 1;
+        // Reclaim the disposition tag and the slot pointer together. The tag
+        // selects how to release the pointer; reset it to `Skb` (the default)
+        // so a slot reused by a later xmit can't be misread as an XDP frame.
+        let kind = crate::netdev::TxSlotKind::from_u8(
+            state.tx.shadow_kind[slot].swap(crate::netdev::TxSlotKind::Skb as u8, Ordering::AcqRel),
+        );
+        let raw = state.tx.shadow[slot].swap(ptr::null_mut(), Ordering::AcqRel);
+        match kind {
+            crate::netdev::TxSlotKind::Xdp => {
+                // XDP_TX completion: the slot holds an `xdp_frame`, not an skb.
+                // The DMA unmap already ran above (shadow_len carried the frame
+                // length). Return the frame to its origin RX page_pool via the
+                // mem model captured at xdp_rxq registration. XDP_TX never went
+                // through `rust_xmit`, so it is deliberately absent from the skb
+                // disposition invariant — no tx_consumed / BQL / byte-budget.
+                if !raw.is_null() {
+                    ub::xdp_return_frame(raw.cast());
+                }
+            }
+            crate::netdev::TxSlotKind::Skb => {
+                if let Some(skb) = crate::skb::DriverOwnedSkb::from_raw_nullable(raw) {
+                    // LastFrag of a logical packet — reclaim the disposition
+                    // obligation from the shadow and hand the skb back to NAPI
+                    // (stats drain happens inside `consume_tx`). The DMA unmap
+                    // for THIS slot already happened above; for SG packets the
+                    // intermediate slots' unmaps happened in earlier loop iters.
+                    completed_budget_bytes +=
+                        state.tx.shadow_budget_len[slot].swap(0, Ordering::AcqRel) as usize;
+                    completed_bytes += skb.consume_tx(ndev);
+                    completed_pkts += 1;
+                }
+            }
         }
         // Clear the descriptor (preserve EOR if last slot).
         let mut opts1 = 0u32;
@@ -344,6 +365,10 @@ pub(crate) fn poll(state: &NetdevState, queue_id: u32, budget: c_int) -> c_int {
     let budget_u = if budget <= 0 { 0 } else { budget as usize };
 
     let work_done = process_rx_completions(state, queue_id, budget_u);
+    // Flush any XDP_REDIRECT'd frames once per poll (no-op if none / no prog).
+    if budget_u > 0 {
+        ub::bridge_xdp_finalize(state.ndev.load(Ordering::Acquire), queue_id);
+    }
     // TX is a single ring owned by RX queue 0: the tx0 MSI-X vector schedules
     // queue 0's NAPI (see netdev::v2_vector_source). ONLY queue 0 reaps it —
     // letting queues 1..N also call process_tx_completions would race the shared

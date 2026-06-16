@@ -34,7 +34,7 @@
  *   register — the "never let the chip write more than the buffer holds"
  *   rule.
  *
- * Hard cap: 320 LOC. Enforced by ci/check_cshim_loc_caps.sh. Raised from
+ * Hard cap: 360 LOC. Enforced by ci/check_cshim_loc_caps.sh. Raised from
  * 200 for the page_pool create/destroy + zero-copy refill super-call; the
  * file still owns exactly one concern (the RX buffer lifecycle + the RX
  * streaming-DMA syncs), which is why it stays one translation unit.
@@ -42,6 +42,7 @@
 
 #include "netdev_bridge_internal.h"
 
+#include <linux/bpf.h>
 #include <linux/dma-mapping.h>
 #include <linux/etherdevice.h>
 #include <linux/if_vlan.h>
@@ -54,13 +55,14 @@
 #include <net/page_pool/types.h>
 
 /*
- * RX headroom reserved in front of every frame. NET_SKB_PAD is the
- * stack's conventional head-padding (room for pushing tunnel/L2 headers,
- * and the same value napi_alloc_skb would reserve), so giving the stack
- * the same headroom keeps the zero-copy path behaviourally identical to
- * the previous copy path from the stack's point of view.
+ * RX headroom reserved in front of every frame. NET_SKB_PAD is the stack's
+ * conventional head-padding; XDP_PACKET_HEADROOM (256) is what an XDP program
+ * needs for bpf_xdp_adjust_head. We reserve the larger of the two
+ * UNCONDITIONALLY so attaching/detaching an XDP program is a pointer swap (no
+ * pool rebuild) and the no-XDP path keeps the same behaviour. The extra ~192 B
+ * per buffer does not change the page order at standard MTU.
  */
-#define R8125_RX_HEADROOM	NET_SKB_PAD
+#define R8125_RX_HEADROOM	max(NET_SKB_PAD, XDP_PACKET_HEADROOM)
 
 /* 14-bit descriptor LEN / RxMaxSize ceiling (DESC_LEN_MASK on the Rust side). */
 #define R8125_RX_DESC_MAX	0x3FFF
@@ -120,6 +122,7 @@ int r8125_bridge_rx_pool_create(struct net_device *ndev, unsigned int queue_id,
 	struct r8125_bridge_rx_queue *q = r8125_bridge_rxq(b, queue_id);
 	struct page_pool_params pp = { 0 };
 	struct page_pool *pool;
+	int rc;
 
 	if (WARN_ON(!q))
 		return -EINVAL;
@@ -148,6 +151,17 @@ int r8125_bridge_rx_pool_create(struct net_device *ndev, unsigned int queue_id,
 		return PTR_ERR(pool);
 
 	q->page_pool = pool;
+
+	/* Register the per-queue xdp_rxq against this pool's memory model so an
+	 * attached XDP program can XDP_REDIRECT / recycle from it.
+	 */
+	rc = r8125_bridge_xdp_rxq_reg(ndev, queue_id);
+	if (rc) {
+		q->page_pool = NULL;
+		page_pool_destroy(pool);
+		return rc;
+	}
+
 	*out_buf_len = q->rx_max_len;
 	return 0;
 }
@@ -167,6 +181,10 @@ void r8125_bridge_rx_pool_destroy(struct net_device *ndev, unsigned int queue_id
 
 	if (!q || !q->page_pool)
 		return;
+	/* Unregister the xdp_rxq (it references the pool's memory model) BEFORE
+	 * destroying the pool.
+	 */
+	r8125_bridge_xdp_rxq_unreg(ndev, queue_id);
 	page_pool_destroy(q->page_pool);
 	q->page_pool = NULL;
 }
@@ -243,6 +261,7 @@ void r8125_bridge_rx_one_packet(struct net_device *ndev, unsigned int queue_id,
 	struct r8125_bridge_rx_queue *q = r8125_bridge_rxq(b, queue_id);
 	struct page *newpage;
 	struct sk_buff *skb;
+	unsigned int xoff, xlen;
 	struct device *dev = &b->pdev->dev;
 	const bool hash_valid = (hash_info >> 63) & 1ULL;
 	const bool hash_l4 = (hash_info >> 62) & 1ULL;
@@ -268,6 +287,19 @@ void r8125_bridge_rx_one_packet(struct net_device *ndev, unsigned int queue_id,
 	page_pool_dma_sync_for_cpu(q->page_pool, virt_to_head_page(buf), 0, len);
 	prefetch(buf + q->rx_offset);
 
+	/* XDP verdict (no-op fast path when no program is attached). On a
+	 * non-PASS verdict the old page is already disposed (recycled to the pool
+	 * or handed to the redirect core); skip the skb but still install the
+	 * fresh page. On PASS, xoff/xlen carry any bpf_xdp_adjust_head/tail edits.
+	 */
+	xoff = q->rx_offset;
+	xlen = len;
+	if (r8125_bridge_xdp_run(ndev, q, (void *)buf, &xoff, &xlen)) {
+		*new_cpu = page_address(newpage);
+		*new_dma = page_pool_get_dma_addr(newpage) + q->rx_offset;
+		return;
+	}
+
 	skb = napi_build_skb((void *)buf, q->rx_buf_total);
 	if (unlikely(!skb)) {
 		/* skb alloc failed: recycle page to pool (NAPI context) and install fresh one. */
@@ -275,8 +307,8 @@ void r8125_bridge_rx_one_packet(struct net_device *ndev, unsigned int queue_id,
 		page_pool_put_page(q->page_pool, virt_to_head_page(buf), len, true);
 	} else {
 		skb_mark_for_recycle(skb);
-		skb_reserve(skb, q->rx_offset);
-		__skb_put(skb, len);
+		skb_reserve(skb, xoff);
+		__skb_put(skb, xlen);
 		skb->protocol = eth_type_trans(skb, ndev);
 		if (!hash_enabled) {
 			this_cpu_inc(*b->rx_hash_disabled);
@@ -297,7 +329,12 @@ void r8125_bridge_rx_one_packet(struct net_device *ndev, unsigned int queue_id,
 						  swab16(desc_opts2 &
 							 R8125_RX_VLAN_MASK));
 		this_cpu_inc(*b->rx_handed_to_stack);
-		dev_sw_netstats_rx_add(ndev, len);
+		dev_sw_netstats_rx_add(ndev, xlen);
+		/* Per-queue counters for netdev_stat_ops; single-writer (this NAPI),
+		 * kept next to the device total so the two stay consistent.
+		 */
+		q->rx_packets++;
+		q->rx_bytes += xlen;
 		napi_gro_receive(&q->napi, skb);
 	}
 

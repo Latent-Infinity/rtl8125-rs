@@ -20,10 +20,11 @@
  * surface is ~25 LOC, kept in this file to leave netdev_bridge.c
  * within its 400-line review cap.
  *
- * Hard cap: 400 LOC. Enforced by ci/check_cshim_loc_caps.sh. Raised from 200
+ * Hard cap: 600 LOC. Enforced by ci/check_cshim_loc_caps.sh. Raised from 200
  * for the ethtool RSS control plane (get/set_rxfh, get_channels, get_rxnfc),
  * then to 340 for the phylib link control plane, then 400 for pause/ring params
- * and nway_reset.
+ * and nway_reset, then 440 for EEE + msglevel, then 520 for the standardized
+ * IEEE 802.3 stats (eth-mac / eth-ctrl / pause), then 560 for Wake-on-LAN, then 600 for the ethtool -d register dump.
  */
 
 #include "netdev_bridge_internal.h"
@@ -31,6 +32,8 @@
 #include <linux/ethtool.h>
 #include <linux/netdevice.h>
 #include <linux/pci.h>
+#include <net/page_pool/helpers.h>
+#include <net/page_pool/types.h>
 
 /*
  * Driver identity exposed via `ethtool -i <iface>`. Keep this small:
@@ -48,6 +51,11 @@ static void bridge_get_drvinfo(struct net_device *ndev,
 	if (b->pdev)
 		strscpy(info->bus_info, pci_name(b->pdev),
 			sizeof(info->bus_info));
+	/* PHY MCU firmware version (set by Rust after a successful apply; empty
+	 * if no firmware was loaded).
+	 */
+	if (b->fw_version[0])
+		strscpy(info->fw_version, b->fw_version, sizeof(info->fw_version));
 }
 
 /*
@@ -86,20 +94,30 @@ static const char bridge_ethtool_strings[][ETH_GSTRING_LEN] = {
 
 static int bridge_get_sset_count(struct net_device *ndev, int sset)
 {
-	return sset == ETH_SS_STATS ? BRIDGE_ETHTOOL_NSTATS : -EOPNOTSUPP;
+	if (sset != ETH_SS_STATS)
+		return -EOPNOTSUPP;
+	/* Driver disposition counters + the page_pool allocator stats (the latter
+	 * surfaced via the standard page_pool ethtool helpers, not a private API).
+	 */
+	return BRIDGE_ETHTOOL_NSTATS + page_pool_ethtool_stats_get_count();
 }
 
 static void bridge_get_strings(struct net_device *ndev, u32 sset, u8 *data)
 {
-	if (sset == ETH_SS_STATS)
-		memcpy(data, bridge_ethtool_strings,
-		       sizeof(bridge_ethtool_strings));
+	if (sset != ETH_SS_STATS)
+		return;
+	memcpy(data, bridge_ethtool_strings, sizeof(bridge_ethtool_strings));
+	data += sizeof(bridge_ethtool_strings);
+	page_pool_ethtool_stats_get_strings(data);
 }
 
 static void bridge_get_ethtool_stats(struct net_device *ndev,
 				     struct ethtool_stats *stats, u64 *data)
 {
+	struct r8125_bridge *b = netdev_priv(ndev);
 	struct r8125_bridge_counters c;
+	struct page_pool_stats pp = {};
+	unsigned int i;
 
 	r8125_bridge_counters_snapshot(ndev, &c);
 	/* Order matches `bridge_ethtool_strings` above. */
@@ -113,6 +131,15 @@ static void bridge_get_ethtool_stats(struct net_device *ndev,
 	data[7] = c.rx_hash_l4;
 	data[8] = c.rx_hash_missing;
 	data[9] = c.rx_hash_disabled;
+
+	/* Append the page_pool allocator stats, summed across the active RX
+	 * queues' pools (NULL while a queue is down). page_pool_get_stats
+	 * accumulates into `pp`.
+	 */
+	for (i = 0; i < R8125_BRIDGE_RX_QUEUE_COUNT; i++)
+		if (b->rxq[i].page_pool)
+			page_pool_get_stats(b->rxq[i].page_pool, &pp);
+	page_pool_ethtool_stats_get(&data[BRIDGE_ETHTOOL_NSTATS], &pp);
 }
 
 u32 r8125_bridge_rxfh_indir_default(u32 index, u32 n_rx_rings)
@@ -346,6 +373,158 @@ static void bridge_get_ringparam(struct net_device *ndev,
 	ring->tx_pending = R8125_BRIDGE_RING_LEN;
 }
 
+/*
+ * Energy-Efficient Ethernet. The integrated PHY owns EEE negotiation, so
+ * delegate straight to phylib (same pattern as pauseparam). phylib returns
+ * -ENODEV when no PHY is attached; the explicit guard documents the contract.
+ * Runs under RTNL.
+ */
+static int bridge_get_eee(struct net_device *ndev, struct ethtool_keee *data)
+{
+	if (!ndev->phydev)
+		return -ENODEV;
+	return phy_ethtool_get_eee(ndev->phydev, data);
+}
+
+static int bridge_set_eee(struct net_device *ndev, struct ethtool_keee *data)
+{
+	if (!ndev->phydev)
+		return -ENODEV;
+	return phy_ethtool_set_eee(ndev->phydev, data);
+}
+
+/*
+ * Standardized IEEE 802.3 statistics, mapped from the hardware tally block
+ * (the same DMA dump ndo_get_stats64 uses). Field mapping ported from
+ * rtl8169_get_eth_{mac,ctrl}_stats / get_pause_stats. RTL8125B always has the
+ * extended counter block, so the 64/32-bit extended fields are used directly.
+ * A dump failure (no buffer / timeout) leaves the ethtool struct's defaults.
+ */
+static bool bridge_tally_refresh(struct r8125_bridge *b)
+{
+	return b->tally_vaddr && !b->ops.tally_dump(b->priv, b->tally_dma);
+}
+
+static void bridge_get_pause_stats(struct net_device *ndev,
+				   struct ethtool_pause_stats *stats)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+
+	if (!bridge_tally_refresh(b))
+		return;
+	stats->tx_pause_frames = le32_to_cpu(b->tally_vaddr->tx_pause_on);
+	stats->rx_pause_frames = le32_to_cpu(b->tally_vaddr->rx_pause_on);
+}
+
+static void bridge_get_eth_mac_stats(struct net_device *ndev,
+				     struct ethtool_eth_mac_stats *s)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+	struct r8125_tally *t = b->tally_vaddr;
+
+	if (!bridge_tally_refresh(b))
+		return;
+	s->FramesTransmittedOK		 = le64_to_cpu(t->tx_packets);
+	s->SingleCollisionFrames	 = le32_to_cpu(t->tx_one_collision);
+	s->MultipleCollisionFrames	 = le32_to_cpu(t->tx_multi_collision);
+	s->FramesReceivedOK		 = le64_to_cpu(t->rx_packets);
+	s->FramesLostDueToIntMACXmitError = le64_to_cpu(t->tx_errors);
+	s->BroadcastFramesReceivedOK	 = le64_to_cpu(t->rx_broadcast);
+	s->AlignmentErrors		 = le32_to_cpu(t->align_errors32);
+	s->OctetsTransmittedOK		 = le64_to_cpu(t->tx_octets);
+	s->LateCollisions		 = le32_to_cpu(t->tx_late_collision);
+	s->FramesAbortedDueToXSColls	 = le32_to_cpu(t->tx_aborted32);
+	s->OctetsReceivedOK		 = le64_to_cpu(t->rx_octets);
+	s->FramesLostDueToIntMACRcvError = le32_to_cpu(t->rx_mac_error);
+	s->MulticastFramesXmittedOK	 = le64_to_cpu(t->tx_multicast64);
+	s->BroadcastFramesXmittedOK	 = le64_to_cpu(t->tx_broadcast64);
+	s->MulticastFramesReceivedOK	 = le64_to_cpu(t->rx_multicast64);
+	s->FrameTooLongErrors		 = le32_to_cpu(t->rx_frame_too_long);
+}
+
+static void bridge_get_eth_ctrl_stats(struct net_device *ndev,
+				      struct ethtool_eth_ctrl_stats *stats)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+
+	if (!bridge_tally_refresh(b))
+		return;
+	stats->UnsupportedOpcodesReceived =
+		le32_to_cpu(b->tally_vaddr->rx_unknown_opcode);
+}
+
+/*
+ * Register dump for `ethtool -d`. Mirrors rtl8169_get_regs: a fixed 256-byte
+ * window of the MAC register space, read as 64 dwords through the Rust boundary
+ * (which owns the BAR). Read-only; intended for debugging.
+ */
+#define R8125_REGS_DUMP_LEN 256
+
+static int bridge_get_regs_len(struct net_device *ndev)
+{
+	return R8125_REGS_DUMP_LEN;
+}
+
+static void bridge_get_regs(struct net_device *ndev, struct ethtool_regs *regs,
+			    void *p)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+	u32 *dw = p;
+	int i;
+
+	regs->version = 0;
+	for (i = 0; i < R8125_REGS_DUMP_LEN; i += 4)
+		*dw++ = b->ops.read_reg(b->priv, i);
+}
+
+/*
+ * Wake-on-LAN. Supports the magic packet plus unicast/broadcast/multicast wake
+ * frames (WAKE_PHY link-change is not wired — Config3.LinkUp is reserved on
+ * RTL8125B). get_wol reports the chip's current arm state; set_wol rejects
+ * unsupported WAKE_* bits, programs the chip via Rust, and mirrors the armed
+ * state into the PCI device's wakeup-enable so the PM core arms PME on suspend.
+ * Runs under RTNL.
+ */
+#define R8125_WAKE_SUPPORTED (WAKE_MAGIC | WAKE_UCAST | WAKE_BCAST | WAKE_MCAST)
+
+static void bridge_get_wol(struct net_device *ndev, struct ethtool_wolinfo *wol)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+
+	wol->supported = R8125_WAKE_SUPPORTED;
+	wol->wolopts = b->ops.get_wol(b->priv);
+}
+
+static int bridge_set_wol(struct net_device *ndev, struct ethtool_wolinfo *wol)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+
+	if (wol->wolopts & ~R8125_WAKE_SUPPORTED)
+		return -EINVAL;
+
+	b->ops.set_wol(b->priv, wol->wolopts);
+
+	if (ndev->dev.parent)
+		device_set_wakeup_enable(ndev->dev.parent, !!wol->wolopts);
+
+	return 0;
+}
+
+/* ethtool -s msglvl / message-level knob (netif_msg_* bitmask). */
+static u32 bridge_get_msglevel(struct net_device *ndev)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+
+	return b->msg_enable;
+}
+
+static void bridge_set_msglevel(struct net_device *ndev, u32 level)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+
+	b->msg_enable = level;
+}
+
 const struct ethtool_ops r8125_bridge_ethtool_ops = {
 	.get_drvinfo		= bridge_get_drvinfo,
 	.get_sset_count		= bridge_get_sset_count,
@@ -365,4 +544,16 @@ const struct ethtool_ops r8125_bridge_ethtool_ops = {
 	.get_pauseparam		= bridge_get_pauseparam,
 	.set_pauseparam		= bridge_set_pauseparam,
 	.get_ringparam		= bridge_get_ringparam,
+	.get_eee		= bridge_get_eee,
+	.set_eee		= bridge_set_eee,
+	.get_msglevel		= bridge_get_msglevel,
+	.set_msglevel		= bridge_set_msglevel,
+	.get_ts_info		= ethtool_op_get_ts_info,
+	.get_pause_stats	= bridge_get_pause_stats,
+	.get_eth_mac_stats	= bridge_get_eth_mac_stats,
+	.get_eth_ctrl_stats	= bridge_get_eth_ctrl_stats,
+	.get_wol		= bridge_get_wol,
+	.set_wol		= bridge_set_wol,
+	.get_regs_len		= bridge_get_regs_len,
+	.get_regs		= bridge_get_regs,
 };

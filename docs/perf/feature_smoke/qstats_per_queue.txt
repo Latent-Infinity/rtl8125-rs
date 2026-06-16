@@ -1,0 +1,16 @@
+BUILD_RC=0
+=== per-queue qstats (ynl, ifindex=47) ===
+[{'ifindex': 47,
+  'rx-bytes': 3525128,
+  'rx-packets': 50363,
+  'tx-bytes': 735289744,
+  'tx-packets': 50587}]
+=== device total (ip -s link) ===
+rx_pkts 50363 tx_pkts 50587
+splats=0
+QST_DONE
+=== -P16 sustained (qstats build) ===
+[SUM]   0.00-10.00  sec  2.74 GBytes  2.35 Gbits/sec    0             sender
+[SUM]   0.00-10.00  sec  2.73 GBytes  2.34 Gbits/sec                  receiver
+(per-queue counter add = one u64 inc + one add per RX packet, single-writer, on the already-hot rxq cache line)
+QSPERF_DONE

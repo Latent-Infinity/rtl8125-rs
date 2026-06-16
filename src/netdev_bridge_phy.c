@@ -205,3 +205,61 @@ void r8125_bridge_phy_stop(struct net_device *ndev)
 	phy_disconnect(b->phydev);
 	b->phy_connected = false;
 }
+
+/*
+ * PHY register-access glue for the Rust-owned hw_phy_config errata table
+ * (src/phy_config.rs). Thin wrappers over the phylib paged/MMD accessors so
+ * phylib keeps ownership of PHY paging; the errata sequence + its values live in
+ * (host-tested) Rust. Best-effort like r8169's hw_phy_config — individual write
+ * errors are not fatal to bring-up.
+ */
+void r8125_bridge_phy_modify_paged(struct net_device *ndev, u16 page, u16 reg,
+				   u16 mask, u16 set)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+
+	if (b->phydev)
+		phy_modify_paged(b->phydev, page, reg, mask, set);
+}
+
+void r8125_bridge_phy_write_paged(struct net_device *ndev, u16 page, u16 reg,
+				  u16 val)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+
+	if (b->phydev)
+		phy_write_paged(b->phydev, page, reg, val);
+}
+
+void r8125_bridge_phy_write_mmd(struct net_device *ndev, u16 devad, u16 reg,
+				u16 val)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+
+	if (b->phydev)
+		phy_write_mmd(b->phydev, devad, reg, val);
+}
+
+void r8125_bridge_phy_modify_mmd(struct net_device *ndev, u16 devad, u16 reg,
+				 u16 mask, u16 set)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+
+	if (b->phydev)
+		phy_modify_mmd(b->phydev, devad, reg, mask, set);
+}
+
+/*
+ * Record the applied PHY MCU firmware version (exact 32-byte version field from
+ * the blob, NUL-padded) for ethtool -i. Called by Rust after a successful
+ * firmware apply (src/phy_fw.rs).
+ */
+void r8125_bridge_set_fw_version(struct net_device *ndev, const char *ver)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+
+	memcpy(b->fw_version, ver, 32);
+	b->fw_version[32] = '\0';
+}
+
+MODULE_FIRMWARE("rtl_nic/rtl8125b-2.fw");

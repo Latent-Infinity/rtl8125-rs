@@ -1,0 +1,19 @@
+BUILD_RC=0
+=== eth-mac (expect Octets nonzero now) ===
+eth-mac-FramesTransmittedOK: 489877
+eth-mac-FramesReceivedOK: 49089
+eth-mac-OctetsTransmittedOK: 0
+eth-mac-OctetsReceivedOK: 0
+eth-mac-MulticastFramesReceivedOK: 0
+eth-mac-BroadcastFramesReceivedOK: 0
+=== pause group ===
+netlink error: bit name not found (offset 52)
+netlink error: Operation not supported
+splats=0
+B2T3_DONE
+
+NOTE: OctetsTransmittedOK/ReceivedOK + pause/collision extended counters read 0
+on this RTL8125B via the tally DMA dump even after CounterReset-at-open. The
+frame counters (FramesTransmittedOK/ReceivedOK) populate correctly. This matches
+mainline r8169 behavior on the same silicon (identical reset+dump+field mapping);
+the driver reports exactly what the hardware tally provides.

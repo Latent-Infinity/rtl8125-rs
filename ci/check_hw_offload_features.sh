@@ -126,4 +126,13 @@ else
 	red "RXHASH hash-engine programming must run after hw_start_8125b and before enable_chip_engines"
 fi
 
+# NETIF_F_HIGHDMA must be advertised (the driver mandates a 64-bit DMA mask at
+# probe). It is a fixed capability marker, so it belongs in features, not
+# hw_features.
+if grep -qE 'ndev->features \|= NETIF_F_HIGHDMA' "$ROOT/src/netdev_bridge.c"; then
+	grn "NETIF_F_HIGHDMA advertised (64-bit DMA mask is mandatory at probe)"
+else
+	red "NETIF_F_HIGHDMA must be advertised in features (64-bit DMA mask is required)"
+fi
+
 exit "$rc"

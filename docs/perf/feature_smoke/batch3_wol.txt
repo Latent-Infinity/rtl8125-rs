@@ -1,0 +1,22 @@
+BUILD_RC=0
+=== supported (expect 'Supports Wake-on: pumbg' minus phy => umbg) ===
+	Supports Wake-on: umbg
+	Wake-on: d
+pci wakeup initial=disabled
+=== set wol g (magic) ===
+	Supports Wake-on: umbg
+	Wake-on: g
+pci wakeup=enabled
+=== set wol ubg (ucast+bcast+magic broader modes) ===
+	Supports Wake-on: umbg
+	Wake-on: ubg
+=== set wol d (disarm) ===
+	Supports Wake-on: umbg
+	Wake-on: d
+pci wakeup=disabled
+=== reject wol a (ARP unsupported) ===
+netlink error: cannot enable unsupported WoL mode (offset 36)
+netlink error: Invalid argument
+rc=75
+splats=0
+B3_DONE

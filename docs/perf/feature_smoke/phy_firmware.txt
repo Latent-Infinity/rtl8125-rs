@@ -1,0 +1,12 @@
+BUILD_RC=0
+-rw-r--r-- 1 root root 1592 Mar 19 12:32 /lib/firmware/rtl_nic/rtl8125b-2.fw.zst
+modinfo firmware: rtl_nic/rtl8125b-2.fw
+=== dmesg firmware apply ===
+[415292.859790] r8125_rust: r8125_rust: PHY firmware applied (800 ops)
+[415295.861309] r8125_rust: r8125_rust: PHY firmware applied (800 ops)
+=== ethtool -i firmware-version ===
+firmware-version: rtl8125b-2_0.0.2 07/13/20
+carrier=1 speed=2500Mb/s
+traffic: 2.34 Gbits/sec
+splats=0
+FWT_DONE

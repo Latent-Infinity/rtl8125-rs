@@ -1,0 +1,11 @@
+BUILD_RC=0
+=== ethtool -d (register dump, expect 256 bytes; offset0=TxConfig nonzero) ===
+Offset		Values
+------		------
+0x0000:		38 05 25 36 a6 1d 00 00 40 00 00 00 80 00 20 00
+0x0010:		00 c0 c6 bf 00 00 00 00 08 00 00 00 00 00 00 00
+0x0020:		00 60 b6 be 00 00 00 00 7d 5f 3f ff bc d9 f9 eb
+0x0030:		00 00 00 00 01 00 00 0c 00 00 00 00 00 00 00 00
+byte count: 256
+splats=0
+B4_DONE

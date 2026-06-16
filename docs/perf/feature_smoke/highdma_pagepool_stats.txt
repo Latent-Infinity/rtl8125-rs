@@ -1,0 +1,14 @@
+BUILD_RC=0
+=== HIGHDMA feature flag ===
+highdma: on [fixed]
+=== page_pool stats in -S (expect rx_pp_alloc_* nonzero after traffic) ===
+     rx_pp_alloc_fast: 38151
+     rx_pp_alloc_slow: 5
+     rx_pp_alloc_slow_ho: 0
+     rx_pp_recycle_cached: 32993
+     rx_pp_recycle_cache_full: 0
+     rx_pp_recycle_ring: 4985
+     rx_pp_recycle_ring_full: 0
+     rx_pp_recycle_released_ref: 0
+splats=0
+W345_DONE

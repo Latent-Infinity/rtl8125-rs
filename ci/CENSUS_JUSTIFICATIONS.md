@@ -455,3 +455,57 @@ wrappers only feed it kernel facts / apply its result:
   `bridge_irq_pin_cpu`), which fans the active vectors across distinct CPUs so
   each queue's DMA stays on one per-CPU IOVA cache (the `tx_dropped_error`
   multi-queue TX-collapse fix).
+
+## 2026-06-15 — PHY errata config bump 78 → 82
+
+Net +4 `unsafe { ... }` blocks in `src/unsafe_boundary.rs` for the PHY errata
+register-access wrappers used by `rtl8125b_hw_phy_config` (host-tested table in
+`src/phy_config.rs`):
+
+- ADDED `phy_modify_paged`, `phy_write_paged`, `phy_write_mmd`,
+  `phy_modify_mmd` — each wraps the matching cshim (`r8125_bridge_phy_*`), which
+  forwards to the phylib paged/MMD accessor on `b->phydev` (phylib owns PHY
+  paging). SAFETY: `ndev` is the registered net_device; the cshim no-ops on a
+  null phydev; called single-threaded during open before the PHY state machine
+  starts. No ownership/MMIO/skb crosses the boundary — only scalar PHY
+  reg/mask/val. The errata sequence + values live in the host-tested Rust table,
+  not in C.
+
+## 2026-06-15 — PHY firmware version readback bump 82 → 83
+
+Net +1 `unsafe { ... }` block in `src/unsafe_boundary.rs`:
+
+- ADDED `set_fw_version(ndev, &[u8; 32])` — wraps `r8125_bridge_set_fw_version`,
+  which `memcpy`s exactly 32 bytes of the parsed PHY-firmware version field into
+  `b->fw_version` (NUL-terminated) for `ethtool -i`. SAFETY: `ndev` is the
+  registered net_device; `ver` is a fixed 32-byte array; the cshim reads exactly
+  32 bytes. No ownership/MMIO/skb. (The firmware request + decode + apply are all
+  safe Rust: `kernel::firmware::Firmware` + the host-tested `phy_fw` interpreter +
+  the `mmio`/`phy` typed accessors — no unsafe added there.)
+
+## 2026-06-15 — XDP redirect flush bump 83 → 84
+
+Net +1 `unsafe { ... }` block in `src/unsafe_boundary.rs`:
+
+- ADDED `bridge_xdp_finalize(ndev, queue_id)` — wraps `r8125_bridge_xdp_finalize`,
+  which does a single `xdp_do_flush()` at NAPI-poll end if any frame was
+  XDP_REDIRECT'd. SAFETY: `ndev` is the registered net_device; `queue_id` is
+  bounds-checked in the cshim; called from NAPI poll context. No ownership/MMIO/
+  skb crosses the boundary. (The XDP verdict path itself — bpf_prog_run_xdp,
+  xdp_buff, xdp_do_redirect, the xdp_rxq lifecycle, ndo_bpf — is all C in
+  netdev_bridge_xdp.c; no Rust unsafe added there.)
+
+## 2026-06-15 — XDP_TX frame return bump 84 → 85
+
+Net +1 `unsafe { ... }` block in `src/unsafe_boundary.rs`:
+
+- ADDED `xdp_return_frame(frame)` — wraps `r8125_bridge_xdp_return_frame`, which
+  calls the kernel `xdp_return_frame()` to return an XDP_TX frame's page to its
+  origin RX page_pool at TX completion (via the frame's captured mem model).
+  SAFETY: `frame` is the exact `xdp_frame*` a prior `xdp_xmit_one` stored in the
+  TX shadow and is returned exactly once (the reaper swaps the shadow pointer to
+  NULL and resets the slot's `TxSlotKind` tag before the call). No MMIO/skb. (The
+  XDP_TX producer — buff→frame convert, dma_map_single, txq lock, enqueue — is
+  C in netdev_bridge_xdp.c calling the Rust `xdp_xmit_one` op, which uses only the
+  already-wrapped `desc_publish_own` accessor; the new `xdp_tx_enqueue` /
+  `rust_xdp_xmit_one` / `rust_xdp_tx_flush` add no unsafe.)

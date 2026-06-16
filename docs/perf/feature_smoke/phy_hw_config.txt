@@ -1,0 +1,11 @@
+BUILD_RC=0
+=== 3 link up/down cycles (errata applied each open) ===
+cycle 1: carrier=1 speed=2500Mb/s
+cycle 2: carrier=1 speed=2500Mb/s
+cycle 3: carrier=1 speed=2500Mb/s
+traffic: 2.34 Gbits/sec
+=== EEE (errata #23-26 touch eee regs) ===
+	EEE status: enabled - inactive
+phy errata applied (dmesg ndo_open complete present)=26
+splats=0
+PHY_DONE

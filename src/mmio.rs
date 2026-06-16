@@ -23,6 +23,16 @@ use crate::{regs, unsafe_boundary};
 /// resize requires touching only this constant.
 pub(crate) const R8125_MMIO_LEN: usize = 0x1_0000;
 
+// `layout` keeps kernel-free copies of the Config3/Config5 WoL bits so it builds
+// standalone for `rustc --test`. Pin each to the canonical register-file value
+// so the two cannot drift (set_wol writes via layout, wol_opts reads via layout
+// against the same bits).
+const _: () = assert!(regs::CONFIG3_MAGIC == crate::layout::CONFIG3_MAGIC);
+const _: () = assert!(regs::CONFIG5_LANWAKE == crate::layout::CONFIG5_LANWAKE);
+const _: () = assert!(regs::CONFIG5_UWF == crate::layout::CONFIG5_UWF);
+const _: () = assert!(regs::CONFIG5_MWF == crate::layout::CONFIG5_MWF);
+const _: () = assert!(regs::CONFIG5_BWF == crate::layout::CONFIG5_BWF);
+
 /// Lightweight view over the device's mapped MMIO BAR. `&Regs` is what the
 /// rest of the crate consumes — `pci.rs` / `hw.rs` / `pm.rs` never see the
 /// `pci::Bar` directly.
@@ -86,11 +96,7 @@ impl<'a> Regs<'a> {
     /// chip silently drops unicast frames after a reset clears IDR0, or after a
     /// random-MAC fallback / `ip link set address`.
     pub(crate) fn set_mac_address(&self, addr: &[u8; 6]) {
-        let low = u32::from(addr[0])
-            | (u32::from(addr[1]) << 8)
-            | (u32::from(addr[2]) << 16)
-            | (u32::from(addr[3]) << 24);
-        let high = u32::from(addr[4]) | (u32::from(addr[5]) << 8);
+        let (low, high) = crate::layout::mac_rar_words(addr);
         self.bar.write8(regs::CFG9346_UNLOCK, regs::CFG9346);
         self.bar.write32(low, regs::MAC_ADDR_LOW);
         self.bar.write32(high, regs::MAC_ADDR_HIGH);
@@ -155,6 +161,27 @@ impl<'a> Regs<'a> {
         for _ in 0..200 {
             udelay(step);
             if self.bar.read32(regs::COUNTER_ADDR_LOW) & regs::COUNTER_DUMP == 0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Reset the on-die tally counters to zero via the `CounterReset` handshake
+    /// (programs the counter DMA address, then polls the reset bit clear). Issued
+    /// once at open so the extended counters (octets, collisions, pause frames)
+    /// begin a clean per-session baseline. Returns true on completion. Mirrors
+    /// vendor `rtl8125_reset_tally_counter`.
+    pub(crate) fn reset_tally(&self, handle: u64) -> bool {
+        let low = (handle as u32) & !0x7;
+        self.bar
+            .write32((handle >> 32) as u32, regs::COUNTER_ADDR_HIGH);
+        self.bar
+            .write32(low | regs::COUNTER_RESET, regs::COUNTER_ADDR_LOW);
+        let step = Delta::from_micros(10);
+        for _ in 0..200 {
+            udelay(step);
+            if self.bar.read32(regs::COUNTER_ADDR_LOW) & regs::COUNTER_RESET == 0 {
                 return true;
             }
         }
@@ -315,6 +342,40 @@ impl<'a> Regs<'a> {
 
     pub(crate) fn set_config5(&self, value: u8) {
         self.bar.write8(value, regs::CONFIG5);
+    }
+
+    // ── Wake-on-LAN (magic packet + unicast/broadcast/multicast, RTL8125B) ──
+
+    /// Program the chip WoL arm state from an `ethtool` `WAKE_*` mask. Mirrors
+    /// vendor `rtl8125_set_hw_wol`: the V3 magic-packet OCP enable (0xC0B6 BIT0),
+    /// Config3.MagicPacket, and the Config5 wake-frame enables (UWF/MWF/BWF +
+    /// LanWake master), all bracketed by the Cfg9346 unlock/lock the config
+    /// registers require. The pure bit math is in `crate::layout` (host-tested).
+    pub(crate) fn set_wol(&self, wolopts: u32) {
+        self.unlock_config_regs();
+        self.mac_ocp_modify(
+            regs::MAC_OCP_MAGIC_V3,
+            regs::MAC_OCP_MAGIC_V3_EN,
+            if wolopts & crate::layout::WAKE_MAGIC != 0 {
+                regs::MAC_OCP_MAGIC_V3_EN
+            } else {
+                0
+            },
+        );
+        self.set_config3(crate::layout::wol_config3(self.config3(), wolopts));
+        self.set_config5(crate::layout::wol_config5(self.config5(), wolopts));
+        self.lock_config_regs();
+    }
+
+    /// The active `WAKE_*` mask read back from Config3/Config5 (for `get_wol`).
+    pub(crate) fn wol_opts(&self) -> u32 {
+        crate::layout::wol_from_config(self.config3(), self.config5())
+    }
+
+    /// Read one 32-bit MMIO register by byte offset, for the `ethtool -d`
+    /// register dump (`get_regs`). Offset is masked into the BAR window.
+    pub(crate) fn read_dword(&self, off: usize) -> u32 {
+        self.bar.read32(off & (R8125_MMIO_LEN - 4))
     }
 
     // ── 8125 multi-queue / RSS disable (TSO) ───────────────────────────

@@ -204,22 +204,114 @@ struct r8125_bridge_ops {
 	 *         hardware-error stats unchanged).
 	 */
 	int (*tally_dump)(void *priv, u64 dma_addr);
+
+	/*
+	 * tally_reset(priv, dma_addr) — zero the on-die tally counters
+	 * ──────────────────────────
+	 * Issued once from bridge_ndo_open after the chip's RX is enabled, so the
+	 * extended counters (octets, collisions, pause frames) begin a clean
+	 * per-session baseline. Same DMA handshake as tally_dump; 0 on success.
+	 */
+	int (*tally_reset)(void *priv, u64 dma_addr);
+
+	/*
+	 * get_wol(priv) / set_wol(priv, wolopts) — ethtool Wake-on-LAN
+	 * ──────────────────────────
+	 * get_wol returns the active WAKE_* mask read back from the chip
+	 * (Config3.MagicPacket + Config5 wake-frame bits). set_wol programs the
+	 * chip arm state; the C side validates wolopts (rejects bits outside the
+	 * supported set) and manages device wakeup-enable around the call.
+	 */
+	u32 (*get_wol)(void *priv);
+	void (*set_wol)(void *priv, u32 wolopts);
+
+	/*
+	 * read_reg(priv, offset) — read one 32-bit MMIO register for `ethtool -d`.
+	 * The C side loops to fill the ethtool buffer, so no raw buffer crosses
+	 * the Rust boundary.
+	 */
+	u32 (*read_reg)(void *priv, u32 offset);
+
+	/*
+	 * set_mac_filter(priv) — reprogram the chip RX unicast filter (RAR) from
+	 * the current net_device address. Called from ndo_set_mac_address when the
+	 * interface is running so a live address change takes effect in hardware
+	 * immediately (the open path programs it otherwise).
+	 */
+	void (*set_mac_filter)(void *priv);
+
+	/*
+	 * xdp_xmit_one(priv, frame_dma, frame_len, frame) — enqueue one XDP_TX
+	 * frame on the Rust-owned TX ring. Called from the XDP verdict path
+	 * (netdev_bridge_xdp.c) under the txq lock, which serialises this
+	 * NAPI-context producer against ndo_start_xmit. `frame_dma`/`frame_len`
+	 * describe the DMA_TO_DEVICE mapping the caller made over the frame data;
+	 * `frame` is the xdp_frame the reaper hands to xdp_return_frame at
+	 * completion. Returns 0 on enqueue, -ENOSPC if the ring is full (the
+	 * caller then unmaps + returns the frame). No doorbell is rung here.
+	 */
+	int (*xdp_xmit_one)(void *priv, u64 frame_dma, u32 frame_len,
+			    void *frame);
+
+	/*
+	 * xdp_tx_flush(priv) — ring the TX doorbell once. Called from
+	 * r8125_bridge_xdp_finalize at NAPI-poll end when at least one XDP_TX
+	 * frame was enqueued during the poll, so the posted descriptors are
+	 * signalled to hardware exactly once per poll.
+	 */
+	void (*xdp_tx_flush)(void *priv);
 };
 
 /*
- * On-die statistics block the chip DMAs on a tally dump (ndo_get_stats64). Only
- * the leading fields are consumed; the chip writes the full block, so the tail
- * pad MUST keep the struct >= the hardware dump size. Field offsets/order match
- * the RTL8125 counter block (vendor `struct rtl8125_counters`).
+ * On-die statistics block the chip DMAs on a tally dump. Field offsets/order
+ * match the RTL8125 counter block exactly (vendor `struct rtl8125_counters`):
+ * the whole block is replicated so ndo_get_stats64 (leading fields) and the
+ * ethtool standard-stats ops (get_eth_mac_stats / get_eth_ctrl_stats /
+ * get_pause_stats — extended fields) all read the right offsets. The chip
+ * writes the full block, so the struct must mirror it field-for-field.
  */
 struct r8125_tally {
-	__le64 tx_packets;	/* 0x00 */
-	__le64 rx_packets;	/* 0x08 */
-	__le64 tx_errors;	/* 0x10 */
-	__le32 rx_errors;	/* 0x18 */
-	__le16 rx_missed;	/* 0x1c — RX FIFO-overflow misses */
-	__le16 align_errors;	/* 0x1e */
-	u8 _rest[224];		/* pad to 256B >= full hardware dump */
+	/* legacy */
+	__le64 tx_packets;
+	__le64 rx_packets;
+	__le64 tx_errors;
+	__le32 rx_errors;
+	__le16 rx_missed;	/* RX FIFO-overflow misses */
+	__le16 align_errors;
+	__le32 tx_one_collision;
+	__le32 tx_multi_collision;
+	__le64 rx_unicast;
+	__le64 rx_broadcast;
+	__le32 rx_multicast;
+	__le16 tx_aborted;
+	__le16 tx_underrun;
+	/* extended (RTL8125) */
+	__le64 tx_octets;
+	__le64 rx_octets;
+	__le64 rx_multicast64;
+	__le64 tx_unicast64;
+	__le64 tx_broadcast64;
+	__le64 tx_multicast64;
+	__le32 tx_pause_on;
+	__le32 tx_pause_off;
+	__le32 tx_pause_all;
+	__le32 tx_deferred;
+	__le32 tx_late_collision;
+	__le32 tx_all_collision;
+	__le32 tx_aborted32;
+	__le32 align_errors32;
+	__le32 rx_frame_too_long;
+	__le32 rx_runt;
+	__le32 rx_pause_on;
+	__le32 rx_pause_off;
+	__le32 rx_pause_all;
+	__le32 rx_unknown_opcode;
+	__le32 rx_mac_error;
+	__le32 tx_underrun32;
+	__le32 rx_mac_missed;
+	__le32 rx_tcam_dropped;
+	__le32 tdu;
+	__le32 rdu;
 };
 
 /*
@@ -666,5 +758,18 @@ int r8125_bridge_phy_kick_state_machine(struct net_device *ndev);
  * safe to call when phy_start was never reached.
  */
 void r8125_bridge_phy_stop(struct net_device *ndev);
+
+/* PHY errata register-access glue (phylib paged/MMD accessors) — driven by the
+ * Rust hw_phy_config table in src/phy_config.rs.
+ */
+void r8125_bridge_phy_modify_paged(struct net_device *ndev, u16 page, u16 reg,
+				   u16 mask, u16 set);
+void r8125_bridge_phy_write_paged(struct net_device *ndev, u16 page, u16 reg,
+				  u16 val);
+void r8125_bridge_phy_write_mmd(struct net_device *ndev, u16 devad, u16 reg,
+				u16 val);
+void r8125_bridge_phy_modify_mmd(struct net_device *ndev, u16 devad, u16 reg,
+				 u16 mask, u16 set);
+void r8125_bridge_set_fw_version(struct net_device *ndev, const char *ver);
 
 #endif /* _R8125_NETDEV_BRIDGE_H */

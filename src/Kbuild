@@ -16,4 +16,5 @@ obj-m += r8125_rust.o
 # from the final link. Same trick samples/rust/rust_print uses.
 r8125_rust-y := r8125_rust_main.o netdev_bridge.o netdev_bridge_phy.o \
                 netdev_bridge_offload.o netdev_bridge_ethtool.o \
-                netdev_bridge_counters.o netdev_bridge_rx_pool.o
+                netdev_bridge_counters.o netdev_bridge_rx_pool.o \
+                netdev_bridge_xdp.o

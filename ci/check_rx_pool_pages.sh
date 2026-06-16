@@ -110,4 +110,16 @@ else
 	red "ndo_open has a post-RX-allocation failure path that does not release the pool"
 fi
 
+# 8. page_pool allocator stats surfaced via the standard ethtool -S helpers,
+#    summed across the active queues' pools — not a private debugfs/procfs API.
+ETH="$ROOT/src/netdev_bridge_ethtool.c"
+if grep -qE 'page_pool_ethtool_stats_get_count' "$ETH" &&
+   grep -qE 'page_pool_ethtool_stats_get_strings' "$ETH" &&
+   grep -qE 'page_pool_get_stats\(b->rxq\[i\]\.page_pool' "$ETH" &&
+   grep -qE 'page_pool_ethtool_stats_get\(&data' "$ETH"; then
+	grn "page_pool allocator stats exposed via standard ethtool -S helpers"
+else
+	red "page_pool stats must use page_pool_ethtool_stats_* helpers summed across active pools"
+fi
+
 exit $rc

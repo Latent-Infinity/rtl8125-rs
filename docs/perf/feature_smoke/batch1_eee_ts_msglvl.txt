@@ -1,0 +1,18 @@
+driver=r8125_rust carrier=1
+=== EEE ===
+EEE settings for enp3s0:
+	EEE status: enabled - inactive
+	Tx LPI: disabled
+	Supported EEE link modes:  100baseT/Full
+	                           1000baseT/Full
+=== time-stamping ===
+Time stamping parameters for enp3s0:
+Capabilities:
+	software-transmit
+	software-receive
+=== msglvl (default) ===
+        Current message level: 0x00000037 (55)
+  set msglvl 0x4 rc=0
+msglvl now:         Current message level: 0x00000004 (4)
+splats=0
+B1T2_DONE

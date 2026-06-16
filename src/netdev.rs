@@ -289,6 +289,36 @@ impl IrqMode {
 /// `desc` / `dma` are set at probe and read-only afterwards; the
 /// shadow arrays and indices are mutated atomically. See the docs on
 /// `NetdevState` for the cache-padding rationale.
+/// How a TX slot's `shadow` pointer must be released when hardware completes it.
+///
+/// Stored per slot as a `u8` (kernel-Rust has no atomic enum). The `shadow`
+/// `AtomicPtr` carries an `sk_buff*` for `Skb` and an `xdp_frame*` for `Xdp`;
+/// the tag is the only thing that distinguishes them at reap time. `Skb` is the
+/// zero default so a freshly-zeroed / reaper-reset slot is always the normal
+/// xmit disposition.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum TxSlotKind {
+    /// `shadow` is an `sk_buff*` from `ndo_start_xmit`; release via the skb path.
+    Skb = 0,
+    /// `shadow` is an `xdp_frame*` from an XDP_TX verdict; release via
+    /// `xdp_return_frame` (its mem model returns the page to the RX page_pool).
+    Xdp = 1,
+}
+
+impl TxSlotKind {
+    /// Round-trip the per-slot `u8` tag back to the enum. Any unexpected value
+    /// is treated as `Skb` (the safe default — the slot then takes the skb path,
+    /// and a null `shadow` makes that a no-op).
+    #[inline]
+    pub(crate) fn from_u8(v: u8) -> Self {
+        match v {
+            1 => TxSlotKind::Xdp,
+            _ => TxSlotKind::Skb,
+        }
+    }
+}
+
 pub(crate) struct TxRingState {
     /// DMA + CPU pointers for the TX descriptor ring (N + 1 slots; slot N
     /// is the tail canary).
@@ -311,6 +341,17 @@ pub(crate) struct TxRingState {
     pub(crate) shadow_len: [AtomicU32; RING_LEN],
     pub(crate) shadow_is_frag: [AtomicBool; RING_LEN],
     pub(crate) shadow_budget_len: [AtomicU32; RING_LEN],
+
+    /// Per-slot disposition tag (`TxSlotKind as u8`). Tells the NAPI reaper how
+    /// to release the slot's buffer at completion: an skb (the normal xmit path,
+    /// `napi_consume_skb`) vs an `xdp_frame` from an XDP_TX verdict
+    /// (`xdp_return_frame`, which routes the page back to its origin page_pool
+    /// via the frame's captured mem model). Written by the matching producer
+    /// (`ndo_start_xmit` leaves the default `Skb`; `xdp_xmit_one` sets `Xdp`),
+    /// reset to `Skb` by the reaper after disposition so a reused slot can't be
+    /// misread. Both producers run under the txq lock; the reaper is the sole
+    /// reader/resetter, so plain Acquire/Release ordering suffices.
+    pub(crate) shadow_kind: [AtomicU8; RING_LEN],
 
     /// Producer index (advanced by `ndo_start_xmit`). Cache-padded per
     /// RUST_STANDARDS.md §15.2 — written by xmit, read by NAPI poll.
@@ -362,6 +403,9 @@ impl TxRingState {
             shadow_budget_len <- pin_init::init_array_from_fn(
                 |_| AtomicU32::new(0)
             ),
+            shadow_kind <- pin_init::init_array_from_fn(
+                |_| AtomicU8::new(TxSlotKind::Skb as u8)
+            ),
             head: CachePadded::new(AtomicUsize::new(0)),
             tail: CachePadded::new(AtomicUsize::new(0)),
             inflight_bytes: CachePadded::new(AtomicUsize::new(0)),
@@ -375,6 +419,7 @@ impl TxRingState {
         self.shadow_len[slot].store(0, Ordering::Release);
         self.shadow_is_frag[slot].store(false, Ordering::Release);
         self.shadow_budget_len[slot].store(0, Ordering::Release);
+        self.shadow_kind[slot].store(TxSlotKind::Skb as u8, Ordering::Release);
         self.shadow[slot].store(core::ptr::null_mut(), Ordering::Release);
     }
 }
@@ -810,6 +855,42 @@ extern "C" fn rust_tally_dump(cookie: *mut c_void, dma_addr: u64) -> c_int {
     }
 }
 
+/// Reset the on-die tally counters (once at open). Returns 0 on success, -1 on
+/// timeout. The C bridge owns the coherent buffer + supplies its DMA address.
+extern "C" fn rust_tally_reset(cookie: *mut c_void, dma_addr: u64) -> c_int {
+    let state = state_from(cookie);
+    if state.regs().reset_tally(dma_addr) {
+        0
+    } else {
+        -1
+    }
+}
+
+/// `ethtool get_wol` — active `WAKE_*` mask read back from the chip Config3/5.
+extern "C" fn rust_get_wol(cookie: *mut c_void) -> u32 {
+    state_from(cookie).regs().wol_opts()
+}
+
+/// `ethtool set_wol` — program the chip WoL arm state (the C side has already
+/// rejected unsupported `WAKE_*` bits).
+extern "C" fn rust_set_wol(cookie: *mut c_void, wolopts: u32) {
+    state_from(cookie).regs().set_wol(wolopts);
+}
+
+/// `ethtool -d` — read one 32-bit MMIO register by byte offset.
+extern "C" fn rust_read_reg(cookie: *mut c_void, offset: u32) -> u32 {
+    state_from(cookie).regs().read_dword(offset as usize)
+}
+
+/// Reprogram the chip RX unicast filter from the live `net_device` address.
+/// Reuses the same RAR write the open path uses, so a running interface tracks
+/// an `ip link set address` change immediately instead of at the next open.
+extern "C" fn rust_set_mac_filter(cookie: *mut c_void) {
+    let state = state_from(cookie);
+    let ndev = state.ndev.load(Ordering::Acquire);
+    state.regs().set_mac_address(&ub::bridge_dev_addr(ndev));
+}
+
 pub(crate) const M4_FULL_OPS: BridgeOps = BridgeOps {
     open: rust_open,
     stop: rust_stop,
@@ -821,6 +902,13 @@ pub(crate) const M4_FULL_OPS: BridgeOps = BridgeOps {
     set_channels: rust_set_channels,
     set_rx_mode: rust_set_rx_mode,
     tally_dump: rust_tally_dump,
+    tally_reset: rust_tally_reset,
+    get_wol: rust_get_wol,
+    set_wol: rust_set_wol,
+    read_reg: rust_read_reg,
+    set_mac_filter: rust_set_mac_filter,
+    xdp_xmit_one: rust_xdp_xmit_one,
+    xdp_tx_flush: rust_xdp_tx_flush,
 };
 
 // Skeleton vtable retained as a load-test fallback. Flip `ACTIVE_OPS`
@@ -879,6 +967,34 @@ extern "C" fn skel_tally_dump(_cookie: *mut c_void, _dma_addr: u64) -> c_int {
 }
 
 #[allow(dead_code)]
+extern "C" fn skel_get_wol(_cookie: *mut c_void) -> u32 {
+    0
+}
+#[allow(dead_code)]
+extern "C" fn skel_set_wol(_cookie: *mut c_void, _wolopts: u32) {}
+
+#[allow(dead_code)]
+extern "C" fn skel_read_reg(_cookie: *mut c_void, _offset: u32) -> u32 {
+    0
+}
+
+#[allow(dead_code)]
+extern "C" fn skel_set_mac_filter(_cookie: *mut c_void) {}
+
+#[allow(dead_code)]
+extern "C" fn skel_xdp_xmit_one(
+    _cookie: *mut c_void,
+    _frame_dma: u64,
+    _frame_len: u32,
+    _frame: *mut c_void,
+) -> c_int {
+    -(bindings::ENOSPC as c_int)
+}
+
+#[allow(dead_code)]
+extern "C" fn skel_xdp_tx_flush(_cookie: *mut c_void) {}
+
+#[allow(dead_code)]
 pub(crate) const M4_SKELETON_OPS: BridgeOps = BridgeOps {
     open: skel_open,
     stop: skel_stop,
@@ -890,6 +1006,13 @@ pub(crate) const M4_SKELETON_OPS: BridgeOps = BridgeOps {
     set_channels: skel_set_channels,
     set_rx_mode: skel_set_rx_mode,
     tally_dump: skel_tally_dump,
+    tally_reset: skel_tally_dump,
+    get_wol: skel_get_wol,
+    set_wol: skel_set_wol,
+    read_reg: skel_read_reg,
+    set_mac_filter: skel_set_mac_filter,
+    xdp_xmit_one: skel_xdp_xmit_one,
+    xdp_tx_flush: skel_xdp_tx_flush,
 };
 
 /// Active vtable. `M4_FULL_OPS` is the production path; `M4_SKELETON_OPS`
@@ -1495,6 +1618,138 @@ impl<'a> Drop for IrqGuard<'a> {
     }
 }
 
+/// Apply the RTL8125B PHY errata sequence (mainline `rtl8125b_hw_phy_config`)
+/// through the phylib paged/MMD accessors. The sequence + register values are
+/// the host-tested table in [`crate::phy_config`]; this only walks it and routes
+/// each primitive to the matching boundary wrapper. Best-effort (individual
+/// write errors are non-fatal, matching r8169). Run once during open, after PHY
+/// connect/reset and before the link state machine starts.
+fn apply_phy_hw_config(ndev: *mut bindings::net_device) {
+    use crate::phy_config::{expand, PhyPrimitive, HW_PHY_CONFIG};
+
+    for op in HW_PHY_CONFIG {
+        expand(op, |p| match p {
+            PhyPrimitive::ModifyPaged {
+                page,
+                reg,
+                mask,
+                set,
+            } => ub::phy_modify_paged(ndev, page, reg, mask, set),
+            PhyPrimitive::WritePaged { page, reg, val } => {
+                ub::phy_write_paged(ndev, page, reg, val)
+            }
+            PhyPrimitive::WriteMmd { devad, reg, val } => ub::phy_write_mmd(ndev, devad, reg, val),
+            PhyPrimitive::ModifyMmd {
+                devad,
+                reg,
+                mask,
+                set,
+            } => ub::phy_modify_mmd(ndev, devad, reg, mask, set),
+        });
+    }
+}
+
+/// Sink that applies the PHY MCU firmware opcode stream to real hardware. The
+/// firmware switches between PHY MDIO and MAC-OCP "MCU" register space; both
+/// share the page base (`state.phy.ocp_base`, like r8169's `tp->ocp_base`).
+/// PHY access uses the `r8168g_mdio_write` semantics our `phy` module already
+/// implements (incl. the 0x1f page register); MAC-OCP uses `mac_ocp_write` with
+/// the page base + raw offset. All accesses are safe (`mmio` typed Bar).
+struct PhyFwSink<'a> {
+    state: &'a NetdevState,
+}
+
+impl crate::phy_fw::FwSink for PhyFwSink<'_> {
+    fn write(&mut self, target: crate::phy_fw::FwTarget, reg: u16, val: u16) {
+        match target {
+            crate::phy_fw::FwTarget::Phy => {
+                if reg == 0x1f {
+                    crate::phy::page_select_write(self.state, val);
+                } else {
+                    let _ = crate::phy::mdio_write(self.state, reg as u8, val);
+                }
+            }
+            crate::phy_fw::FwTarget::MacMcu => {
+                if reg == 0x1f {
+                    self.state
+                        .phy
+                        .ocp_base
+                        .store(u32::from(val) << 4, Ordering::Release);
+                } else {
+                    let base = self.state.phy.ocp_base.load(Ordering::Acquire);
+                    self.state.regs().mac_ocp_write(base + u32::from(reg), val);
+                }
+            }
+        }
+    }
+
+    fn read(&mut self, target: crate::phy_fw::FwTarget, reg: u16) -> u16 {
+        match target {
+            crate::phy_fw::FwTarget::Phy => {
+                if reg == 0x1f {
+                    crate::phy::page_select_read(self.state)
+                } else {
+                    crate::phy::mdio_read(self.state, reg as u8).unwrap_or(0xffff)
+                }
+            }
+            crate::phy_fw::FwTarget::MacMcu => {
+                let base = self.state.phy.ocp_base.load(Ordering::Acquire);
+                self.state.regs().mac_ocp_read(base + u32::from(reg))
+            }
+        }
+    }
+
+    fn delay_ms(&mut self, ms: u16) {
+        kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(ms)));
+    }
+}
+
+/// Apply the RTL8125B PHY MCU firmware (`rtl_nic/rtl8125b-2.fw`) — the patch
+/// mainline runs first inside `rtl8125b_hw_phy_config`, that the stock phylib
+/// driver does not. The firmware is optional: if absent or invalid the driver
+/// continues with the errata table only (the same fallback r8169 takes). Run
+/// once during open, before [`apply_phy_hw_config`]. Fully validated
+/// (`phy_fw::parse`) before any register is touched.
+fn apply_phy_firmware(state: &NetdevState) {
+    use kernel::firmware::Firmware;
+
+    let fw = match Firmware::request_nowarn(c"rtl_nic/rtl8125b-2.fw", state.pdev.as_ref()) {
+        Ok(f) => f,
+        Err(_) => {
+            pr_info!("r8125_rust: PHY firmware not present; applying errata only\n");
+            return;
+        }
+    };
+    let parsed = match crate::phy_fw::parse(fw.data()) {
+        Ok(p) => p,
+        Err(e) => {
+            pr_warn!(
+                "r8125_rust: PHY firmware rejected ({:?}); applying errata only\n",
+                e
+            );
+            return;
+        }
+    };
+
+    let mut sink = PhyFwSink { state };
+    crate::phy_fw::run(&parsed, &mut sink);
+
+    // r8169 note: at least one firmware doesn't restore the page base, and the
+    // firmware may have triggered a PHY soft reset. Force the base back to the
+    // standard page and wait for BMCR.RESET to clear (~600 ms cap).
+    crate::phy::page_select_write(state, 0);
+    let ndev = state.ndev.load(Ordering::Acquire);
+    for _ in 0..12 {
+        match crate::phy::mdio_read(state, 0x00) {
+            Ok(v) if v & 0x8000 == 0 => break,
+            _ => kernel::time::delay::fsleep(kernel::time::Delta::from_millis(50)),
+        }
+    }
+    // Expose the firmware version via `ethtool -i` (proof it loaded).
+    ub::set_fw_version(ndev, parsed.version());
+    pr_info!("r8125_rust: PHY firmware applied ({} ops)\n", parsed.size());
+}
+
 // ── ndo_open ──────────────────────────────────────────────────────────────
 
 fn ndo_open(state: &NetdevState, feature_flags: u32) -> Result<()> {
@@ -1537,6 +1792,14 @@ fn ndo_open(state: &NetdevState, feature_flags: u32) -> Result<()> {
     // before `rtl_reset_work → rtl_hw_start`).
     let ndev = state.ndev.load(Ordering::Acquire);
     ub::bridge_phy_connect_and_reset(ndev)?;
+
+    // Apply the RTL8125B PHY config (mainline rtl8125b_hw_phy_config) that the
+    // stock phylib driver does not — after PHY reset, before the link state
+    // machine starts. Mirrors r8169 running rtl8169_init_phy before rtl_hw_start.
+    // Firmware MCU patch first, then the errata register table (same order as
+    // rtl8125b_hw_phy_config).
+    apply_phy_firmware(state);
+    apply_phy_hw_config(ndev);
 
     setup_interrupt_config(&regs);
 
@@ -2129,6 +2392,84 @@ fn ndo_start_xmit(state: &NetdevState, skb: crate::skb::DriverOwnedSkb) -> c_int
     }
 
     NETDEV_TX_OK
+}
+
+// ── XDP_TX producer ────────────────────────────────────────────────────────
+
+/// Enqueue one XDP_TX frame on the TX ring. Called from the C XDP verdict path
+/// (`netdev_bridge_xdp.c`) when a program returns `XDP_TX`, **while it holds the
+/// txq lock** — that lock is the only thing serialising this NAPI-context
+/// producer against the process-context `ndo_start_xmit`, since both advance
+/// `tx.head` and write head-region descriptors. The reaper (tail) stays lockless
+/// against both via the OWN bit.
+///
+/// `frame_dma` / `frame_len` describe the `DMA_TO_DEVICE` mapping the C side made
+/// over the frame's data; `frame` is the `xdp_frame*` the reaper returns with
+/// `xdp_return_frame` at completion. Returns 0 on enqueue, or `-ENOSPC` when the
+/// ring is full (the caller then unmaps and returns the frame — the packet is
+/// dropped). No doorbell is rung here; `xdp_tx_flush` does that once per poll.
+fn xdp_tx_enqueue(
+    state: &NetdevState,
+    frame_dma: u64,
+    frame_len: u32,
+    frame: *mut c_void,
+) -> c_int {
+    let head = state.tx.head.inner.load(Ordering::Relaxed);
+    let tail = state.tx.tail.inner.load(Ordering::Acquire);
+    // One descriptor, keeping a slot of headroom — same `>=` discipline as the
+    // skb path's `try_reserve_ring_space`, but without its `tx_busy_exception`
+    // counter: an XDP_TX drop is not part of the skb disposition invariant.
+    if head.wrapping_sub(tail) + 1 >= RING_LEN {
+        return -(bindings::ENOSPC as c_int);
+    }
+    let slot = head % RING_LEN;
+    let mut opts1 =
+        regs::DESC_OWN | regs::DESC_TX_FS | regs::DESC_TX_LS | (frame_len & regs::DESC_LEN_MASK);
+    if slot == RING_LEN - 1 {
+        opts1 |= regs::DESC_EOR;
+    }
+    // Shadow first (Release), then publish OWN — mirrors `ndo_start_xmit` so the
+    // reaper sees a fully-populated slot once hardware clears OWN.
+    state.tx.shadow_dma[slot].store(frame_dma, Ordering::Release);
+    state.tx.shadow_len[slot].store(frame_len, Ordering::Release);
+    state.tx.shadow_is_frag[slot].store(false, Ordering::Release);
+    state.tx.shadow_budget_len[slot].store(0, Ordering::Release);
+    state.tx.shadow_kind[slot].store(TxSlotKind::Xdp as u8, Ordering::Release);
+    state.tx.shadow[slot].store(frame.cast(), Ordering::Release);
+    ub::desc_publish_own(
+        state.tx.desc.cast::<u8>(),
+        slot,
+        Descriptor {
+            opts1,
+            opts2: 0,
+            addr: frame_dma,
+        },
+        crate::ring::RxDescFormat::Legacy,
+    );
+    state
+        .tx
+        .head
+        .inner
+        .store(head.wrapping_add(1), Ordering::Release);
+    0
+}
+
+extern "C" fn rust_xdp_xmit_one(
+    cookie: *mut c_void,
+    frame_dma: u64,
+    frame_len: u32,
+    frame: *mut c_void,
+) -> c_int {
+    let state = state_from(cookie);
+    xdp_tx_enqueue(state, frame_dma, frame_len, frame)
+}
+
+/// Ring the TX doorbell once at NAPI-poll end if any XDP_TX frame was enqueued
+/// this poll. Called from `r8125_bridge_xdp_finalize`; the per-queue pending
+/// flag (C side) gates it so a poll with no XDP_TX does no MMIO.
+extern "C" fn rust_xdp_tx_flush(cookie: *mut c_void) {
+    let state = state_from(cookie);
+    state.regs().tx_poll();
 }
 
 // ── Raw IRQ handler ───────────────────────────────────────────────────────

@@ -1,0 +1,2 @@
+hwmon: r8125_rust_0_300:00 temp1_input=49000(=49C) temp1_max=120000
+REALTEK_PHY_HWMON=y (phylib provides it through our mdio bus)

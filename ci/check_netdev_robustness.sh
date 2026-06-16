@@ -62,4 +62,33 @@ else
 	red "ndo_get_stats64 must call dev_get_tstats64 and fold rx/tx_dropped_error"
 fi
 
+# 4. ndo_set_mac_address must reprogram the chip RX filter on a live change, not
+#    be the bare eth_mac_addr (which only updates dev_addr -> hardware filters on
+#    the stale MAC until the next open).
+setmac_body=$(awk '/static int bridge_ndo_set_mac_address\(/,/^}/' "$C")
+if grep -qE '\.ndo_set_mac_address\s*=\s*bridge_ndo_set_mac_address' "$C" &&
+	! grep -qE '\.ndo_set_mac_address\s*=\s*eth_mac_addr' "$C" &&
+	grep -qE 'eth_mac_addr\(ndev, p\)' <<<"$setmac_body" &&
+	grep -qE 'netif_running\(ndev\)' <<<"$setmac_body" &&
+	grep -qE 'set_mac_filter\(b->priv\)' <<<"$setmac_body" &&
+	grep -qE 'IFF_LIVE_ADDR_CHANGE' "$C"; then
+	grn "ndo_set_mac_address reprograms the RX filter live (RAR) + IFF_LIVE_ADDR_CHANGE"
+else
+	red "ndo_set_mac_address must validate + reprogram the RAR while running (set_mac_filter) and set IFF_LIVE_ADDR_CHANGE, not bare eth_mac_addr"
+fi
+
+# 5. Per-queue netdev-genl stats (netdev_stat_ops). The per-queue counters MUST
+#    be incremented next to the device dev_sw_netstats totals so the base +
+#    per-queue sum stays consistent with ndo_get_stats64.
+RXP="$ROOT/src/netdev_bridge_rx_pool.c"
+OFF="$ROOT/src/netdev_bridge_offload.c"
+if grep -qE '\.stat_ops\s*=\s*&bridge_stat_ops|ndev->stat_ops\s*=\s*&bridge_stat_ops' "$C" &&
+	grep -qE 'get_queue_stats_rx|get_queue_stats_tx|get_base_stats' "$C" &&
+	grep -qE 'q->rx_packets\+\+' "$RXP" && grep -qE 'dev_sw_netstats_rx_add' "$RXP" &&
+	grep -qE 'b->tx_packets\+\+' "$OFF" && grep -qE 'dev_sw_netstats_tx_add' "$OFF"; then
+	grn "netdev_stat_ops wired; per-queue counters kept next to the device totals"
+else
+	red "netdev_stat_ops must be wired and per-queue rx/tx counters incremented alongside dev_sw_netstats_{rx,tx}_add"
+fi
+
 exit "$rc"

@@ -1,0 +1,9 @@
+BUILD_RC=0
+orig MAC=38:05:25:36:a6:1d
+baseline ping: 0% packet loss
+=== change MAC while UP ===
+ set rc=0
+new MAC=02:de:ad:be:ef:42
+ping after live MAC change: 0% packet loss
+splats=0
+W12_DONE

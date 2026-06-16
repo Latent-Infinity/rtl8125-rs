@@ -234,6 +234,94 @@ pub(crate) const fn rx_mode_rcr(current: u32, accept: u32) -> u32 {
     (current & !RX_ACCEPT_MASK) | (accept & RX_ACCEPT_MASK)
 }
 
+/// Pack a 6-byte MAC into the chip's two RX-filter registers (IDR0 low dword =
+/// bytes 0..3 little-endian, IDR4 high dword = bytes 4..5). Pure + host-tested so
+/// the unicast-filter programming (`mmio::set_mac_address`, run at open and on a
+/// live `ndo_set_mac_address`) can't transpose bytes.
+#[inline]
+pub(crate) const fn mac_rar_words(addr: &[u8; 6]) -> (u32, u32) {
+    let low = (addr[0] as u32)
+        | ((addr[1] as u32) << 8)
+        | ((addr[2] as u32) << 16)
+        | ((addr[3] as u32) << 24);
+    let high = (addr[4] as u32) | ((addr[5] as u32) << 8);
+    (low, high)
+}
+
+// -- Wake-on-LAN (magic packet + unicast/broadcast/multicast wake frames) ----
+// `ethtool` WAKE_* flags (linux/ethtool.h); kept local so this module stays
+// kernel-free for `rustc --test`. We support the magic packet + the three
+// wake-frame classes; WAKE_PHY (link-change) is not wired (Config3.LinkUp is
+// reserved on RTL8125B).
+pub(crate) const WAKE_UCAST: u32 = 1 << 1;
+pub(crate) const WAKE_MCAST: u32 = 1 << 2;
+pub(crate) const WAKE_BCAST: u32 = 1 << 3;
+pub(crate) const WAKE_MAGIC: u32 = 1 << 5;
+/// Everything `set_wol` accepts; any bit outside this is rejected (-EINVAL).
+pub(crate) const WAKE_SUPPORTED: u32 = WAKE_UCAST | WAKE_MCAST | WAKE_BCAST | WAKE_MAGIC;
+
+// Config3 / Config5 bit copies (mirror `regs::CONFIG3_MAGIC` etc.; `mmio.rs`
+// pins them together with compile-time asserts so they cannot drift).
+pub(crate) const CONFIG3_MAGIC: u8 = 1 << 5;
+pub(crate) const CONFIG5_LANWAKE: u8 = 1 << 1;
+pub(crate) const CONFIG5_UWF: u8 = 1 << 4;
+pub(crate) const CONFIG5_MWF: u8 = 1 << 5;
+pub(crate) const CONFIG5_BWF: u8 = 1 << 6;
+
+/// New Config3 byte for a WoL request: set/clear exactly the `MagicPacket` bit,
+/// preserving every other Config3 bit. Pure + host-tested.
+#[inline]
+pub(crate) const fn wol_config3(current: u8, wolopts: u32) -> u8 {
+    if wolopts & WAKE_MAGIC != 0 {
+        current | CONFIG3_MAGIC
+    } else {
+        current & !CONFIG3_MAGIC
+    }
+}
+
+/// New Config5 byte for a WoL request: set the wake-frame enables matching the
+/// requested `WAKE_*` classes (and LanWake as the master when any is set),
+/// clearing the rest, preserving unrelated Config5 bits (e.g. ASPM_en). Pure +
+/// host-tested. Mirrors the vendor `rtl8125_set_hw_wol` Config5 loop.
+#[inline]
+pub(crate) const fn wol_config5(current: u8, wolopts: u32) -> u8 {
+    let wake_frames = CONFIG5_UWF | CONFIG5_MWF | CONFIG5_BWF | CONFIG5_LANWAKE;
+    let mut set = 0u8;
+    if wolopts & WAKE_UCAST != 0 {
+        set |= CONFIG5_UWF;
+    }
+    if wolopts & WAKE_MCAST != 0 {
+        set |= CONFIG5_MWF;
+    }
+    if wolopts & WAKE_BCAST != 0 {
+        set |= CONFIG5_BWF;
+    }
+    if wolopts & (WAKE_UCAST | WAKE_MCAST | WAKE_BCAST | WAKE_MAGIC) != 0 {
+        set |= CONFIG5_LANWAKE;
+    }
+    (current & !wake_frames) | set
+}
+
+/// The active `WAKE_*` mask implied by the live Config3/Config5 bytes — used by
+/// `get_wol` to report back exactly what the chip is armed for.
+#[inline]
+pub(crate) const fn wol_from_config(cfg3: u8, cfg5: u8) -> u32 {
+    let mut w = 0u32;
+    if cfg3 & CONFIG3_MAGIC != 0 {
+        w |= WAKE_MAGIC;
+    }
+    if cfg5 & CONFIG5_UWF != 0 {
+        w |= WAKE_UCAST;
+    }
+    if cfg5 & CONFIG5_MWF != 0 {
+        w |= WAKE_MCAST;
+    }
+    if cfg5 & CONFIG5_BWF != 0 {
+        w |= WAKE_BCAST;
+    }
+    w
+}
+
 /// Convert the two natural-order multicast hash words into the MAR0/MAR4 the
 /// RTL8125 expects: each word byte-swapped AND the two words swapped
 /// (`MAR0 = swab32(mc1)`, `MAR4 = swab32(mc0)`), matching the vendor
@@ -723,11 +811,81 @@ mod tests {
     }
 
     #[test]
+    fn mac_rar_words_little_endian_split() {
+        let (low, high) = mac_rar_words(&[0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
+        assert_eq!(low, 0x12005452); // bytes 0..3 LE
+        assert_eq!(high, 0x00005634); // bytes 4..5 LE, top 16 bits zero
+    }
+
+    #[test]
+    fn mac_rar_words_all_set_and_zero() {
+        assert_eq!(mac_rar_words(&[0; 6]), (0, 0));
+        assert_eq!(mac_rar_words(&[0xff; 6]), (0xffff_ffff, 0x0000_ffff));
+    }
+
+    #[test]
     fn mar_words_swabs_and_swaps() {
         // MAR0 = swab32(mc1), MAR4 = swab32(mc0).
         let (m0, m4) = mar_words(0x11223344, 0xaabbccdd);
         assert_eq!(m0, 0xddccbbaa); // swab32(0xaabbccdd)
         assert_eq!(m4, 0x44332211); // swab32(0x11223344)
+    }
+
+    // -- WoL ----------------------------------------------------------------
+
+    const RDY_L23: u8 = 0x02; // regs::CONFIG3_RDY_TO_L23
+    const ASPM_EN: u8 = 0x01; // regs::CONFIG5_ASPM_EN
+
+    #[test]
+    fn wol_config3_magic_sets_only_magic_bit() {
+        let cur = RDY_L23 | (1 << 7);
+        let on = wol_config3(cur, WAKE_MAGIC);
+        assert_eq!(on & CONFIG3_MAGIC, CONFIG3_MAGIC);
+        assert_eq!(on & !CONFIG3_MAGIC, cur); // rest preserved
+                                              // No magic requested -> bit cleared, rest preserved.
+        assert_eq!(wol_config3(on, WAKE_UCAST), cur);
+    }
+
+    #[test]
+    fn wol_config5_maps_wake_frames_and_preserves_aspm() {
+        // ucast + bcast + the LanWake master, ASPM_en untouched.
+        let got = wol_config5(ASPM_EN, WAKE_UCAST | WAKE_BCAST);
+        assert_eq!(got & ASPM_EN, ASPM_EN); // unrelated bit preserved
+        assert_eq!(got & CONFIG5_UWF, CONFIG5_UWF);
+        assert_eq!(got & CONFIG5_BWF, CONFIG5_BWF);
+        assert_eq!(got & CONFIG5_MWF, 0);
+        assert_eq!(got & CONFIG5_LANWAKE, CONFIG5_LANWAKE);
+    }
+
+    #[test]
+    fn wol_config5_magic_only_still_sets_lanwake_master() {
+        let got = wol_config5(0, WAKE_MAGIC);
+        assert_eq!(got & CONFIG5_LANWAKE, CONFIG5_LANWAKE);
+        assert_eq!(got & (CONFIG5_UWF | CONFIG5_MWF | CONFIG5_BWF), 0);
+    }
+
+    #[test]
+    fn wol_config5_off_clears_all_wake_frames() {
+        let cur = ASPM_EN | CONFIG5_UWF | CONFIG5_LANWAKE;
+        let got = wol_config5(cur, 0);
+        assert_eq!(got, ASPM_EN); // only ASPM_en survives
+    }
+
+    #[test]
+    fn wol_from_config_roundtrips() {
+        let opts = WAKE_MAGIC | WAKE_UCAST | WAKE_BCAST;
+        let cfg3 = wol_config3(RDY_L23, opts);
+        let cfg5 = wol_config5(ASPM_EN, opts);
+        assert_eq!(wol_from_config(cfg3, cfg5), opts);
+        assert_eq!(wol_from_config(wol_config3(0, 0), wol_config5(0, 0)), 0);
+    }
+
+    #[test]
+    fn wake_constants_match_ethtool_uapi() {
+        assert_eq!(WAKE_UCAST, 1 << 1);
+        assert_eq!(WAKE_MCAST, 1 << 2);
+        assert_eq!(WAKE_BCAST, 1 << 3);
+        assert_eq!(WAKE_MAGIC, 1 << 5);
     }
 
     #[test]

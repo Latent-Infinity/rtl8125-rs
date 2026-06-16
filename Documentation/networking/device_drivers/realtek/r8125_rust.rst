@@ -113,19 +113,37 @@ Supported on RX:
   - VLAN strip (when chip-side VLAN ingress is configured by
     upstream userspace)
 
+XDP
+===
+
+``xdp_features`` advertises ``NETDEV_XDP_ACT_BASIC |
+NETDEV_XDP_ACT_REDIRECT``:
+
+  - ``XDP_PASS`` / ``XDP_DROP`` / ``XDP_ABORTED`` on the RX read path.
+  - ``XDP_TX`` reflects the frame out the same port: the buffer is
+    converted to an ``xdp_frame``, DMA-mapped, and enqueued on the TX
+    ring under the txq lock; the frame's page returns to its origin
+    page_pool at TX completion via ``xdp_return_frame``.
+  - ``XDP_REDIRECT`` via ``xdp_do_redirect`` with one ``xdp_do_flush``
+    per NAPI poll.
+  - Copy-mode AF_XDP works (a consequence of advertising
+    ``BASIC | REDIRECT``).
+
+Not yet implemented: ``ndo_xdp_xmit`` (the redirect-target side,
+``NETDEV_XDP_ACT_NDO_XMIT``), RX multi-buffer XDP for jumbo frames, and
+AF_XDP zero-copy. Their ``xdp_features`` bits stay clear so the
+advertised set is exactly what works.
+
 Limitations
 ===========
 
-  - **No suspend / resume yet.** The driver does not register
-    ``struct pci_driver::driver::pm`` ops; system suspend across the
-    NIC is untested. Suspend/resume support is planned for a follow-up
-    series.
-  - **Single RX / single TX queue.** Multi-queue is documented as
-    not-yet (the design notes cover the additional surface area required
-    in the cshim).
-  - **No XDP.** The cshim does not export ``XDP_REDIRECT``-shaped
-    helpers; an XDP RX path requires either an upstream safe-Rust
-    XDP abstraction or a substantially larger cshim.
+  - **No** ``ndo_xdp_xmit`` **/ AF_XDP zero-copy yet.** The redirect
+    *source* side (``XDP_REDIRECT``) and copy-mode AF_XDP work; serving
+    as a redirect *target* (``ndo_xdp_xmit``) and zero-copy AF_XDP are
+    follow-up work (their ``xdp_features`` bits are not advertised).
+  - **System suspend / resume** is gated behind a kernel-Rust PCI PM
+    extension (built with ``make PCI_PM=1`` against a patched kernel);
+    the default in-tree build does not register ``pm`` ops.
 
 Performance
 ===========
