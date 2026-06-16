@@ -509,3 +509,22 @@ Net +1 `unsafe { ... }` block in `src/unsafe_boundary.rs`:
   C in netdev_bridge_xdp.c calling the Rust `xdp_xmit_one` op, which uses only the
   already-wrapped `desc_publish_own` accessor; the new `xdp_tx_enqueue` /
   `rust_xdp_xmit_one` / `rust_xdp_tx_flush` add no unsafe.)
+
+## 2026-06-16 — custom RSS key/table copy wrappers bump 85 → 89
+
+Net +4 `unsafe { ... }` blocks in `src/unsafe_boundary.rs`, all the same shape as
+the existing `rxfh_indir_valid`: view a kernel ethtool RSS buffer as a call-scoped
+slice (`core::slice::from_raw_parts[_mut]`) to copy the active RSS key /
+indirection table in or out of the Rust-owned `rss::RssPolicy`.
+
+- ADDED `read_rss_key(*const u8, &mut [u8; 40])` / `write_rss_key(*mut u8, &[u8; 40])`
+  — copy a `set_rxfh` / `get_rxfh` key buffer. SAFETY: the ethtool core allocated
+  `get_rxfh_key_size()` (= 40) bytes before invoking the op; the borrow is
+  call-scoped; no ownership/MMIO crosses.
+- ADDED `read_rss_indir(*const u32, &mut [u8; 128])` (saturating-narrow each entry
+  so an out-of-range value is rejected by the host-tested `RssPolicy::set_indir`,
+  not silently wrapped) / `write_rss_indir(*mut u32, &[u8; 128])`. SAFETY: the
+  ethtool core allocated `get_rxfh_indir_size()` (= 128) `u32` entries; borrows are
+  call-scoped. All RSS *policy* decisions (validation, default-collapse, reclamp)
+  are pure safe Rust in `src/rss.rs` (host-tested); these wrappers only move bytes
+  across the ethtool boundary.

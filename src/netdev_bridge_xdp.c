@@ -12,10 +12,11 @@
  * RX read-path actions: XDP_PASS / XDP_DROP / XDP_ABORTED / XDP_REDIRECT.
  * XDP_TX converts the buffer to an xdp_frame and enqueues it on the Rust-owned
  * TX ring (ops.xdp_xmit_one) under the txq lock; the reaper returns the frame
- * via xdp_return_frame at completion. xdp_features is advertised as
- * BASIC | REDIRECT in netdev_bridge.c once this path is in place.
+ * via xdp_return_frame at completion. ndo_xdp_xmit (the redirect-target side)
+ * batches the same producer path. xdp_features is advertised as
+ * BASIC | REDIRECT | NDO_XMIT in netdev_bridge.c.
  *
- * Hard cap: 240 LOC. Enforced by ci/check_cshim_loc_caps.sh.
+ * Hard cap: 280 LOC. Enforced by ci/check_cshim_loc_caps.sh.
  */
 #include "netdev_bridge_internal.h"
 
@@ -28,39 +29,95 @@
 #include <net/xdp.h>
 
 /*
- * XDP_TX one frame: convert the run buffer to an xdp_frame, DMA-map its data
- * TO_DEVICE, and enqueue on the Rust TX ring under the txq lock (the only thing
- * serialising this NAPI-context producer against ndo_start_xmit). On any failure
- * the frame/page is returned and the caller still refills the RX slot. Returns
- * true if the frame was enqueued (caller sets xdp_tx_pending for the doorbell).
+ * Map one linear xdp_frame's data TO_DEVICE and enqueue it on the Rust-owned TX
+ * ring. The caller MUST hold the txq lock (the only thing serialising these
+ * NAPI/redirect-context producers against ndo_start_xmit). Returns 0 on enqueue;
+ * on failure the frame is left un-consumed and fully unmapped; the caller
+ * returns it with xdp_return_frame.
+ * Shared by the XDP_TX verdict and ndo_xdp_xmit so there is one TX producer path.
+ */
+static int xdp_frame_xmit_locked(struct r8125_bridge *b, struct device *dev,
+				 struct xdp_frame *frame)
+{
+	dma_addr_t dma;
+
+	if (unlikely(xdp_frame_has_frags(frame)))
+		return -EOPNOTSUPP;
+	dma = dma_map_single(dev, frame->data, frame->len, DMA_TO_DEVICE);
+	if (unlikely(dma_mapping_error(dev, dma)))
+		return -ENOMEM;
+	if (b->ops.xdp_xmit_one(b->priv, dma, frame->len, frame)) {
+		dma_unmap_single(dev, dma, frame->len, DMA_TO_DEVICE);
+		return -ENOSPC;
+	}
+	return 0;
+}
+
+/*
+ * XDP_TX one frame: convert the run buffer to an xdp_frame and enqueue it. On
+ * any failure the frame/page is returned and the caller still refills the RX
+ * slot. Returns true if enqueued (caller sets xdp_tx_pending for the doorbell).
  */
 static bool r8125_bridge_xdp_tx_one(struct net_device *ndev,
 				    struct r8125_bridge *b, struct xdp_buff *xdp)
 {
 	struct device *dev = &b->pdev->dev;
-	struct xdp_frame *frame;
+	struct xdp_frame *frame = xdp_convert_buff_to_frame(xdp);
 	struct netdev_queue *txq;
-	dma_addr_t dma;
 	int rc;
 
-	frame = xdp_convert_buff_to_frame(xdp);
 	if (unlikely(!frame))
 		return false;
-	dma = dma_map_single(dev, frame->data, frame->len, DMA_TO_DEVICE);
-	if (unlikely(dma_mapping_error(dev, dma))) {
-		xdp_return_frame(frame);
-		return false;
-	}
 	txq = netdev_get_tx_queue(ndev, 0);
 	__netif_tx_lock(txq, raw_smp_processor_id());
-	rc = b->ops.xdp_xmit_one(b->priv, dma, frame->len, frame);
+	rc = xdp_frame_xmit_locked(b, dev, frame);
 	__netif_tx_unlock(txq);
 	if (rc) {
-		dma_unmap_single(dev, dma, frame->len, DMA_TO_DEVICE);
 		xdp_return_frame(frame);
 		return false;
 	}
 	return true;
+}
+
+/*
+ * ndo_xdp_xmit — redirect-target side: transmit a batch of xdp_frames another
+ * device (or this one) redirected to us. Same TX-ring producer + TxSlotKind::Xdp
+ * disposition as XDP_TX; the reaper returns each frame via xdp_return_frame using
+ * the frame's own mem model, so foreign frames route back to their origin pool.
+ * Returns the number of frames consumed; on a partial batch failure, this driver
+ * returns all unconsumed frames before returning the successful count (the core
+ * only frees all frames for negative, no-frame-consumed errors). One doorbell
+ * per batch on XDP_XMIT_FLUSH.
+ */
+int r8125_bridge_ndo_xdp_xmit(struct net_device *ndev, int n,
+			      struct xdp_frame **frames, u32 flags)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+	struct device *dev = &b->pdev->dev;
+	struct netdev_queue *txq;
+	int i, nxmit = 0;
+
+	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
+		return -EINVAL;
+	if (unlikely(!netif_carrier_ok(ndev)))
+		return -ENETDOWN;
+
+	txq = netdev_get_tx_queue(ndev, 0);
+	__netif_tx_lock(txq, raw_smp_processor_id());
+	for (i = 0; i < n; i++) {
+		if (xdp_frame_xmit_locked(b, dev, frames[i]))
+			break;	/* ring full / map fail: return frames[i..n) below */
+		nxmit++;
+	}
+	__netif_tx_unlock(txq);
+
+	while (i < n)
+		xdp_return_frame(frames[i++]);
+
+	if (nxmit && (flags & XDP_XMIT_FLUSH))
+		b->ops.xdp_tx_flush(b->priv);
+
+	return nxmit;
 }
 
 /* Reaper-side disposition for an XDP_TX frame (called from the Rust TX reaper

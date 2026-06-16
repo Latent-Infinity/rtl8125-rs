@@ -176,6 +176,20 @@ pub(crate) struct BridgeOps {
         len: c_uint,
         queue_count: c_uint,
     ) -> c_int,
+    /// ethtool `get_rxfh` — fill the caller's key (40 bytes) and/or indirection
+    /// table (128 `u32` entries) from the Rust-owned RSS policy. Either pointer
+    /// may be NULL. The chip RSS key is write-only, so this cache is the source
+    /// of truth for what `ethtool -x` reports.
+    pub rss_get: extern "C" fn(cookie: *mut c_void, key_out: *mut u8, indir_out: *mut u32),
+    /// ethtool `set_rxfh` — install a custom key and/or indirection table into the
+    /// Rust policy and reprogram the chip live. Either input may be NULL.
+    /// `queue_count` is the active RX-queue count. Returns 0 or `-EINVAL`.
+    pub rss_set: extern "C" fn(
+        cookie: *mut c_void,
+        key_in: *const u8,
+        indir_in: *const u32,
+        queue_count: c_uint,
+    ) -> c_int,
     /// ethtool `set_channels` — set the runtime active RX-queue count. The C
     /// bridge validates tx/combined and reconfigures (stop+open) to apply.
     /// Returns 0 (accepted) or `-EINVAL`.
@@ -1098,6 +1112,55 @@ pub(crate) fn rxfh_indir_valid(ptr: *const u32, len: usize, queue_count: u32) ->
     // SAFETY: see fn-level contract; slice is read-only and call-scoped.
     let indir = unsafe { core::slice::from_raw_parts(ptr, len) };
     crate::layout::rxfh_indir_all_valid(indir, queue_count)
+}
+
+/// Copy a kernel `set_rxfh` RSS key buffer (`RSS_KEY_SIZE` bytes) into `out`.
+///
+/// # SAFETY: `ptr` points to at least `RSS_KEY_SIZE` readable bytes (the ethtool
+/// core allocates `get_rxfh_key_size()` before invoking `set_rxfh`); the borrow
+/// is call-scoped.
+pub(crate) fn read_rss_key(ptr: *const u8, out: &mut [u8; crate::rss::RSS_KEY_SIZE]) {
+    // SAFETY: see fn-level contract; read-only, call-scoped.
+    let src = unsafe { core::slice::from_raw_parts(ptr, crate::rss::RSS_KEY_SIZE) };
+    out.copy_from_slice(src);
+}
+
+/// Copy the active RSS key into a kernel `get_rxfh` key buffer.
+///
+/// # SAFETY: `ptr` points to at least `RSS_KEY_SIZE` writable bytes (allocated by
+/// the ethtool core); the borrow is call-scoped.
+pub(crate) fn write_rss_key(ptr: *mut u8, key: &[u8; crate::rss::RSS_KEY_SIZE]) {
+    // SAFETY: see fn-level contract; write-only, call-scoped.
+    let dst = unsafe { core::slice::from_raw_parts_mut(ptr, crate::rss::RSS_KEY_SIZE) };
+    dst.copy_from_slice(key);
+}
+
+/// Read a kernel `set_rxfh` indirection table (`RSS_INDIR_ENTRIES` `u32` queue
+/// ids) into `out`, narrowing each entry to `u8` (saturating, so an out-of-range
+/// value stays out of range for the host-tested `RssPolicy::set_indir` to reject
+/// rather than silently wrapping).
+///
+/// # SAFETY: `ptr` points to at least `RSS_INDIR_ENTRIES` readable `u32`s
+/// (allocated by the ethtool core); the borrow is call-scoped.
+pub(crate) fn read_rss_indir(ptr: *const u32, out: &mut [u8; crate::rss::RSS_INDIR_ENTRIES]) {
+    // SAFETY: see fn-level contract; read-only, call-scoped.
+    let src = unsafe { core::slice::from_raw_parts(ptr, crate::rss::RSS_INDIR_ENTRIES) };
+    for (d, &s) in out.iter_mut().zip(src.iter()) {
+        *d = s.min(u32::from(u8::MAX)) as u8;
+    }
+}
+
+/// Write the active indirection table (`u8` queue ids) into a kernel `get_rxfh`
+/// `u32` buffer.
+///
+/// # SAFETY: `ptr` points to at least `RSS_INDIR_ENTRIES` writable `u32`s
+/// (allocated by the ethtool core); the borrow is call-scoped.
+pub(crate) fn write_rss_indir(ptr: *mut u32, table: &[u8; crate::rss::RSS_INDIR_ENTRIES]) {
+    // SAFETY: see fn-level contract; write-only, call-scoped.
+    let dst = unsafe { core::slice::from_raw_parts_mut(ptr, crate::rss::RSS_INDIR_ENTRIES) };
+    for (d, &s) in dst.iter_mut().zip(table.iter()) {
+        *d = u32::from(s);
+    }
 }
 
 pub(crate) fn bridge_tx_disable(ndev: *mut bindings::net_device) {

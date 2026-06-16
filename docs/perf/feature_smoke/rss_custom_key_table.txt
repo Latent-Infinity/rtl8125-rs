@@ -1,0 +1,59 @@
+Custom RSS key + indirection table (W3.3) — ethtool -x/-X validation
+====================================================================
+Date:     2026-06-16
+Host:     gateway (bare metal), kernel 7.0.0-kasan (KASAN on)
+Driver:   r8125_rust, srcversion 9FDDB4C2123E1616C136496, loaded rss_queues=4
+Interface: enp3s0 (RTL8125 DUT) <-> controller enp4s0 (igc), 2.5G
+
+Design under test
+-----------------
+A Rust-owned RSS policy (src/rss.rs `RssPolicy`, host-unit-tested) holds the
+active Toeplitz key + 128-bucket indirection table. Storage is lock-free atomics
+in NetdevState (RTNL-serialized, never on the packet hot path); the policy
+round-trips through the tested type via rss_policy_snapshot/store. ethtool
+get_rxfh/set_rxfh call ops.rss_get/rss_set; the chip is reprogrammed live via the
+existing apply_rss_programming path. The chip RSS key is write-only, so the cache
+is the only truthful source for `ethtool -x`.
+
+Host unit tests (ci/check_rust_unit_tests.sh): src/rss.rs = 11 tests
+  default round-robin entry, indir bounds, is-default detection, set_indir
+  (default-collapse / custom-store / out-of-range reject + keep-old / wrong-len),
+  reclamp (drop-invalid / keep-valid), effective_indir, key + parts round-trip.
+
+Hardware results
+----------------
+1. get_rxfh (default): reports the round-robin spread for the active count:
+     0:  0 1 2 3 0 1 2 3   (4 RX rings) — matches what was programmed.
+
+2. CUSTOM indirection table persists + reads back (proves it is NOT recomputed):
+     ethtool -X enp3s0 weight 3 1 0 0  -> table biased to q0/q1 (head all 0)
+     ethtool -X enp3s0 weight 0 0 1 1  -> head reads "2 2 2 2 ..." (queue 2)
+   Both differ from the default 0,1,2,3 spread -> custom table is live.
+
+3. CUSTOM hash key persists + reads back EXACTLY (the decisive cache proof):
+     ethtool -X enp3s0 hkey 6d:5a:11:22:...:55:66
+     ethtool -x enp3s0 -> "RSS hash key:" shows the identical 40 bytes.
+   (The chip key register is write-only; only the Rust policy cache makes this
+    readback possible.)
+
+4. Channel-count reclamp:
+   - A custom table that only references surviving queues is KEPT across a shrink
+     (weight 3 1 0 0 -> `ethtool -L rx 2` keeps the q0/q1 table). Host-tested
+     reclamp_for_queue_count keeps a still-valid table.
+   - A custom table referencing q2/q3 blocks the shrink: the kernel core itself
+     rejects `ethtool -L rx 2` ("requested channel counts are too low for existing
+     indirection table"), so the invalidating case never reaches the driver. Our
+     reclamp remains the defensive reset for any path the core does not guard
+     (host-tested: drop-invalid -> default).
+
+5. `ethtool -X enp3s0 default` restores the default spread.
+
+6. Memory safety + traffic: 0 KASAN/WARN/BUG across all set/get/reclamp cycles;
+   segment-A ping 0% loss after restore. The no-RSS / single-queue fast path is
+   unchanged (policy is touched only under RTNL).
+
+Scope
+-----
+Implemented: custom RSS key + indirection table (get_rxfh/set_rxfh). Hash-field
+selection (rxnfc GRXFH/SRXFH) and n-tuple steering remain deferred (the chip's
+hash fields are fixed by RSS_CTRL_HASH_BITS; n-tuple has no proven classifier).

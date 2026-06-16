@@ -43,7 +43,7 @@ use kernel::{
     device::Core, devres::Devres, error::code::ENODEV, pci, prelude::*, sync::aref::ARef,
 };
 
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize};
 
 use crate::hw;
 use crate::mmio::{self, Regs};
@@ -509,6 +509,10 @@ impl pci::Driver for R8125Driver {
                             bql_enabled: AtomicBool::new(false),
                             rx_hash_enabled: AtomicBool::new(false),
                             requested_rx_queues: AtomicUsize::new(0),
+                            rss_key_custom: AtomicBool::new(false),
+                            rss_key <- pin_init::init_array_from_fn(|_| AtomicU8::new(0)),
+                            rss_indir_custom: AtomicBool::new(false),
+                            rss_indir <- pin_init::init_array_from_fn(|_| AtomicU8::new(0)),
                             tx <- crate::netdev::TxRingState::new(
                                 tx_ring.desc_ptr_mut(),
                                 tx_ring.dma_handle(),

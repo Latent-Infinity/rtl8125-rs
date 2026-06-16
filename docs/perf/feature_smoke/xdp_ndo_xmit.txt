@@ -1,0 +1,63 @@
+XDP ndo_xdp_xmit validation (Stage 3 — redirect-target transmit side)
+=====================================================================
+Date:        2026-06-16
+Host:        gateway (bare metal), kernel 7.0.0-kasan (KASAN on)
+Driver:      r8125_rust, srcversion 30A5A3B1E5E56EA72BB0C02
+Topology:    cross-machine 2-node rig
+  Segment A: gateway enp3s0 (RTL8125, r8125_rust DUT, 10.0.0.2) <-> controller enp4s0 (igc, 10.0.0.1)
+  Segment B: guest enp5s0 (RTL8125, r8125_rust, 10.0.2.2) <-> gateway enp4s0 (igc, 10.0.2.1)
+Redirect prog: /tmp/xdp_redir.o = SEC("xdp") { return bpf_redirect(<enp3s0 ifindex>, 0); }
+  clang -O2 -target bpf; attached NATIVE on gateway enp4s0 (the igc redirect SOURCE).
+
+What this exercises
+-------------------
+A frame arriving on gateway enp4s0 (igc) is XDP_REDIRECT'd to enp3s0 (our driver).
+The kernel XDP core then calls enp3s0's **ndo_xdp_xmit** to transmit the foreign
+xdp_frame. This is the redirect-TARGET side (distinct from XDP_TX, which reflects
+out the same port). Both share the Stage-2 TX-ring producer (ops.xdp_xmit_one) +
+TxSlotKind::Xdp reaper disposition (xdp_return_frame), so foreign frames route
+back to their ORIGIN page_pool via the frame's own mem model.
+
+xdp_features advertised (authoritative, netdev-genl dev-get)
+-----------------------------------------------------------
+  'xdp-features': {'basic', 'redirect', 'ndo-xmit'}
+NDO_XMIT now set (was withheld until this implementation); XSK bit still clear.
+
+Functional proof (segment-B IPs appear on segment A)
+----------------------------------------------------
+The guest (10.0.2.2, segment B) pinged gateway enp4s0 (10.0.2.1, pinned ARP since
+the redirect prog consumes the guest's ARP). With the redirect attached, those
+echo-requests are transmitted out enp3s0 via ndo_xdp_xmit and captured on the
+controller (segment A) — an address that otherwise NEVER appears on segment A:
+
+  controller# tcpdump -nni enp4s0 'src host 10.0.2.2'
+    10.0.2.2 > 10.0.2.1: ICMP echo request, id 51330, seq 1 ...
+  redirected frames captured on segment A: 47 / 50 sent
+  (the few missing are ARP-settle/ring-warmup at the very start)
+
+Memory-safety soak (foreign-frame xdp_return_frame — R1-equivalent)
+------------------------------------------------------------------
+25 s guest flood-ping through the redirect:
+  ndo_xdp_xmit frames transmitted: 2273
+  gateway dmesg KASAN / WARNING / BUG / use-after: 0 splats
+The foreign-frame disposition (dma_unmap + xdp_return_frame, where the frame's
+mem model returns the page to the igc/origin pool, NOT our page_pool) is clean.
+
+Implementation notes
+--------------------
+- ndo_xdp_xmit (netdev_bridge_xdp.c) takes the txq lock once per batch, loops
+  xdp_frame_xmit_locked (shared with XDP_TX), returns nxmit (the xdp core frees
+  the un-sent tail), and rings one doorbell on XDP_XMIT_FLUSH.
+- Rejects unknown flags (-EINVAL) and no-carrier (-ENETDOWN).
+- The producer/disposition path is identical to Stage-2 XDP_TX — no second TX
+  implementation (the Stage-2 design deliberately collapsed to one path for this).
+
+Cleanup
+-------
+Redirect prog detached; segment A no-prog ping 0% loss; rig restored.
+
+Scope
+-----
+XDP datapath now covers BASIC (PASS/DROP/ABORTED/TX), REDIRECT, and NDO_XMIT.
+Remaining: RX multi-buffer for jumbo+XDP, and AF_XDP zero-copy (Stage 4).
+Copy-mode AF_XDP already works.

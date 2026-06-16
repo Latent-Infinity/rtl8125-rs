@@ -75,6 +75,7 @@ mod phy_fw;
 mod pm;
 mod regs;
 mod ring;
+mod rss;
 mod skb;
 mod unsafe_boundary;
 

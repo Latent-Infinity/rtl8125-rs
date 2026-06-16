@@ -45,10 +45,22 @@ reject "$XDP_C" "xchg(&b->xdp_prog" \
 
 need "$NETDEV_C" ".ndo_bpf" \
   "native XDP attach callback is wired"
-need "$NETDEV_C" "NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT" \
-  "xdp_features advertises only implemented BASIC and REDIRECT actions"
-reject "$NETDEV_C" "NETDEV_XDP_ACT_NDO_XMIT" \
-  "NDO_XMIT xdp_features bit before ndo_xdp_xmit implementation"
+need "$NETDEV_C" ".ndo_xdp_xmit" \
+  "redirect-target transmit callback is wired"
+need "$NETDEV_C" "NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT |" \
+  "xdp_features advertises BASIC and REDIRECT actions"
+need "$NETDEV_C" "NETDEV_XDP_ACT_NDO_XMIT" \
+  "xdp_features advertises NDO_XMIT now that ndo_xdp_xmit is implemented"
+need "$XDP_C" "r8125_bridge_ndo_xdp_xmit" \
+  "ndo_xdp_xmit implementation present (redirect-target side)"
+need "$XDP_C" "flags & ~XDP_XMIT_FLAGS_MASK" \
+  "ndo_xdp_xmit rejects unknown xmit flags"
+need "$XDP_C" "xdp_frame_has_frags(frame)" \
+  "ndo_xdp_xmit producer rejects non-linear frames until SG is advertised"
+need "$XDP_C" "while (i < n)" \
+  "ndo_xdp_xmit partial failure walks the unconsumed tail"
+need "$XDP_C" "xdp_return_frame(frames[i++])" \
+  "ndo_xdp_xmit returns unconsumed tail frames on partial failure"
 need "$NAPI_RS" "TxSlotKind::Xdp" \
   "TX reaper has explicit XDP frame disposition"
 need "$NAPI_RS" "ub::xdp_return_frame" \

@@ -4,13 +4,12 @@
 # B5 ethtool RSS control-plane contract.
 #
 # The driver exposes RSS key/indirection/channels via ethtool. get_rxfh reports
-# the boot-stable key + the kernel default indirection spread for the active
-# RX-queue count (exactly what apply_rss_programming writes); set_rxfh validates
-# the table through the host-tested Rust validator and accepts only that default
-# (rejecting custom tables + custom keys with -EOPNOTSUPP, never a silent
-# no-op); get_channels/set_channels report and change the active RX-queue count.
-# The C size macros MUST equal the Rust source of
-# truth so the kernel buffers match what hardware was programmed with.
+# the ACTIVE Rust-owned policy (key + indirection table via ops.rss_get);
+# set_rxfh range-checks the table (host-tested validator) and installs a CUSTOM
+# key and/or table into the policy via ops.rss_set, reprogramming the chip live;
+# get_channels/set_channels report and change the active RX-queue count. The C
+# size macros MUST equal the Rust source of truth so the kernel buffers match
+# what hardware was programmed with.
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -70,38 +69,52 @@ else
 	red "get_rx_ring_count must report the RX ring count (else ethtool -x/-X fail)"
 fi
 
-# 3. get_rxfh reports the programmed key (boot key) + the ACTUAL default spread
-#    for the active queue count (NOT a hardcoded all-zero table) + Toeplitz.
+# 3. get_rxfh reports the ACTIVE policy via ops.rss_get (key + indir from the
+#    Rust-owned RssPolicy, not a recomputed default) + Toeplitz.
 get_body=$(awk '/static int bridge_get_rxfh\(/,/^}/' "$ETH")
-if grep -q 'netdev_rss_key_fill' <<<"$get_body" &&
+if grep -qE 'ops\.rss_get\(b->priv, rxfh->key, rxfh->indir\)' <<<"$get_body" &&
 	grep -q 'ETH_RSS_HASH_TOP' <<<"$get_body" &&
-	grep -qE 'r8125_bridge_rxfh_indir_default\(i, b->active_rx_queues\)' <<<"$get_body" &&
 	! grep -qE 'memset\(rxfh->indir' <<<"$get_body"; then
-	grn "get_rxfh reports boot key + the default spread for active_rx_queues + Toeplitz"
+	grn "get_rxfh reports the active key + indir from the Rust policy (ops.rss_get) + Toeplitz"
 else
-	red "get_rxfh must fill the boot key + the default spread (rxfh_indir_default), not a zero table"
+	red "get_rxfh must fill key+indir from ops.rss_get (the Rust-owned policy), not a recomputed/zero table"
 fi
 
-# 4. set_rxfh rejects rss_context, validates indir via Rust, AND rejects any
-#    non-default indirection table (-EOPNOTSUPP) instead of silently no-op'ing.
+# 4. set_rxfh rejects rss_context, range-checks indir via the Rust validator,
+#    then installs the CUSTOM key/table via ops.rss_set (no -EOPNOTSUPP for a
+#    valid custom table — custom RSS is now supported).
 set_body=$(awk '/static int bridge_set_rxfh\(/,/^}/' "$ETH")
 if grep -qE 'rss_context' <<<"$set_body" &&
 	grep -qE 'ops\.rss_indir_check\(' <<<"$set_body" &&
 	grep -qE 'ETH_RSS_HASH_NO_CHANGE' <<<"$set_body" &&
-	grep -qE 'r8125_bridge_rxfh_indir_default\(i, b->active_rx_queues\)' <<<"$set_body" &&
-	grep -qE 'return -EOPNOTSUPP' <<<"$set_body"; then
-	grn "set_rxfh rejects contexts, validates indir, and rejects non-default tables (no silent no-op)"
+	grep -qE 'return b->ops\.rss_set\(b->priv, rxfh->key, rxfh->indir' <<<"$set_body"; then
+	grn "set_rxfh rejects contexts, validates indir, and installs the custom key/table via ops.rss_set"
 else
-	red "set_rxfh must reject rss_context, validate indir, and reject non-default tables with -EOPNOTSUPP"
+	red "set_rxfh must reject rss_context, validate indir, and install the custom key/table via ops.rss_set"
 fi
 
-# 5. vtable rss_indir_check exists on BOTH sides and Rust uses the tested validator.
+# 5. RSS vtable ops (validate + get + set) exist on BOTH sides and are wired.
 if grep -qE 'int \(\*rss_indir_check\)\(void \*priv, const u32 \*indir, unsigned int len,' "$HDR" &&
+	grep -qE 'void \(\*rss_get\)\(void \*priv, u8 \*key_out, u32 \*indir_out\)' "$HDR" &&
+	grep -qE 'int \(\*rss_set\)\(void \*priv, const u8 \*key_in, const u32 \*indir_in,' "$HDR" &&
 	grep -qE 'pub rss_indir_check:' "$UB" &&
-	grep -qE 'rss_indir_check: rust_rss_indir_check' "$NETDEV"; then
-	grn "rss_indir_check vtable op present in C struct, Rust BridgeOps, and M4_FULL_OPS"
+	grep -qE 'pub rss_get:' "$UB" &&
+	grep -qE 'pub rss_set:' "$UB" &&
+	grep -qE 'rss_indir_check: rust_rss_indir_check' "$NETDEV" &&
+	grep -qE 'rss_get: rust_rss_get' "$NETDEV" &&
+	grep -qE 'rss_set: rust_rss_set' "$NETDEV"; then
+	grn "rss_indir_check/get/set vtable ops present in C struct, Rust BridgeOps, and M4_FULL_OPS"
 else
-	red "rss_indir_check must be declared in the C vtable, Rust BridgeOps, and wired in M4_FULL_OPS"
+	red "rss_indir_check/get/set must be declared in the C vtable, Rust BridgeOps, and wired in M4_FULL_OPS"
+fi
+
+# 5b. The Rust-owned policy module sizes match the chip register sizes.
+rss_key=$(grep -oE 'RSS_KEY_SIZE: usize = [0-9]+' "$ROOT/src/rss.rs" | grep -oE '[0-9]+$' | head -1)
+rss_indir=$(grep -oE 'RSS_INDIR_ENTRIES: usize = [0-9]+' "$ROOT/src/rss.rs" | grep -oE '[0-9]+$' | head -1)
+if [[ "$rss_key" == "$key_rs" && "$rss_indir" == "$indir_rs" ]]; then
+	grn "rss::RssPolicy sizes match the chip register sizes (key=$rss_key, indir=$rss_indir)"
+else
+	red "rss.rs sizes must equal regs/layout (key rss=$rss_key/regs=$key_rs indir rss=$rss_indir/layout=$indir_rs)"
 fi
 
 check_body=$(awk '/extern "C" fn rust_rss_indir_check\(/,/^}/' "$NETDEV")
@@ -111,6 +124,15 @@ if grep -qE 'ub::rxfh_indir_valid\(indir, len as usize, queue_count\)' <<<"$chec
 	grn "rss_indir_check bounds entries by runtime active_rx_queues via host-tested validator"
 else
 	red "rss_indir_check must bound indirection by runtime active_rx_queues through layout::rxfh_indir_all_valid"
+fi
+
+set_rss_body=$(awk '/extern "C" fn rust_rss_set\(/,/^}/' "$NETDEV")
+if grep -qE 'rss_policy_store\(state, &policy\)' <<<"$set_rss_body" &&
+	grep -qE 'ub::netif_running' <<<"$set_rss_body" &&
+	grep -qE 'apply_rss_programming\(state\)' <<<"$set_rss_body"; then
+	grn "rss_set caches policy first and only reprograms hardware when netif_running"
+else
+	red "rust_rss_set must cache policy first and guard live MMIO programming with netif_running"
 fi
 
 exit "$rc"

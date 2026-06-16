@@ -447,6 +447,28 @@ impl<'a> Regs<'a> {
         }
     }
 
+    /// Program the RSS indirection table from an explicit 128-entry table (one
+    /// queue id per bucket). Same four-entries-per-dword packing as
+    /// `set_rss_indir_default_8125`; used when a custom `ethtool -X` table is
+    /// active. The caller guarantees every entry references an owned queue
+    /// (validated by the host-tested `rss::RssPolicy`).
+    pub(crate) fn set_rss_indir_8125(&self, table: &[u8; crate::layout::RSS_INDIR_TBL_ENTRIES]) {
+        let mut bucket = 0usize;
+        while bucket < crate::layout::RSS_INDIR_TBL_ENTRIES {
+            let entries = [
+                table[bucket],
+                table[bucket + 1],
+                table[bucket + 2],
+                table[bucket + 3],
+            ];
+            self.bar.write32(
+                crate::layout::indir_word(entries),
+                regs::RSS_INDIRECTION_TBL_8125 + bucket,
+            );
+            bucket += 4;
+        }
+    }
+
     // ── Generic small-region accessors used by hw_start_8125b ───────────
 
     /// Read a 16-bit register at an arbitrary BAR offset. Used by the

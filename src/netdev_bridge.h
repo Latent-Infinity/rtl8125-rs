@@ -171,6 +171,33 @@ struct r8125_bridge_ops {
 			       unsigned int queue_count);
 
 	/*
+	 * rss_get(priv, key_out, indir_out) — ethtool get_rxfh (-x)
+	 * ─────────────────────────────────
+	 * Pre   : RTNL held. key_out (RSS_KEY_SIZE bytes) and/or indir_out
+	 *         (RSS_INDIR_SIZE u32 entries) point to ethtool-allocated buffers;
+	 *         either may be NULL when only the other is requested.
+	 * Post  : both buffers are filled from the Rust-owned RSS policy (the active
+	 *         key + indirection table). The chip RSS key is write-only, so this
+	 *         cache is the only truthful source for `ethtool -x`.
+	 */
+	void (*rss_get)(void *priv, u8 *key_out, u32 *indir_out);
+
+	/*
+	 * rss_set(priv, key_in, indir_in, queue_count) — ethtool set_rxfh (-X)
+	 * ────────────────────────────────────────────
+	 * Pre   : RTNL held. key_in (RSS_KEY_SIZE bytes) and/or indir_in
+	 *         (RSS_INDIR_SIZE u32 entries) are the requested values; either may
+	 *         be NULL for "no change". `queue_count` is the active RX-queue count.
+	 * Post  : on success (0) the Rust policy stores the new key/table. If the
+	 *         device is running, the chip is reprogrammed live (same path as
+	 *         open); if it is down, the next open programs the cached policy. An
+	 *         out-of-range indirection entry returns -EINVAL with the policy
+	 *         unchanged.
+	 */
+	int (*rss_set)(void *priv, const u8 *key_in, const u32 *indir_in,
+		       unsigned int queue_count);
+
+	/*
 	 * set_channels(priv, rx_count) — ethtool set_channels (-L)
 	 * ───────────────────────────
 	 * Pre   : RTNL held. C has already rejected tx/combined changes; rx_count

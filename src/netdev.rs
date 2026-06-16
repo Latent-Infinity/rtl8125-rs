@@ -648,6 +648,21 @@ pub(crate) struct NetdevState {
     // NOT-PADDED: written under RTNL in set_channels; read at open.
     pub(crate) requested_rx_queues: AtomicUsize,
 
+    /// Rust-owned RSS policy storage (`crate::rss`). The active Toeplitz key and
+    /// 128-bucket indirection table, persisted as the lock-free serialization of
+    /// a `RssPolicy`: a `*_custom` flag plus the array (flag false ⇒ "use the
+    /// system key / default spread"). Written only under RTNL (ethtool
+    /// get/set_rxfh, set_channels, open) and read at open / live reprogram —
+    /// never on the packet hot path — so single-writer atomics need no lock.
+    /// `netdev::rss_policy_snapshot` / `rss_policy_store` round-trip these through
+    /// the host-tested `RssPolicy` type.
+    // NOT-PADDED: cold-path RSS policy, RTNL-serialized, never written at packet rate.
+    pub(crate) rss_key_custom: AtomicBool,
+    pub(crate) rss_key: [AtomicU8; crate::rss::RSS_KEY_SIZE],
+    // NOT-PADDED: cold-path RSS policy, RTNL-serialized, never written at packet rate.
+    pub(crate) rss_indir_custom: AtomicBool,
+    pub(crate) rss_indir: [AtomicU8; crate::rss::RSS_INDIR_ENTRIES],
+
     /// TX descriptor ring + producer/consumer indices + shadow.
     pub(crate) tx: TxRingState,
     /// RX descriptor rings + per-slot streaming-DMA pages + consumer indices.
@@ -797,6 +812,65 @@ extern "C" fn rust_rss_indir_check(
     }
 }
 
+/// ethtool `get_rxfh` — report the ACTIVE RSS key + indirection table from the
+/// Rust-owned policy (so `ethtool -x` matches exactly what was programmed). The
+/// chip RSS key is write-only, so the cache is the only source of truth. Either
+/// buffer may be NULL (caller wants only the other). Runs under RTNL.
+extern "C" fn rust_rss_get(cookie: *mut c_void, key_out: *mut u8, indir_out: *mut u32) {
+    let state = state_from(cookie);
+    let queue_count = active_rx_queues(state) as u8;
+    let policy = rss_policy_snapshot(state);
+    if !indir_out.is_null() {
+        let mut table = [0u8; crate::rss::RSS_INDIR_ENTRIES];
+        policy.effective_indir(queue_count, &mut table);
+        ub::write_rss_indir(indir_out, &table);
+    }
+    if !key_out.is_null() {
+        let mut key = [0u8; crate::rss::RSS_KEY_SIZE];
+        match policy.key() {
+            Some(custom) => key.copy_from_slice(custom),
+            None => ub::rss_key_fill(&mut key),
+        }
+        ub::write_rss_key(key_out, &key);
+    }
+}
+
+/// ethtool `set_rxfh` — install a custom RSS key and/or indirection table into
+/// the Rust-owned policy. If the netdev is running, reprogram the chip live via
+/// the same `apply_rss_programming` path as open / set_features; if it is down,
+/// only cache the policy and let the next open program hardware. Either input
+/// may be NULL (no change to that component). The table is validated by the
+/// host-tested `RssPolicy::set_indir` (a default-equal table collapses to "track
+/// default"); an out-of-range entry returns `-EINVAL` and leaves the policy
+/// untouched. Runs under RTNL.
+extern "C" fn rust_rss_set(
+    cookie: *mut c_void,
+    key_in: *const u8,
+    indir_in: *const u32,
+    queue_count: core::ffi::c_uint,
+) -> c_int {
+    let state = state_from(cookie);
+    let qc = queue_count as u8;
+    let mut policy = rss_policy_snapshot(state);
+    if !key_in.is_null() {
+        let mut key = [0u8; crate::rss::RSS_KEY_SIZE];
+        ub::read_rss_key(key_in, &mut key);
+        policy.set_key(key);
+    }
+    if !indir_in.is_null() {
+        let mut table = [0u8; crate::rss::RSS_INDIR_ENTRIES];
+        ub::read_rss_indir(indir_in, &mut table);
+        if policy.set_indir(&table, qc).is_err() {
+            return EINVAL.to_errno();
+        }
+    }
+    rss_policy_store(state, &policy);
+    if ub::netif_running(state.ndev.load(Ordering::Acquire)) {
+        apply_rss_programming(state);
+    }
+    0
+}
+
 /// ethtool `set_channels` — set the runtime active RX-queue count. The C bridge
 /// has already rejected tx/combined changes and passed the requested RX count.
 /// Validates it against the owned queues and the V3/V2 prerequisites for >1,
@@ -820,6 +894,14 @@ extern "C" fn rust_set_channels(cookie: *mut c_void, rx_count: core::ffi::c_uint
         }
     }
     state.requested_rx_queues.store(rx, Ordering::Release);
+    // A custom indirection table is queue-count-specific: if the new active
+    // count would leave it referencing queues that no longer exist, drop it back
+    // to the default spread (host-tested `reclamp_for_queue_count`). The C bridge
+    // reopens after this returns, so the reclamped policy is what gets programmed.
+    let new_qc = crate::layout::active_rx_queues(rx as u8, RX_QUEUE_COUNT) as u8;
+    let mut policy = rss_policy_snapshot(state);
+    policy.reclamp_for_queue_count(new_qc);
+    rss_policy_store(state, &policy);
     0
 }
 
@@ -899,6 +981,8 @@ pub(crate) const M4_FULL_OPS: BridgeOps = BridgeOps {
     change_mtu: rust_change_mtu,
     set_features: rust_set_features,
     rss_indir_check: rust_rss_indir_check,
+    rss_get: rust_rss_get,
+    rss_set: rust_rss_set,
     set_channels: rust_set_channels,
     set_rx_mode: rust_set_rx_mode,
     tally_dump: rust_tally_dump,
@@ -944,6 +1028,17 @@ extern "C" fn skel_rss_indir_check(
     _cookie: *mut c_void,
     _indir: *const u32,
     _len: core::ffi::c_uint,
+    _queue_count: core::ffi::c_uint,
+) -> c_int {
+    0
+}
+#[allow(dead_code)]
+extern "C" fn skel_rss_get(_cookie: *mut c_void, _key_out: *mut u8, _indir_out: *mut u32) {}
+#[allow(dead_code)]
+extern "C" fn skel_rss_set(
+    _cookie: *mut c_void,
+    _key_in: *const u8,
+    _indir_in: *const u32,
     _queue_count: core::ffi::c_uint,
 ) -> c_int {
     0
@@ -1003,6 +1098,8 @@ pub(crate) const M4_SKELETON_OPS: BridgeOps = BridgeOps {
     change_mtu: skel_change_mtu,
     set_features: skel_set_features,
     rss_indir_check: skel_rss_indir_check,
+    rss_get: skel_rss_get,
+    rss_set: skel_rss_set,
     set_channels: skel_set_channels,
     set_rx_mode: skel_set_rx_mode,
     tally_dump: skel_tally_dump,
@@ -1133,12 +1230,73 @@ fn validate_rss_queue_request(state: &NetdevState) -> Result<()> {
     Ok(())
 }
 
-fn program_rss_key_and_indir(regs: &Regs<'_>, queue_count: u8) {
-    regs.set_rss_indir_default_8125(queue_count);
-    // Boot-stable system RSS key (not a hardcoded constant) — hashes are
-    // unpredictable across reboots without baking a key into the driver.
+// The Rust-owned RSS key/table length constants must match the chip register
+// sizes the programming code uses; tie them at compile time.
+const _: () = assert!(crate::rss::RSS_KEY_SIZE == regs::RSS_KEY_SIZE);
+const _: () = assert!(crate::rss::RSS_INDIR_ENTRIES == crate::layout::RSS_INDIR_TBL_ENTRIES);
+
+/// Snapshot the lock-free RSS storage into the host-tested `RssPolicy` model.
+/// Called only under RTNL (ethtool / open), so the per-field loads are coherent.
+fn rss_policy_snapshot(state: &NetdevState) -> crate::rss::RssPolicy {
+    let key = if state.rss_key_custom.load(Ordering::Acquire) {
+        let mut k = [0u8; crate::rss::RSS_KEY_SIZE];
+        for (i, b) in k.iter_mut().enumerate() {
+            *b = state.rss_key[i].load(Ordering::Relaxed);
+        }
+        Some(k)
+    } else {
+        None
+    };
+    let indir = if state.rss_indir_custom.load(Ordering::Acquire) {
+        let mut t = [0u8; crate::rss::RSS_INDIR_ENTRIES];
+        for (i, e) in t.iter_mut().enumerate() {
+            *e = state.rss_indir[i].load(Ordering::Relaxed);
+        }
+        Some(t)
+    } else {
+        None
+    };
+    crate::rss::RssPolicy::from_stored(key, indir)
+}
+
+/// Persist a `RssPolicy` back into the lock-free storage (RTNL-serialized).
+fn rss_policy_store(state: &NetdevState, policy: &crate::rss::RssPolicy) {
+    match policy.key() {
+        Some(k) => {
+            for (i, b) in k.iter().enumerate() {
+                state.rss_key[i].store(*b, Ordering::Relaxed);
+            }
+            state.rss_key_custom.store(true, Ordering::Release);
+        }
+        None => state.rss_key_custom.store(false, Ordering::Release),
+    }
+    match policy.custom_indir() {
+        Some(t) => {
+            for (i, e) in t.iter().enumerate() {
+                state.rss_indir[i].store(*e, Ordering::Relaxed);
+            }
+            state.rss_indir_custom.store(true, Ordering::Release);
+        }
+        None => state.rss_indir_custom.store(false, Ordering::Release),
+    }
+}
+
+fn program_rss_key_and_indir(regs: &Regs<'_>, queue_count: u8, policy: &crate::rss::RssPolicy) {
+    // Indirection: a stored custom table, else the kernel default spread.
+    if policy.has_custom_indir() {
+        let mut table = [0u8; crate::rss::RSS_INDIR_ENTRIES];
+        policy.effective_indir(queue_count, &mut table);
+        regs.set_rss_indir_8125(&table);
+    } else {
+        regs.set_rss_indir_default_8125(queue_count);
+    }
+    // Key: a stored custom key, else the boot-stable system RSS key (not a
+    // hardcoded constant — hashes stay unpredictable across reboots).
     let mut key = [0u8; regs::RSS_KEY_SIZE];
-    ub::rss_key_fill(&mut key);
+    match policy.key() {
+        Some(custom) => key.copy_from_slice(custom),
+        None => ub::rss_key_fill(&mut key),
+    }
     regs.set_rss_key_8125(&key);
 }
 
@@ -1149,7 +1307,8 @@ fn apply_rss_programming(state: &NetdevState) {
 
     if state.rx_hash_enabled.load(Ordering::Acquire) || requested != 0 {
         regs.set_q_num_ctrl_8125(rss_q_num_ctrl(queue_count));
-        program_rss_key_and_indir(&regs, queue_count);
+        let policy = rss_policy_snapshot(state);
+        program_rss_key_and_indir(&regs, queue_count, &policy);
         // RSS_CTRL carries the queue-count + mask-length fields, not just the
         // hash-type enables — without the queue-count field the chip steers
         // everything to queue 0. See layout::rss_ctrl_value.

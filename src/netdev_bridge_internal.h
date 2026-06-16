@@ -164,6 +164,8 @@ void r8125_bridge_xdp_finalize(struct net_device *ndev, unsigned int queue_id);
 int  r8125_bridge_xdp_rxq_reg(struct net_device *ndev, unsigned int queue_id);
 void r8125_bridge_xdp_rxq_unreg(struct net_device *ndev, unsigned int queue_id);
 int  r8125_bridge_ndo_bpf(struct net_device *ndev, struct netdev_bpf *bpf);
+int  r8125_bridge_ndo_xdp_xmit(struct net_device *ndev, int n,
+			       struct xdp_frame **frames, u32 flags);
 /* Called from the Rust TX reaper (via the unsafe boundary) to return an
  * XDP_TX frame's page to its origin page_pool at TX completion.
  */

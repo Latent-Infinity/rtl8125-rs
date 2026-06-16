@@ -148,18 +148,16 @@ u32 r8125_bridge_rxfh_indir_default(u32 index, u32 n_rx_rings)
 }
 
 /*
- * RSS control plane. The chip uses Toeplitz hashing with the boot-stable
- * system key and the kernel DEFAULT indirection spread for the active RX-queue
- * count (`ethtool_rxfh_indir_default`, bucket i -> queue i % active_rx_queues) —
- * exactly what `apply_rss_programming` writes to hardware. `get_rxfh` therefore
- * reports that same default spread (NOT a hardcoded all-zero table), so
- * `ethtool -x` matches the programmed state for any queue count. `set_rxfh`
- * supports only that default: it validates the table through the host-tested
- * Rust validator and then accepts it only if it equals the default spread,
- * rejecting a custom table (-EOPNOTSUPP) rather than silently no-op'ing — a
- * custom hash key/table is a documented follow-up. The active count is changed
- * via `ethtool -L` (set_channels), which reprograms the default for the new
- * count. ethtool ops run under RTNL, serialized against open/stop.
+ * RSS control plane. The chip uses Toeplitz hashing with a Rust-owned policy
+ * object (the active key + 128-bucket indirection table — `crate::rss`).
+ * `get_rxfh` reports that active policy (so `ethtool -x` matches hardware; the
+ * chip key is write-only, so the cache is the only truthful source). `set_rxfh`
+ * installs a CUSTOM key and/or table: the table is range-checked against the
+ * active queue count (host-tested validator) and then handed to the policy,
+ * which collapses a default-equal table back to "track default". Running devices
+ * are reprogrammed live; down devices apply the cached policy on the next open.
+ * `set_channels` (-L) reclamps a now-out-of-range custom table to the default
+ * for the new count. ethtool ops run under RTNL, serialized against open/stop.
  */
 static u32 bridge_get_rxfh_key_size(struct net_device *ndev)
 {
@@ -175,18 +173,11 @@ static int bridge_get_rxfh(struct net_device *ndev,
 			   struct ethtool_rxfh_param *rxfh)
 {
 	struct r8125_bridge *b = netdev_priv(ndev);
-	u32 i;
 
-	/* Report the SAME default spread that apply_rss_programming wrote for the
-	 * active queue count, so `ethtool -x` matches hardware (was: all-zero,
-	 * which lied once >1 queue was active).
+	/* Fill key/indir from the Rust-owned policy (NULL pointers are skipped
+	 * inside the op). Toeplitz is the only supported hash function.
 	 */
-	if (rxfh->indir)
-		for (i = 0; i < R8125_RSS_INDIR_SIZE; i++)
-			rxfh->indir[i] =
-				r8125_bridge_rxfh_indir_default(i, b->active_rx_queues);
-	if (rxfh->key)
-		netdev_rss_key_fill(rxfh->key, R8125_RSS_KEY_SIZE);
+	b->ops.rss_get(b->priv, rxfh->key, rxfh->indir);
 	rxfh->hfunc = ETH_RSS_HASH_TOP;
 	return 0;
 }
@@ -196,43 +187,28 @@ static int bridge_set_rxfh(struct net_device *ndev,
 			   struct netlink_ext_ack *extack)
 {
 	struct r8125_bridge *b = netdev_priv(ndev);
-	u8 boot_key[R8125_RSS_KEY_SIZE];
 
 	if (rxfh->rss_context)
 		return -EOPNOTSUPP;
 	if (rxfh->hfunc != ETH_RSS_HASH_NO_CHANGE &&
 	    rxfh->hfunc != ETH_RSS_HASH_TOP)
 		return -EOPNOTSUPP;
+	/* Range-check the indirection table against the active queue count first
+	 * (host-tested validator), so a bad table is rejected before any state
+	 * change. NULL indir (key-only update) is vacuously valid.
+	 */
 	if (rxfh->indir) {
-		u32 i;
-		/* First reject entries that don't map to an owned queue (-EINVAL,
-		 * host-tested validator).
-		 */
 		int rc = b->ops.rss_indir_check(b->priv, rxfh->indir,
 						R8125_RSS_INDIR_SIZE,
 						b->active_rx_queues);
 		if (rc)
 			return rc;
-		/* Only the kernel default spread is supported. Accept an echo of
-		 * the default; reject a custom (valid-but-different) table with
-		 * -EOPNOTSUPP rather than silently no-op'ing — the hardware always
-		 * runs the default for the active queue count. Custom indirection
-		 * is a documented follow-up.
-		 */
-		for (i = 0; i < R8125_RSS_INDIR_SIZE; i++)
-			if (rxfh->indir[i] !=
-			    r8125_bridge_rxfh_indir_default(i, b->active_rx_queues))
-				return -EOPNOTSUPP;
 	}
-	/* A custom hash key is likewise unsupported; accept only an echo of the
-	 * current (boot-stable) key, reject a real change.
+	/* Install the custom key and/or table into the Rust policy and reprogram
+	 * the chip live. The policy re-validates and collapses a default table.
 	 */
-	if (rxfh->key) {
-		netdev_rss_key_fill(boot_key, R8125_RSS_KEY_SIZE);
-		if (memcmp(rxfh->key, boot_key, R8125_RSS_KEY_SIZE))
-			return -EOPNOTSUPP;
-	}
-	return 0;
+	return b->ops.rss_set(b->priv, rxfh->key, rxfh->indir,
+			      b->active_rx_queues);
 }
 
 static void bridge_get_channels(struct net_device *ndev,

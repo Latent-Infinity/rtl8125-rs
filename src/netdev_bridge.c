@@ -427,6 +427,7 @@ static const struct net_device_ops bridge_ops = {
 	.ndo_get_stats64	= bridge_ndo_get_stats64,
 	.ndo_set_rx_mode	= bridge_ndo_set_rx_mode,
 	.ndo_bpf		= r8125_bridge_ndo_bpf,
+	.ndo_xdp_xmit		= r8125_bridge_ndo_xdp_xmit,
 };
 
 /* ── Lifecycle ─────────────────────────────────────────────────────── */
@@ -535,15 +536,16 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	 * it lives in features (not hw_features).
 	 */
 	ndev->features |= NETIF_F_HIGHDMA;
-	/* XDP: BASIC (attach + XDP_PASS/DROP/TX/ABORTED) and REDIRECT are both
-	 * implemented (netdev_bridge_xdp.c). XDP_TX enqueues on the Rust TX ring
-	 * via ops.xdp_xmit_one; REDIRECT goes through xdp_do_redirect + a once-per-
-	 * poll xdp_do_flush. NDO_XMIT (ndo_xdp_xmit, the redirect-target side) and
-	 * XSK zero-copy are not implemented yet, so their bits stay clear — the
-	 * advertised set is exactly what works. Advertising BASIC|REDIRECT also
-	 * unlocks copy-mode AF_XDP for free.
+	/* XDP: BASIC (attach + XDP_PASS/DROP/TX/ABORTED), REDIRECT, and NDO_XMIT
+	 * (the redirect-target transmit side, ndo_xdp_xmit) are all implemented
+	 * (netdev_bridge_xdp.c). XDP_TX/NDO_XMIT enqueue on the Rust TX ring via
+	 * ops.xdp_xmit_one; REDIRECT goes through xdp_do_redirect + a once-per-poll
+	 * xdp_do_flush. XSK zero-copy is not implemented yet, so its bit stays clear
+	 * — the advertised set is exactly what works. Advertising BASIC|REDIRECT
+	 * also unlocks copy-mode AF_XDP for free.
 	 */
-	ndev->xdp_features = NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT;
+	ndev->xdp_features = NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT |
+			     NETDEV_XDP_ACT_NDO_XMIT;
 	ndev->vlan_features = NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
 			      NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6;
 
