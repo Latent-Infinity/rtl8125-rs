@@ -1,0 +1,27 @@
+--- rust/kernel/pci.rs.orig.bak	2026-06-18 01:23:51.033330181 +0000
++++ rust/kernel/pci.rs	2026-06-18 01:23:51.049257548 +0000
+@@ -86,0 +87,1 @@
++            (*pdrv.get()).shutdown = Some(Self::shutdown_callback);
+@@ -138,0 +140,14 @@
++    /// PCI `.shutdown` thunk. The bus passes a `pci_dev*` (like remove); recover
++    /// the bound device + drvdata and run the driver shutdown. Returns void.
++    extern "C" fn shutdown_callback(pdev: *mut bindings::pci_dev) {
++        // SAFETY: the PCI bus only calls .shutdown with a valid `pci_dev*`.
++        // INVARIANT: `pdev` is valid for the duration of `shutdown_callback()`.
++        let pdev = unsafe { &*pdev.cast::<Device<device::CoreInternal>>() };
++
++        // SAFETY: .shutdown runs only between a successful `probe_callback` and
++        // `remove_callback`, so drvdata holds a `Pin<KBox<T>>`.
++        let data = unsafe { pdev.as_ref().drvdata_borrow::<T>() };
++
++        T::shutdown(pdev, data);
++    }
++
+@@ -380,0 +396,7 @@
++    /// Device shutdown (reboot / kexec / poweroff). Default no-op. Override to
++    /// quiesce the device (stop DMA, mask IRQs) so it is quiet for the next
++    /// kernel / power-off; the PCI core does not save/restore around this.
++    fn shutdown(dev: &Device<device::Core>, this: Pin<&Self>) {
++        let _ = (dev, this);
++    }
++

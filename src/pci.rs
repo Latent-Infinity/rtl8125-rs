@@ -172,6 +172,54 @@ impl pci::Driver for R8125Driver {
         unsafe_boundary::bridge_pm_resume(this._netdev.ndev())
     }
 
+    /// PCI `.shutdown` (reboot / kexec / poweroff). Quiesce the device so it
+    /// stops DMA and masks IRQs before the platform resets or powers off —
+    /// reuse the same suspend quiesce (MMIO-only; does NOT drop `DriverData`, so
+    /// `remove` still runs the real teardown if it follows). Without this a NIC
+    /// that keeps DMAing across a `kexec` into the next kernel's memory is a
+    /// known corruption source; mainline r8169 wires `.shutdown` for the same
+    /// reason.
+    ///
+    /// Gated on the `r8125_pci_shutdown` cfg (Makefile `SHUTDOWN=1`): the
+    /// `pci::Driver::shutdown` hook only exists on a kernel carrying
+    /// kernel-patches/0002-rust-pci-add-shutdown-callback.patch. On a stock
+    /// kernel the trait has no such method, so this impl compiles out to keep
+    /// the driver buildable upstream.
+    #[cfg(r8125_pci_shutdown)]
+    fn shutdown(dev: &pci::Device<Core>, this: Pin<&Self>) {
+        dev_info!(
+            dev,
+            "RTL8125 shutdown: quiescing device (stop DMA + mask IRQs)\n"
+        );
+        unsafe_boundary::bridge_pm_suspend(this._netdev.ndev());
+    }
+
+    /// PCI function-reset prepare (`pci_error_handlers.reset_prepare`). Quiesce
+    /// the device — `phy_stop` + stop DMA + mask IRQs — BEFORE a secondary-bus /
+    /// FLR reset (e.g. `echo 1 > /sys/.../reset`). Reuses the validated suspend
+    /// quiesce. Mainline r8169 `phy_stop`s across a reset for the same reason;
+    /// without it the phylib state machine WARNs when the link drops mid-reset.
+    ///
+    /// Gated on the `r8125_pci_reset` cfg (Makefile `RESET=1`): the
+    /// `pci::Driver::reset_prepare`/`reset_done` hooks only exist on a kernel
+    /// carrying kernel-patches/0003-rust-pci-add-reset-callbacks.patch.
+    #[cfg(r8125_pci_reset)]
+    fn reset_prepare(dev: &pci::Device<Core>, this: Pin<&Self>) {
+        dev_info!(dev, "RTL8125 reset_prepare: quiescing across PCI reset\n");
+        unsafe_boundary::bridge_pm_suspend(this._netdev.ndev());
+    }
+
+    /// PCI function-reset done (`pci_error_handlers.reset_done`). Re-initialise
+    /// after the reset (the PCI core restored config space + D0). Reuses the
+    /// validated resume re-init. The C callback is void, so a re-init failure is
+    /// logged here rather than propagated to the core.
+    #[cfg(r8125_pci_reset)]
+    fn reset_done(dev: &pci::Device<Core>, this: Pin<&Self>) {
+        if let Err(e) = unsafe_boundary::bridge_pm_resume(this._netdev.ndev()) {
+            dev_warn!(dev, "RTL8125 reset_done re-init failed: {e:?}\n");
+        }
+    }
+
     fn probe(pdev: &pci::Device<Core>, _info: &Self::IdInfo) -> impl PinInit<Self, Error> {
         pin_init::pin_init_scope(move || {
             dev_info!(

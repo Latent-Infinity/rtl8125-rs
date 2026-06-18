@@ -38,6 +38,20 @@ KRUSTFLAGS := -A unexpected_cfgs
 ifeq ($(PCI_PM),1)
 KRUSTFLAGS += --cfg=r8125_pci_pm
 endif
+# PCI .shutdown (reboot/kexec quiesce) requires the kernel-Rust PCI shutdown
+# extension (kernel-patches/0002-rust-pci-add-shutdown-callback.patch). Gated on
+# the `r8125_pci_shutdown` cfg so the default build stays stock-kernel buildable.
+#   make SHUTDOWN=1 -> .shutdown compiled in (requires a shutdown-extended kernel)
+ifeq ($(SHUTDOWN),1)
+KRUSTFLAGS += --cfg=r8125_pci_shutdown
+endif
+# PCI function-reset handlers (reset_prepare/reset_done) require the kernel-Rust
+# PCI reset extension (kernel-patches/0003-rust-pci-add-reset-callbacks.patch).
+# Gated on the `r8125_pci_reset` cfg.
+#   make RESET=1 -> reset handlers compiled in (requires a reset-extended kernel)
+ifeq ($(RESET),1)
+KRUSTFLAGS += --cfg=r8125_pci_reset
+endif
 
 all default modules:
 	$(MAKE) -C $(KDIR) M=$(CURDIR)/src RUSTC=$(RUSTC) BINDGEN=$(BINDGEN) CLIPPY_DRIVER=$(CLIPPY_DRIVER) CC=$(CC) KRUSTFLAGS="$(KRUSTFLAGS)" CONFIG_DEBUG_INFO_BTF_MODULES= modules

@@ -8,7 +8,13 @@
  * has no stable Rust API today: net_device + net_device_ops + NAPI +
  * sk_buff plumbing.
  *
- * Hard cap: 1010 LOC including comments. The per-CPU netstats, IRQ-affinity,
+ * Hard cap: 1200 LOC including comments. Raised from 1110 for the AF_XDP
+ * zero-copy surgical per-queue RX reconfigure (r8125_bridge_xsk_reconfig_queue:
+ * swap one queue's RX pool with the chip RX engine briefly off, no full
+ * stop+open / link-down), including failure rollback to the previous pool, on
+ * top of r8125_bridge_xsk_pool_setup + r8125_bridge_rxq_is_zc (which still use
+ * the static ndo_open/ndo_stop for the multi-queue fallback).
+ * The per-CPU netstats, IRQ-affinity,
  * and TX-queue-len additions plus the per-MTU zero-copy RX path fit after dead
  * RX helpers moved out; queue-id plumbing and the multi-queue NAPI lifecycle
  * helpers raised the cap from 540, then 615. Raised to 700 for the upstream
@@ -21,7 +27,8 @@
  * ndo_features_check offload veto and phy_do_ioctl_running wiring, then 910 for
  * the live ndo_set_mac_address RAR reprogram + tally CounterReset, then 960 for
  * the netdev-genl per-queue statistics (netdev_stat_ops), then 1010 for the WoL
- * suspend arming branch + the IRQ affinity-hint clear helper.
+ * suspend arming branch + the IRQ affinity-hint clear helper, then 1030 for the
+ * PHY LED class-device register/unregister wiring.
  * See cshim/README.md.
  *
  * Every ndo callback below is a thin delegation to the Rust vtable.
@@ -43,6 +50,7 @@
 #include <linux/slab.h>
 #include <linux/workqueue.h>
 #include <net/netdev_queues.h>
+#include <net/xdp_sock_drv.h>
 #include <asm/barrier.h>
 
 /*
@@ -271,11 +279,19 @@ static void bridge_reset_work(struct work_struct *work)
 	struct r8125_bridge *b = container_of(work, struct r8125_bridge, reset_work);
 	struct net_device *ndev = b->ndev;
 
-	rtnl_lock();
-	if (netif_running(ndev)) {
-		netdev_warn(ndev, "recovering link after TX watchdog timeout\n");
-		r8125_bridge_reopen(ndev);
+	netdev_warn(ndev, "recovering link after TX watchdog timeout\n");
+	if (b->devlink) {
+		/* Record the error via devlink-health; the reporter auto-recovers
+		 * through its .recover op (RTNL + r8125_bridge_reopen). One source of
+		 * recovery, observable via `devlink health show`.
+		 */
+		r8125_bridge_devlink_report_tx_timeout(b->devlink);
+		return;
 	}
+	/* No devlink instance — recover directly (same reopen). */
+	rtnl_lock();
+	if (netif_running(ndev))
+		r8125_bridge_reopen(ndev);
 	rtnl_unlock();
 }
 
@@ -429,6 +445,7 @@ static const struct net_device_ops bridge_ops = {
 	.ndo_set_rx_mode	= bridge_ndo_set_rx_mode,
 	.ndo_bpf		= r8125_bridge_ndo_bpf,
 	.ndo_xdp_xmit		= r8125_bridge_ndo_xdp_xmit,
+	.ndo_xsk_wakeup		= r8125_bridge_xsk_wakeup,
 };
 
 /* ── Lifecycle ─────────────────────────────────────────────────────── */
@@ -546,7 +563,7 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	 * also unlocks copy-mode AF_XDP for free.
 	 */
 	ndev->xdp_features = NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT |
-			     NETDEV_XDP_ACT_NDO_XMIT;
+			     NETDEV_XDP_ACT_NDO_XMIT | NETDEV_XDP_ACT_XSK_ZEROCOPY;
 	ndev->vlan_features = NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
 			      NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6;
 
@@ -608,12 +625,35 @@ void r8125_bridge_free(struct net_device *ndev)
 
 int r8125_bridge_register(struct net_device *ndev)
 {
-	return register_netdev(ndev);
+	struct r8125_bridge *b = netdev_priv(ndev);
+	int rc = register_netdev(ndev);
+
+	if (rc)
+		return rc;
+	/* Register the PHY LED class devices now that ndev->dev exists. Best-effort
+	 * (mirrors mainline): a NULL result just means no LED sysfs surface.
+	 */
+	b->leds = r8125_bridge_init_leds(ndev);
+	/* devlink instance + TX health reporter (best-effort; NULL on failure or a
+	 * kernel without CONFIG_NET_DEVLINK keeps the direct-reopen recovery).
+	 */
+	b->devlink = r8125_bridge_devlink_init(ndev);
+	return 0;
 }
 
 void r8125_bridge_unregister_and_free(struct net_device *ndev)
 {
 	struct r8125_bridge *b = netdev_priv(ndev);
+
+	/* Remove the LED class devices (children of ndev->dev) before the netdev
+	 * goes away.
+	 */
+	r8125_bridge_remove_leds(b->leds);
+	b->leds = NULL;
+
+	/* Tear down the devlink instance (independent of the netdev). */
+	r8125_bridge_devlink_remove(b->devlink);
+	b->devlink = NULL;
 
 	/* Order: unregister_netdev synchronously runs ndo_stop (which calls
 	 * phy_stop + phy_disconnect — severing the phy_device from the
@@ -831,6 +871,153 @@ int r8125_bridge_reopen(struct net_device *ndev)
 {
 	bridge_ndo_stop(ndev);
 	return bridge_ndo_open(ndev);
+}
+
+/* True when an AF_XDP umem pool is bound to this RX queue (zero-copy). Read by
+ * the Rust RX path (allocate / pre-post / poll refill) to take the ZC branch.
+ */
+bool r8125_bridge_rxq_is_zc(struct net_device *ndev, unsigned int queue_id)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+
+	if (queue_id >= R8125_BRIDGE_RX_QUEUE_COUNT)
+		return false;
+	return b->rxq[queue_id].xsk_pool != NULL;
+}
+
+/*
+ * Live per-queue RX reconfigure for an AF_XDP bind/unbind: swap ONE queue's RX
+ * pool (page_pool <-> umem) WITHOUT a full device stop+open. The full reopen
+ * re-applies the PHY firmware + renegotiates (~4s link-down) and races the ZC
+ * cold-start bootstrap; this instead (igc_xdp_enable_pool pattern) disables NAPI,
+ * has the Rust side briefly turn the chip RX engine off (TX/PHY/IRQ stay up, so
+ * the LINK NEVER DROPS), frees+rebuilds just this queue's ring, and re-enables.
+ * The q->xsk_pool toggle happens BETWEEN rx_quiesce (frees the old buffers with
+ * the old pool type) and rx_restore (builds the new pool), so each phase uses the
+ * matching allocator/freer. On restore failure it rolls back to the previous pool
+ * before re-enabling NAPI. Only valid for queue 0 in the single-active-queue case
+ * (the global RX-engine toggle would disturb other queues' heads); the
+ * multi-queue caller falls back to a full reopen.
+ */
+static int r8125_bridge_xsk_reconfig_queue(struct net_device *ndev,
+					   struct r8125_bridge_rx_queue *q,
+					   struct xsk_buff_pool *new_pool,
+					   unsigned int queue_id)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+	struct xsk_buff_pool *old_pool = q->xsk_pool;
+	int rc;
+	int rollback_rc;
+
+	bridge_napi_disable_all(b);
+	b->ops.rx_quiesce(b->priv, queue_id);	/* RX engine off + free old pool */
+	q->xsk_pool = new_pool;			/* toggle between free and build */
+	rc = b->ops.rx_restore(b->priv, queue_id);	/* build new pool + RX on */
+	if (rc) {
+		q->xsk_pool = old_pool;
+		rollback_rc = b->ops.rx_restore(b->priv, queue_id);
+		if (rollback_rc)
+			netdev_err(ndev,
+				   "AF_XDP queue %u restore failed (%d), rollback failed (%d)\n",
+				   queue_id, rc, rollback_rc);
+	}
+	bridge_napi_enable_all(b);
+	return rc;
+}
+
+/*
+ * XDP_SETUP_XSK_POOL (ndo_bpf): bind or unbind an AF_XDP umem pool to one RX
+ * queue for zero-copy. DMA-maps/unmaps the umem and swaps the queue's RX pool.
+ * On a running single-queue device this uses the surgical per-queue reconfigure
+ * above (no link-down); multi-queue falls back to a full stop+open. The umem
+ * fill ring is empty at bind, so the ZC restore posts 0 RX buffers; we then
+ * advertise RX need-wakeup so userspace's first recvfrom/poll issues
+ * ndo_xsk_wakeup, which posts the buffers synchronously (xsk_kick). When the
+ * netdev is down, only the bound flag (+ DMA map) changes; the next ndo_open
+ * builds the pool for it. Runs under RTNL (ndo_bpf contract).
+ */
+int r8125_bridge_xsk_pool_setup(struct net_device *ndev,
+				struct xsk_buff_pool *pool, unsigned int queue_id)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+	struct r8125_bridge_rx_queue *q;
+	bool running = netif_running(ndev);
+	bool live;
+	int rc;
+
+	if (queue_id >= R8125_BRIDGE_RX_QUEUE_COUNT)
+		return -EINVAL;
+	if (running && queue_id >= b->active_rx_queues)
+		return -EINVAL;
+	q = &b->rxq[queue_id];
+	live = running && b->active_rx_queues == 1 && queue_id == 0;
+
+	if (pool) {
+		if (q->xsk_pool)
+			return -EBUSY;
+		rc = xsk_pool_dma_map(pool, &b->pdev->dev, 0);
+		if (rc)
+			return rc;
+		if (live) {
+			rc = r8125_bridge_xsk_reconfig_queue(ndev, q, pool, queue_id);
+		} else if (running) {
+			bridge_ndo_stop(ndev);
+			q->xsk_pool = pool;
+			rc = bridge_ndo_open(ndev);
+			if (rc) {
+				int rollback_rc;
+
+				q->xsk_pool = NULL;
+				rollback_rc = bridge_ndo_open(ndev);
+				if (rollback_rc)
+					netdev_err(ndev,
+						   "AF_XDP bind failed (%d), page-pool rollback failed (%d)\n",
+						   rc, rollback_rc);
+			}
+		} else {
+			q->xsk_pool = pool;	/* next ndo_open builds the umem pool */
+			rc = 0;
+		}
+		if (rc) {
+			q->xsk_pool = NULL;
+			xsk_pool_dma_unmap(pool, 0);
+			return rc;
+		}
+		/* Cold start: fill ring empty -> 0 buffers posted. Ask userspace to
+		 * kick us (ndo_xsk_wakeup -> xsk_kick) once it has populated it.
+		 */
+		if (running)
+			r8125_bridge_xsk_set_rx_wakeup(ndev, queue_id, true);
+		return 0;
+	}
+
+	/* Unbind. */
+	if (!q->xsk_pool)
+		return 0;
+	pool = q->xsk_pool;
+	if (live) {
+		rc = r8125_bridge_xsk_reconfig_queue(ndev, q, NULL, queue_id);
+	} else if (running) {
+		bridge_ndo_stop(ndev);	/* frees ZC buffers; q->xsk_pool still set */
+		q->xsk_pool = NULL;
+		rc = bridge_ndo_open(ndev);	/* recreates the page_pool */
+		if (rc) {
+			int rollback_rc;
+
+			q->xsk_pool = pool;
+			rollback_rc = bridge_ndo_open(ndev);
+			if (rollback_rc)
+				netdev_err(ndev,
+					   "AF_XDP unbind failed (%d), xsk rollback failed (%d)\n",
+					   rc, rollback_rc);
+		}
+	} else {
+		q->xsk_pool = NULL;
+		rc = 0;
+	}
+	if (!rc)
+		xsk_pool_dma_unmap(pool, 0);
+	return rc;
 }
 
 /*

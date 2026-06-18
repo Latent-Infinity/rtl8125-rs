@@ -120,11 +120,17 @@ fn process_rx_completions(state: &NetdevState, queue_id: u32, budget_u: usize) -
     let Some(rx) = state.rx_queue(queue_id) else {
         return 0;
     };
-    let mut work_done = 0usize;
-    let mut rx_tail = rx.tail.inner.load(Ordering::Acquire);
     // Hoist the `ndev` atomic load out of the per-packet loop. `ndev` is
     // invariant across the whole NAPI poll call — load it once.
     let ndev = state.ndev.load(Ordering::Acquire);
+    // AF_XDP zero-copy queues use a dedicated producer/consumer poll: the slot
+    // buffers are umem chunks consumed by the XDP verdict and refilled from the
+    // fill ring, not page_pool pages handed up via build_skb.
+    if ub::bridge_rxq_is_zc(ndev, queue_id) {
+        return process_rx_completions_zc(rx, queue_id, budget_u, ndev);
+    }
+    let mut work_done = 0usize;
+    let mut rx_tail = rx.tail.inner.load(Ordering::Acquire);
     let rx_hash_enabled = state.rx_hash_enabled.load(Ordering::Relaxed);
     // Per-MTU buffer length for this open: drives both the
     // frame-length clamp and the descriptor LEN field. Invariant across
@@ -229,6 +235,140 @@ fn process_rx_completions(state: &NetdevState, queue_id: u32, budget_u: usize) -
     work_done
 }
 
+/// AF_XDP zero-copy RX poll (producer/consumer over the umem fill ring).
+///
+/// Unlike the page_pool path — which keeps every slot permanently posted and
+/// refills each slot inline as it is consumed — a ZC queue tracks a posted
+/// window `[tail, tail+posted)` of chip-owned umem buffers. The umem fill ring is
+/// usually (partly) empty at open and is topped up here / on `ndo_xsk_wakeup`.
+///
+/// Two phases:
+///   1. Consume — for each chip-filled slot at `tail` (OWN clear) inside the
+///      posted window, run the XDP verdict via the cshim (redirect to the bound
+///      socket zero-copy / copy-to-skb on PASS / drop), mark the slot empty,
+///      publish a host-owned descriptor, and advance `tail` (`posted--`).
+///   2. Refill — post fresh umem buffers at the far edge of the window
+///      (`(tail+posted) % RING_LEN`) until the ring is full or the fill ring is
+///      exhausted (then `ndo_xsk_wakeup` re-kicks the poll later).
+fn process_rx_completions_zc(
+    rx: &crate::netdev::RxQueueState,
+    queue_id: u32,
+    budget_u: usize,
+    ndev: *mut kernel::bindings::net_device,
+) -> usize {
+    // Serialise against ndo_xsk_wakeup's synchronous refill (which runs in
+    // process context, possibly on another CPU). On contention the wakeup is
+    // already refilling this ring, so skip — the next poll/IRQ re-runs us.
+    if !rx.try_xsk_lock() {
+        return 0;
+    }
+    let mut work_done = 0usize;
+    let mut rx_tail = rx.tail.inner.load(Ordering::Acquire);
+    let mut posted = rx.posted.inner.load(Ordering::Relaxed);
+    let buf_len = rx.buf_len.load(Ordering::Relaxed) as usize;
+    let parse = crate::ring::RxParse::new(rx.format);
+    let rx_ring = rx.desc.cast::<u8>();
+
+    // Phase 1: consume chip-filled slots in the posted window.
+    while work_done < budget_u && posted > 0 {
+        if ub::rx_read_opts1(rx_ring, rx_tail, &parse) & regs::DESC_OWN != 0 {
+            break; // chip still owns `tail` — nothing newly filled
+        }
+        ub::dma_rmb();
+        let completion = ub::rx_read_completion(rx_ring, rx_tail, &parse);
+        let len = core::cmp::min(completion.len, buf_len);
+        let slot_cpu = rx.slot_cpu[rx_tail].load(Ordering::Relaxed);
+        if !slot_cpu.is_null() {
+            if len > 0 {
+                ub::bridge_xsk_rx_consume(ndev, queue_id, slot_cpu, len);
+            } else {
+                // Zero-length completion: recycle the umem chunk, deliver nothing.
+                ub::rx_free(ndev, queue_id, slot_cpu);
+            }
+        }
+        // Slot is now empty; publish a host-owned (no buffer) descriptor so the
+        // chip cannot DMA into the consumed buffer before the refill re-posts it.
+        rx.set_slot(rx_tail, crate::netdev::RxSlot::EMPTY);
+        let mut opts1 = 0u32;
+        if rx_tail == RING_LEN - 1 {
+            opts1 |= regs::DESC_EOR;
+        }
+        ub::desc_publish_own(
+            rx_ring,
+            rx_tail,
+            crate::ring::Descriptor {
+                opts1,
+                opts2: 0,
+                addr: 0,
+            },
+            rx.format,
+        );
+        rx_tail = (rx_tail + 1) % RING_LEN;
+        posted -= 1;
+        work_done += 1;
+    }
+    // Publish the consumer position before the refill reads it.
+    rx.tail.inner.store(rx_tail, Ordering::Release);
+    rx.posted.inner.store(posted, Ordering::Relaxed);
+
+    // Phase 2: refill the empty window from the umem fill ring (the same routine
+    // ndo_xsk_wakeup uses for the cold-start kick).
+    zc_refill_locked(rx, queue_id, ndev);
+
+    rx.xsk_unlock();
+    work_done
+}
+
+/// Post fresh umem buffers into the ZC RX ring's empty window
+/// `[(tail + posted) ..)` until the ring is full or the umem fill ring is
+/// exhausted, then advertise RX need-wakeup accordingly. The CALLER must hold the
+/// queue's `xsk_lock`. This is the single refill shared by the NAPI poll and
+/// `ndo_xsk_wakeup`'s synchronous cold-start kick (via `rust_xsk_kick`) — the
+/// chip can take no RX IRQ with an empty ring, so the wakeup must post buffers
+/// itself rather than only scheduling NAPI.
+pub(crate) fn zc_refill_locked(
+    rx: &crate::netdev::RxQueueState,
+    queue_id: u32,
+    ndev: *mut kernel::bindings::net_device,
+) {
+    let rx_tail = rx.tail.inner.load(Ordering::Acquire);
+    let mut posted = rx.posted.inner.load(Ordering::Relaxed);
+    let buf_desc_len = rx.buf_len.load(Ordering::Relaxed) & regs::DESC_LEN_MASK;
+    let rx_ring = rx.desc.cast::<u8>();
+    let mut fill_exhausted = false;
+    while posted < RING_LEN {
+        match ub::rx_alloc(ndev, queue_id) {
+            Ok((cpu, dma)) => {
+                let idx = (rx_tail + posted) % RING_LEN;
+                rx.set_slot(idx, crate::netdev::RxSlot { cpu, dma });
+                let mut opts1 = regs::DESC_OWN | buf_desc_len;
+                if idx == RING_LEN - 1 {
+                    opts1 |= regs::DESC_EOR;
+                }
+                ub::desc_publish_own(
+                    rx_ring,
+                    idx,
+                    crate::ring::Descriptor {
+                        opts1,
+                        opts2: 0,
+                        addr: dma,
+                    },
+                    rx.format,
+                );
+                posted += 1;
+            }
+            Err(_) => {
+                fill_exhausted = true;
+                break; // fill ring empty — userspace re-kicks after replenishing
+            }
+        }
+    }
+    rx.posted.inner.store(posted, Ordering::Relaxed);
+    // Tell userspace to kick us (ndo_xsk_wakeup) once it replenishes the fill
+    // ring; clear the flag while we still have buffers to post into.
+    ub::bridge_xsk_set_rx_wakeup(ndev, queue_id, fill_exhausted);
+}
+
 /// Walk TX from `state.tx.tail` toward `state.tx.head`; for each
 /// descriptor whose OWN bit hardware cleared, unmap the matching shadow
 /// DMA mapping and `napi_consume_skb` the LastFrag-slot skb. Returns
@@ -247,6 +387,9 @@ fn process_tx_completions(state: &NetdevState) -> (usize, usize, usize) {
     let mut completed_pkts = 0usize;
     let mut completed_bytes = 0usize;
     let mut completed_budget_bytes = 0usize;
+    // AF_XDP zero-copy TX completions, batched per RX queue id (the pool that
+    // owns the umem chunk), drained to xsk_tx_completed after the reap loop.
+    let mut xsk_completed = [0u32; crate::netdev::RX_QUEUE_COUNT];
     while tx_tail != tx_head {
         let slot = tx_tail % RING_LEN;
         let desc = ub::desc_read(state.tx.desc, slot);
@@ -287,6 +430,17 @@ fn process_tx_completions(state: &NetdevState) -> (usize, usize, usize) {
                 // disposition invariant — no tx_consumed / BQL / byte-budget.
                 if !raw.is_null() {
                     ub::xdp_return_frame(raw.cast());
+                }
+            }
+            crate::netdev::TxSlotKind::XskTx => {
+                // AF_XDP zero-copy TX completion: the descriptor addr was a umem
+                // chunk owned by the socket (no skb / xdp_frame, no per-frame DMA
+                // unmap — shadow_len was 0 above). Tally it against the owning
+                // queue's pool; xsk_tx_completed runs once per queue after the
+                // loop. Not part of the skb disposition invariant.
+                let qid = state.tx.shadow_xsk_qid[slot].load(Ordering::Acquire) as usize;
+                if qid < xsk_completed.len() {
+                    xsk_completed[qid] += 1;
                 }
             }
             crate::netdev::TxSlotKind::Skb => {
@@ -344,6 +498,12 @@ fn process_tx_completions(state: &NetdevState) -> (usize, usize, usize) {
     // skips MSI delivery; see crate::netdev::bql_active + docs/perf/bql_20260605/.
     if completed_pkts > 0 && crate::netdev::bql_active(state) {
         ub::netdev_completed_queue(ndev, completed_pkts, completed_bytes);
+    }
+    // Drain AF_XDP zero-copy TX completions back to each socket's completion ring.
+    for (qid, &count) in xsk_completed.iter().enumerate() {
+        if count > 0 {
+            ub::bridge_xsk_tx_completed(ndev, qid as u32, count);
+        }
     }
     (tx_tail, tx_head, reaped)
 }
@@ -404,6 +564,24 @@ pub(crate) fn poll(state: &NetdevState, queue_id: u32, budget: c_int) -> c_int {
             if crate::netdev::tx_should_wake(state, free) {
                 let ndev = state.ndev.load(Ordering::Acquire);
                 ub::bridge_tx_wake_queue(ndev);
+            }
+        }
+    }
+
+    // AF_XDP zero-copy TX: drain this queue's bound socket TX ring onto the
+    // shared TX ring. Bounded by the free TX-ring slots so the C producer never
+    // overflows (any residual xmit race just breaks the drain early). The TX ring
+    // is reaped by queue 0, but any ZC queue may produce here under the txq lock.
+    if budget_u > 0 {
+        let ndev = state.ndev.load(Ordering::Acquire);
+        if ub::bridge_rxq_is_zc(ndev, queue_id) {
+            let head = state.tx.head.inner.load(Ordering::Acquire);
+            let tail = state.tx.tail.inner.load(Ordering::Acquire);
+            let in_flight = head.wrapping_sub(tail);
+            let free = (RING_LEN - 1).saturating_sub(in_flight);
+            let tx_budget = core::cmp::min(free, budget_u);
+            if tx_budget > 0 {
+                ub::bridge_xsk_tx(ndev, queue_id, tx_budget as i32);
             }
         }
     }

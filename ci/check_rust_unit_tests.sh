@@ -24,7 +24,7 @@ fi
 
 # Kernel-free, host-testable modules. Each MUST carry #[cfg(test)] tests and
 # pass `rustc --test`. Add new pure modules here as they are extracted.
-MODULES=("src/layout.rs" "src/phy_config.rs" "src/phy_fw.rs" "src/rss.rs")
+MODULES=("src/layout.rs" "src/led.rs" "src/phy_config.rs" "src/phy_fw.rs" "src/rss.rs")
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 

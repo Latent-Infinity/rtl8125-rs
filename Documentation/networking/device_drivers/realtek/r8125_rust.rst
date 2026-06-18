@@ -117,7 +117,8 @@ XDP
 ===
 
 ``xdp_features`` advertises ``NETDEV_XDP_ACT_BASIC |
-NETDEV_XDP_ACT_REDIRECT | NETDEV_XDP_ACT_NDO_XMIT``:
+NETDEV_XDP_ACT_REDIRECT | NETDEV_XDP_ACT_NDO_XMIT |
+NETDEV_XDP_ACT_XSK_ZEROCOPY``:
 
   - ``XDP_PASS`` / ``XDP_DROP`` / ``XDP_ABORTED`` on the RX read path.
   - ``XDP_TX`` reflects the frame out the same port: the buffer is
@@ -130,19 +131,42 @@ NETDEV_XDP_ACT_REDIRECT | NETDEV_XDP_ACT_NDO_XMIT``:
     ``xdp_frame``\ s another device redirected to us, sharing the
     ``XDP_TX`` TX-ring producer; foreign frames return to their origin
     pool via the frame's own mem model.
-  - Copy-mode AF_XDP works (a consequence of advertising
+  - AF_XDP zero-copy (``XDP_SETUP_XSK_POOL`` + ``ndo_xsk_wakeup``): a bound
+    umem pool feeds a per-queue RX producer/consumer ring (the xsk kernel
+    API lives in the ``netdev_bridge_xsk.c`` cshim; the fill-cursor ring
+    discipline is safe Rust). ``XDP_REDIRECT`` to the socket is zero-copy;
+    ``XDP_PASS`` copies the umem chunk into a normal skb. ZC TX pulls from
+    the socket TX ring onto the shared TX ring (tagged ``XskTx`` so the
+    reaper completes each chunk back to the socket's completion ring).
+  - Copy-mode AF_XDP also works (a consequence of advertising
     ``BASIC | REDIRECT``).
 
-Not yet implemented: RX multi-buffer XDP for jumbo frames, and AF_XDP
-zero-copy. Their ``xdp_features`` bits stay clear so the advertised set
-is exactly what works.
+Not yet implemented: RX multi-buffer XDP for jumbo frames (per-MTU
+single buffers already cover jumbo, so this is moot for the supported
+MTUs). Its ``xdp_features`` bit stays clear so the advertised set is
+exactly what works.
+
+LEDs
+====
+
+The four chip LEDs are exposed as ``led_classdev`` devices
+(``/sys/class/leds/r8125_rust-<iface>:lan:<0..3>``) with the standard
+``netdev`` LED trigger offloaded to hardware: setting the trigger's
+``link_10`` / ``link_100`` / ``link_1000`` / ``link_2500`` and combined
+``tx`` + ``rx`` (activity) attributes programs the chip LEDSEL register so
+the LED is driven by hardware. Requires ``CONFIG_LEDS_CLASS`` and
+``CONFIG_LEDS_TRIGGER_NETDEV``.
 
 Limitations
 ===========
 
-  - **No AF_XDP zero-copy yet.** Copy-mode AF_XDP works (it follows from
-    advertising ``BASIC | REDIRECT``); zero-copy is follow-up work and its
-    ``xdp_features`` bit is not advertised.
+  - **AF_XDP zero-copy** (RX + TX) is implemented, advertised
+    (``NETDEV_XDP_ACT_XSK_ZEROCOPY``), and validated on-wire. Binding/unbinding a
+    socket swaps only that queue's RX pool in place (the chip RX engine is briefly
+    cycled while TX/PHY/IRQ stay up), so the link does **not** drop on bind. It
+    shares the single TX ring with the skb and XDP_TX producers under the txq
+    lock; multi-socket ZC TX across several RX queues is supported but the common
+    single-queue path is the validated one.
   - **System suspend / resume and Wake-on-LAN wake** are gated behind a
     kernel-Rust PCI PM extension (built with ``make PCI_PM=1`` against a
     patched kernel); the default in-tree build does not register ``pm`` ops.

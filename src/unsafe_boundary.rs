@@ -224,6 +224,13 @@ pub(crate) struct BridgeOps {
     /// interface is running so the hardware filter tracks the new address
     /// without waiting for the next open.
     pub set_mac_filter: extern "C" fn(cookie: *mut c_void),
+    /// LED netdev-trigger offload write: set LED `index`'s LEDSEL select field to
+    /// `mode` (the cshim built it from the kernel `TRIGGER_NETDEV_*` flags).
+    /// Returns 0 or `-EINVAL` for an out-of-range index.
+    pub led_set_mode: extern "C" fn(cookie: *mut c_void, index: u32, mode: u16) -> c_int,
+    /// LED netdev-trigger offload read-back: return LED `index`'s active LEDSEL
+    /// select field (`>= 0`), or `-EINVAL` for an out-of-range index.
+    pub led_get_mode: extern "C" fn(cookie: *mut c_void, index: u32) -> c_int,
     /// XDP_TX producer — enqueue one already-`DMA_TO_DEVICE`-mapped `xdp_frame`
     /// on the TX ring. Called from the C XDP verdict path under the txq lock.
     /// `frame` is the `xdp_frame*` the reaper returns via `xdp_return_frame`.
@@ -237,6 +244,28 @@ pub(crate) struct BridgeOps {
     /// Ring the TX doorbell once at NAPI-poll end if any XDP_TX frame was
     /// enqueued this poll. Called from `r8125_bridge_xdp_finalize`.
     pub xdp_tx_flush: extern "C" fn(cookie: *mut c_void),
+    /// AF_XDP zero-copy TX producer — enqueue one umem chunk (already
+    /// `DMA_TO_DEVICE`-synced by the cshim) on the TX ring, tagged for xsk
+    /// completion on RX `queue_id`'s bound pool. Called from `r8125_bridge_xsk_tx`
+    /// while it holds the txq lock. Returns 0 on enqueue, `-ENOSPC` if full.
+    pub xsk_xmit_one:
+        extern "C" fn(cookie: *mut c_void, umem_dma: u64, len: u32, queue_id: u32) -> c_int,
+    /// AF_XDP zero-copy RX cold-start kick — synchronously post umem buffers into
+    /// the ZC RX ring from the fill ring. Called from `ndo_xsk_wakeup`; the chip
+    /// can take no RX IRQ with an empty ring, so the wakeup must post buffers
+    /// itself rather than only scheduling NAPI.
+    pub xsk_kick: extern "C" fn(cookie: *mut c_void, queue_id: u32),
+    /// Live per-queue RX reconfigure, phase 1 (quiesce): disable the chip RX
+    /// engine (TX/PHY/IRQ stay up) and free this queue's RX buffers + pool using
+    /// the CURRENT pool type. Called under RTNL with NAPI disabled, BEFORE the
+    /// caller toggles `q->xsk_pool`. Lets an AF_XDP bind/unbind swap one queue's
+    /// RX pool WITHOUT a full stop+open (no ~4s link-down).
+    pub rx_quiesce: extern "C" fn(cookie: *mut c_void, queue_id: u32),
+    /// Live per-queue RX reconfigure, phase 2 (restore): create this queue's RX
+    /// pool for the NOW-current type, re-post its descriptors, reset the chip RX
+    /// head, and re-enable the RX engine. Called AFTER the caller toggles
+    /// `q->xsk_pool`. Returns 0 or a negative errno (RX left disabled on error).
+    pub rx_restore: extern "C" fn(cookie: *mut c_void, queue_id: u32) -> c_int,
 }
 
 // Bindgen emits `pci_dev` / `net_device` / `sk_buff` as opaque
@@ -265,9 +294,14 @@ extern "C" {
     );
     fn r8125_bridge_set_active_rx_queues(ndev: *mut bindings::net_device, n: c_uint);
     fn r8125_bridge_dev_addr(ndev: *mut bindings::net_device, out: *mut u8);
-    #[cfg(r8125_pci_pm)]
+    #[cfg(any(
+        r8125_pci_pm,
+        r8125_pci_shutdown,
+        r8125_pci_reset,
+        r8125_pci_runtime_pm
+    ))]
     fn r8125_bridge_pm_suspend(ndev: *mut bindings::net_device);
-    #[cfg(r8125_pci_pm)]
+    #[cfg(any(r8125_pci_pm, r8125_pci_reset, r8125_pci_runtime_pm))]
     fn r8125_bridge_pm_resume(ndev: *mut bindings::net_device) -> c_int;
     fn r8125_bridge_irq_pin_cpu(irq: u32, cpu: c_int) -> c_int;
     fn r8125_bridge_irq_clear_hint(irq: u32);
@@ -378,6 +412,30 @@ extern "C" {
         out_dma: *mut bindings::dma_addr_t,
     ) -> c_int;
     fn r8125_bridge_rx_free(ndev: *mut bindings::net_device, queue_id: c_uint, cpu: *mut c_void);
+    // AF_XDP zero-copy RX consume: run the XDP verdict on a received umem chunk
+    // (`cpu` = its xdp_buff) and dispose it (redirect to socket / copy to skb /
+    // free). Consume-only; the Rust producer/consumer poll refills via rx_alloc.
+    fn r8125_bridge_xsk_rx_consume(
+        ndev: *mut bindings::net_device,
+        queue_id: c_uint,
+        cpu: *mut c_void,
+        len: usize,
+    );
+    // AF_XDP zero-copy TX drain: enqueue up to `budget` umem chunks from the
+    // bound socket's TX ring onto the shared TX ring. Returns the count enqueued.
+    fn r8125_bridge_xsk_tx(
+        ndev: *mut bindings::net_device,
+        queue_id: c_uint,
+        budget: c_int,
+    ) -> c_int;
+    // Complete `count` zero-copy TX chunks back to the socket's completion ring.
+    fn r8125_bridge_xsk_tx_completed(ndev: *mut bindings::net_device, queue_id: c_uint, count: u32);
+    // RX need-wakeup toggle for the bound pool (fill-ring exhausted / replenished).
+    fn r8125_bridge_xsk_set_rx_wakeup(
+        ndev: *mut bindings::net_device,
+        queue_id: c_uint,
+        need: bool,
+    );
 
     // RX super-call: zero-copy napi_build_skb +
     // page-pool recycle, with alloc-before-consume refill. Outputs the
@@ -400,6 +458,9 @@ extern "C" {
     // MTU change; see `netdev::rust_change_mtu`). The reopen bracket lives
     // in C so the napi_disable/enable discipline matches ndo_open/stop.
     fn r8125_bridge_netif_running(ndev: *mut bindings::net_device) -> bool;
+    // True when an AF_XDP umem pool is bound to this RX queue (zero-copy). The
+    // Rust RX allocate/pre-post/poll paths read it to take the ZC branch.
+    fn r8125_bridge_rxq_is_zc(ndev: *mut bindings::net_device, queue_id: c_uint) -> bool;
     fn r8125_bridge_reopen_for_mtu(ndev: *mut bindings::net_device, new_mtu: c_int) -> c_int;
 }
 
@@ -631,6 +692,54 @@ pub(crate) fn rx_alloc(
     };
     to_result(rc)?;
     Ok((cpu, dma))
+}
+
+/// AF_XDP zero-copy RX consume: run the XDP verdict on the received umem chunk
+/// (`cpu` is its `xdp_buff`, `len` the frame length) and dispose it. The slot is
+/// empty afterwards; the caller refills it via `rx_alloc`. NAPI-poll context only.
+///
+/// # SAFETY: `ndev` is the registered net_device; `cpu` is an `xdp_buff` from a
+/// prior `rx_alloc` on the live xsk pool; `len` ≤ the umem chunk size.
+pub(crate) fn bridge_xsk_rx_consume(
+    ndev: *mut bindings::net_device,
+    queue_id: u32,
+    cpu: *mut c_void,
+    len: usize,
+) {
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_xsk_rx_consume(ndev, queue_id as c_uint, cpu, len) };
+}
+
+/// AF_XDP zero-copy TX drain: enqueue up to `budget` umem chunks from the bound
+/// socket's TX ring. Returns the count enqueued. NAPI-poll context; `budget` must
+/// be ≤ the free TX-ring slots so the producer never overflows. # SAFETY: `ndev`
+/// is the registered net_device with a pool bound to `queue_id`.
+pub(crate) fn bridge_xsk_tx(ndev: *mut bindings::net_device, queue_id: u32, budget: i32) -> i32 {
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_xsk_tx(ndev, queue_id as c_uint, budget as c_int) }
+}
+
+/// Complete `count` zero-copy TX chunks to the socket's completion ring. Called
+/// from the TX reaper. # SAFETY: `ndev` is the registered net_device; `count` is
+/// the number of XskTx slots reaped for `queue_id` this pass.
+pub(crate) fn bridge_xsk_tx_completed(ndev: *mut bindings::net_device, queue_id: u32, count: u32) {
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_xsk_tx_completed(ndev, queue_id as c_uint, count) };
+}
+
+/// Toggle RX need-wakeup on the bound pool (umem fill ring exhausted/replenished).
+/// # SAFETY: `ndev` is the registered net_device.
+pub(crate) fn bridge_xsk_set_rx_wakeup(ndev: *mut bindings::net_device, queue_id: u32, need: bool) {
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_xsk_set_rx_wakeup(ndev, queue_id as c_uint, need) };
+}
+
+/// True when an AF_XDP umem pool is bound to this RX queue (zero-copy RX). The
+/// Rust RX path branches on it to allocate from / refill the umem pool.
+pub(crate) fn bridge_rxq_is_zc(ndev: *mut bindings::net_device, queue_id: u32) -> bool {
+    // SAFETY: `ndev` is the registered net_device; the call only reads a bridge
+    // field and bounds-checks queue_id.
+    unsafe { r8125_bridge_rxq_is_zc(ndev, queue_id as c_uint) }
 }
 
 /// Return one slot's page to the pool. Idempotent against a null `cpu`
@@ -977,7 +1086,15 @@ pub(crate) fn bridge_dev_addr(ndev: *mut bindings::net_device) -> [u8; 6] {
 /// # SAFETY: `ndev` is the registered net_device (or null after teardown; the
 /// cshim no-ops on a down/detached device). Called from the PM callback while
 /// the device is still bound.
-#[cfg(r8125_pci_pm)]
+// Shared by every PCI hook that quiesces the device: PM suspend (r8125_pci_pm),
+// .shutdown (r8125_pci_shutdown), function reset (r8125_pci_reset), and runtime
+// PM (r8125_pci_runtime_pm). All reuse the same quiesce.
+#[cfg(any(
+    r8125_pci_pm,
+    r8125_pci_shutdown,
+    r8125_pci_reset,
+    r8125_pci_runtime_pm
+))]
 pub(crate) fn bridge_pm_suspend(ndev: *mut bindings::net_device) {
     if ndev.is_null() {
         return;
@@ -991,8 +1108,9 @@ pub(crate) fn bridge_pm_suspend(ndev: *mut bindings::net_device) {
 /// cshim leaves the device detached in that case rather than reattaching a dead
 /// interface).
 ///
-/// # SAFETY: see [`bridge_pm_suspend`].
-#[cfg(r8125_pci_pm)]
+/// # SAFETY: see [`bridge_pm_suspend`]. Shared by PM resume, function-reset
+/// reset_done, and runtime PM resume.
+#[cfg(any(r8125_pci_pm, r8125_pci_reset, r8125_pci_runtime_pm))]
 pub(crate) fn bridge_pm_resume(ndev: *mut bindings::net_device) -> Result {
     if ndev.is_null() {
         return Ok(());

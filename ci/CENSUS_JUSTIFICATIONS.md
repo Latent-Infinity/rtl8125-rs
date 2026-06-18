@@ -543,3 +543,25 @@ Net +1 `unsafe { ... }` block in `src/unsafe_boundary.rs`:
   register programming is safe Rust in `src/netdev.rs`, using existing `mmio`
   accessors for Config1/2, PMCH, RCR, and the existing `set_wol` path — no new
   unsafe.)
+
+## 2026-06-16 — AF_XDP zero-copy datapath bump 90 → 95
+
+Net +5 `unsafe { ... }` blocks in `src/unsafe_boundary.rs`, all thin FFI wrappers
+over the new `netdev_bridge_xsk.c` cshim. The xsk kernel-API knowledge
+(`xsk_buff_*`, `xsk_tx_peek_desc`, `xsk_pool_dma_map`, need-wakeup) stays entirely
+in the C bridge; the Rust producer/consumer ring discipline (the fill-cursor poll
+in `src/napi.rs`, the `XskTx` TX slot kind) is safe Rust. The wrappers only move a
+buffer pointer / DMA address / count across the boundary:
+
+- ADDED `bridge_xsk_rx_consume(ndev, qid, cpu, len)` — run the XDP verdict on a
+  received umem chunk (`cpu` = its `xdp_buff`) and dispose it. SAFETY: `cpu` came
+  from a prior `rx_alloc` on the live pool; `len` ≤ the umem chunk size; NAPI ctx.
+- ADDED `bridge_xsk_tx(ndev, qid, budget)` — drain up to `budget` umem chunks from
+  the bound socket TX ring onto the shared TX ring. SAFETY: `budget` ≤ free TX
+  slots (bounded by the caller) so the producer never overflows; NAPI ctx.
+- ADDED `bridge_xsk_tx_completed(ndev, qid, count)` — complete `count` ZC TX chunks
+  to the socket completion ring. SAFETY: `count` = XskTx slots reaped this pass.
+- ADDED `bridge_xsk_set_rx_wakeup(ndev, qid, need)` — toggle RX need-wakeup when
+  the umem fill ring is exhausted/replenished. SAFETY: reads only the bound pool.
+- ADDED `bridge_rxq_is_zc(ndev, qid)` — read whether a ZC pool is bound to the
+  queue (drives the RX branch). SAFETY: bounds-checks qid, reads one bridge field.

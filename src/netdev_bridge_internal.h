@@ -21,6 +21,8 @@
  * the userspace `ethtool -S` surface.
  */
 struct page_pool;	/* zero-copy RX buffer owner (netdev_bridge_rx_pool.c) */
+struct xsk_buff_pool;	/* AF_XDP umem pool (netdev_bridge_xsk.c) */
+struct xdp_buff;
 
 /* Compile-time maximum RX queues = NAPI instances + per-queue state allocated.
  * RTL8125B HwSuppNumRxQueues is 4. The RUNTIME active count lives in
@@ -64,6 +66,14 @@ struct r8125_bridge_rx_queue {
 	struct xdp_rxq_info xdp_rxq;
 	bool xdp_rxq_registered;
 	bool xdp_redirect_pending;
+
+	/* AF_XDP zero-copy (netdev_bridge_xsk.c). When an xsk umem pool is bound to
+	 * this queue, xsk_pool is non-NULL and the RX alloc/refill/completion path
+	 * uses xsk_buff_* instead of the page_pool (the page_pool is not created for
+	 * a ZC queue). NULL = normal page_pool RX. Bound/unbound only under RTNL via
+	 * XDP_SETUP_XSK_POOL, which reconfigures the queue (stop+open).
+	 */
+	struct xsk_buff_pool *xsk_pool;
 	/* Set by an XDP_TX verdict during the poll; drives a single TX doorbell
 	 * (ops.xdp_tx_flush) at poll end so the posted XDP_TX descriptors are
 	 * signalled to hardware exactly once per poll.
@@ -128,6 +138,18 @@ struct r8125_bridge {
 	 */
 	struct work_struct reset_work;
 
+	/* LED class devices for the chip's PHY LEDs (netdev_bridge_leds.c). Opaque
+	 * array allocated at register, unregistered + freed at teardown; NULL if LED
+	 * init failed (best-effort, like mainline). See r8125_bridge_init_leds.
+	 */
+	void *leds;
+
+	/* devlink instance + TX health reporter (netdev_bridge_devlink.c). Opaque
+	 * handle allocated at register, freed at teardown; NULL if devlink init
+	 * failed (best-effort — the driver then uses the direct-reopen recovery).
+	 */
+	void *devlink;
+
 	/* Coherent buffer for the hardware tally-counter dump (ndo_get_stats64).
 	 * Allocated once at probe, reused per stats call, freed at teardown.
 	 * tally_vaddr is NULL if the allocation failed (tally stats then skipped).
@@ -160,6 +182,44 @@ extern const struct ethtool_ops r8125_bridge_ethtool_ops;
  */
 int  r8125_bridge_counters_alloc(struct r8125_bridge *b);
 void r8125_bridge_counters_free(struct r8125_bridge *b);
+
+/* PHY LED netdev-trigger offload (netdev_bridge_leds.c). init registers the LED
+ * class devices (best-effort, returns NULL on failure); remove unregisters +
+ * frees them. The opaque pointer is stored in r8125_bridge.leds.
+ */
+void *r8125_bridge_init_leds(struct net_device *ndev);
+void r8125_bridge_remove_leds(void *leds);
+
+/* devlink instance + TX health reporter (netdev_bridge_devlink.c). init allocs +
+ * registers (best-effort, NULL on failure); remove tears down; report_tx_timeout
+ * records a TX-watchdog error and auto-recovers via the reporter (chip reopen).
+ */
+void *r8125_bridge_devlink_init(struct net_device *ndev);
+void r8125_bridge_devlink_remove(void *cookie);
+void r8125_bridge_devlink_report_tx_timeout(void *cookie);
+
+/* AF_XDP zero-copy (netdev_bridge_xsk.c). xsk_pool_setup binds/unbinds an xsk
+ * umem pool to a queue (XDP_SETUP_XSK_POOL); the rest are the ZC datapath the
+ * page_pool RX path delegates to when q->xsk_pool is set, plus ndo_xsk_wakeup.
+ */
+int  r8125_bridge_xsk_pool_setup(struct net_device *ndev,
+				 struct xsk_buff_pool *pool, unsigned int queue_id);
+bool r8125_bridge_rxq_is_zc(struct net_device *ndev, unsigned int queue_id);
+int  r8125_bridge_xsk_wakeup(struct net_device *ndev, unsigned int queue_id,
+			     u32 flags);
+int  r8125_bridge_xsk_rxq_reg(struct net_device *ndev, unsigned int queue_id);
+int  r8125_bridge_xsk_rx_alloc(struct net_device *ndev, unsigned int queue_id,
+			       void **out_cpu, dma_addr_t *out_dma);
+void r8125_bridge_xsk_rx_free(struct net_device *ndev, unsigned int queue_id,
+			      void *cpu);
+void r8125_bridge_xsk_rx_consume(struct net_device *ndev, unsigned int queue_id,
+				 void *cpu, size_t len);
+int  r8125_bridge_xsk_tx(struct net_device *ndev, unsigned int queue_id,
+			 int budget);
+void r8125_bridge_xsk_tx_completed(struct net_device *ndev, unsigned int queue_id,
+				   u32 count);
+void r8125_bridge_xsk_set_rx_wakeup(struct net_device *ndev, unsigned int queue_id,
+				    bool need);
 
 /* XDP datapath glue (netdev_bridge_xdp.c). xdp_run is the per-packet verdict
  * called from rx_one_packet; the rest manage the xdp_rxq lifecycle, the

@@ -1,0 +1,49 @@
+W2.1 — PCI .shutdown (reboot/kexec quiesce) — status 2026-06-18
+==============================================================
+
+Adds a `.shutdown` hook to the kernel-Rust PCI abstraction + the driver, so the
+chip is quiesced (DMA stopped, IRQs masked) on reboot / kexec / poweroff. Mainline
+r8169 wires `.shutdown` for the same reason (a NIC DMAing across a kexec into the
+next kernel's memory is a known corruption source). Mirrors the landed 0001 PM
+patch exactly.
+
+Pieces:
+ - kernel-patches/0002-rust-pci-add-shutdown-callback.patch: adds
+   `pci::Driver::shutdown` (default no-op), the `shutdown_callback` thunk (takes a
+   `pci_dev*` like remove, returns void), and the
+   `(*pdrv.get()).shutdown = Some(Self::shutdown_callback)` registration. Applied
+   to the gateway kernel tree (rust/kernel/pci.rs) and the kasan kernel rebuilt.
+ - src/pci.rs: cfg-gated `fn shutdown` (r8125_pci_shutdown) reusing the
+   already-validated `bridge_pm_suspend` quiesce (does NOT drop DriverData).
+ - Makefile: `SHUTDOWN=1` -> `--cfg=r8125_pci_shutdown` (mirrors PCI_PM=1).
+ - unsafe_boundary: `bridge_pm_suspend` + `NetdevHandle::ndev` cfgs widened to
+   `any(r8125_pci_pm, r8125_pci_shutdown)` so the quiesce is reachable from either
+   hook.
+
+Build/load:
+ - Kernel rebuilt (rust/ + vmlinux relink, ~80s incremental); driver built with
+   `make SHUTDOWN=1` (the registration compiled in); rmmod/insmod clean, bound to
+   enp3s0. Default `make` (no cfg) stays stock-kernel buildable; CI 406/0.
+
+Validation (and a rig limitation, honestly):
+ - The module registers pci_driver.shutdown; the C PCI core's device_shutdown()
+   unconditionally invokes every bound driver's .shutdown on reboot/kexec — this
+   is core, non-driver-specific behavior.
+ - A reboot with the SHUTDOWN=1 module loaded completed CLEANLY in ~120s. A
+   .shutdown that hung would have stalled the reboot indefinitely (exactly what
+   the earlier devlink self-deadlock did) — it did not, so the handler ran without
+   hanging.
+ - The quiesce it performs is the IDENTICAL, fully-validated PM suspend path
+   (bridge_pm_suspend; see wol_wake_s3_external_sender.txt + PM validation).
+ - POSITIVE printk capture of the shutdown marker was NOT achievable on this rig:
+   device_shutdown() runs after journald has stopped (so journalctl -b -1 misses
+   it), there is no pstore/ramoops console capture, and netconsole produces no
+   output over this driver (it has no netpoll/ndo_poll_controller support — that
+   is W3.5, deferred; a plain-UDP test over the same link succeeded, confirming
+   the path, but netconsole's netpoll TX emitted nothing). So the evidence is
+   wired-correctly + clean-non-hanging-reboot + identical-validated-quiesce, not a
+   captured log line.
+
+Note discovered: netconsole does not work over r8125_rust (no netpoll support).
+That is the deferred W3.5 (netpoll/netconsole) — recorded so a future netconsole
+need knows to implement ndo_poll_controller / the netpoll TX path first.

@@ -304,6 +304,11 @@ pub(crate) enum TxSlotKind {
     /// `shadow` is an `xdp_frame*` from an XDP_TX verdict; release via
     /// `xdp_return_frame` (its mem model returns the page to the RX page_pool).
     Xdp = 1,
+    /// AF_XDP zero-copy TX: the descriptor addr is a umem chunk owned by the
+    /// socket (no skb / xdp_frame, no per-frame DMA to unmap). At completion the
+    /// reaper signals the chunk back to the socket's completion ring via
+    /// `xsk_tx_completed` on the pool bound to `shadow_xsk_qid[slot]`.
+    XskTx = 2,
 }
 
 impl TxSlotKind {
@@ -314,6 +319,7 @@ impl TxSlotKind {
     pub(crate) fn from_u8(v: u8) -> Self {
         match v {
             1 => TxSlotKind::Xdp,
+            2 => TxSlotKind::XskTx,
             _ => TxSlotKind::Skb,
         }
     }
@@ -352,6 +358,11 @@ pub(crate) struct TxRingState {
     /// misread. Both producers run under the txq lock; the reaper is the sole
     /// reader/resetter, so plain Acquire/Release ordering suffices.
     pub(crate) shadow_kind: [AtomicU8; RING_LEN],
+
+    /// Per-slot RX queue id whose xsk pool owns an `XskTx` slot's umem chunk, so
+    /// the reaper completes it back to the right socket (`xsk_tx_completed`).
+    /// Only meaningful when `shadow_kind[slot] == XskTx`; ignored otherwise.
+    pub(crate) shadow_xsk_qid: [AtomicU8; RING_LEN],
 
     /// Producer index (advanced by `ndo_start_xmit`). Cache-padded per
     /// RUST_STANDARDS.md §15.2 — written by xmit, read by NAPI poll.
@@ -405,6 +416,9 @@ impl TxRingState {
             ),
             shadow_kind <- pin_init::init_array_from_fn(
                 |_| AtomicU8::new(TxSlotKind::Skb as u8)
+            ),
+            shadow_xsk_qid <- pin_init::init_array_from_fn(
+                |_| AtomicU8::new(0)
             ),
             head: CachePadded::new(AtomicUsize::new(0)),
             tail: CachePadded::new(AtomicUsize::new(0)),
@@ -461,6 +475,20 @@ pub(crate) struct RxQueueState {
     /// RX consumer index (advanced by the NAPI RX path). Cache-padded so
     /// the RX hot loop's index doesn't ping-pong with TX indices.
     pub(crate) tail: CachePadded<AtomicUsize>,
+    /// AF_XDP zero-copy producer cursor: count of currently chip-owned RX
+    /// buffers (OWN-set), occupying the contiguous window `[tail, tail+posted)`
+    /// mod RING_LEN. Only the ZC poll path reads/writes it (same context as
+    /// `tail`); the page_pool path keeps the ring permanently full and ignores
+    /// it. At a ZC open the fill ring is usually empty, so `posted` starts below
+    /// RING_LEN and the poll / ndo_xsk_wakeup tops it up from the umem.
+    pub(crate) posted: CachePadded<AtomicUsize>,
+    /// AF_XDP zero-copy ring try-lock. The ZC ring has two writers — the NAPI
+    /// poll (consume + refill) and `ndo_xsk_wakeup`'s synchronous cold-start
+    /// refill (process context, a different CPU). This serialises them: each
+    /// takes it before touching the ZC ring and skips its work on contention
+    /// (the other writer makes progress). `false` = free. Cache-padded: the two
+    /// writers run on different CPUs, so keep it off the tail/posted line.
+    pub(crate) xsk_lock: CachePadded<AtomicBool>,
     /// Active RX descriptor format for this open. Kept fixed for the device
     /// open/session so descriptor parsing never switches per packet.
     pub(crate) format: RxDescFormat,
@@ -483,6 +511,8 @@ impl RxQueueState {
             ),
             buf_len: CachePadded::new(AtomicU32::new(0)),
             tail: CachePadded::new(AtomicUsize::new(0)),
+            posted: CachePadded::new(AtomicUsize::new(0)),
+            xsk_lock: CachePadded::new(AtomicBool::new(false)),
             format,
         }? kernel::error::Error)
     }
@@ -506,6 +536,22 @@ impl RxQueueState {
     pub(crate) fn set_slot(&self, i: usize, slot: RxSlot) {
         self.slot_cpu[i].store(slot.cpu, Ordering::Relaxed);
         self.slot_dma[i].store(slot.dma, Ordering::Relaxed);
+    }
+
+    /// Try to acquire the AF_XDP zero-copy ring lock (Acquire on success).
+    /// Returns false if another writer holds it — the caller skips its work.
+    #[inline]
+    pub(crate) fn try_xsk_lock(&self) -> bool {
+        self.xsk_lock
+            .inner
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// Release the AF_XDP zero-copy ring lock (Release).
+    #[inline]
+    pub(crate) fn xsk_unlock(&self) {
+        self.xsk_lock.inner.store(false, Ordering::Release);
     }
 
     #[inline]
@@ -1002,6 +1048,34 @@ extern "C" fn rust_set_mac_filter(cookie: *mut c_void) {
     state.regs().set_mac_address(&ub::bridge_dev_addr(ndev));
 }
 
+/// LED netdev-trigger offload: write LED `index`'s LEDSEL select field to `mode`
+/// (the cshim built `mode` from the kernel `TRIGGER_NETDEV_*` flags). The LEDSEL
+/// register choice + masked update are the host-tested `crate::led` encode.
+/// Returns 0 or `-EINVAL` for an out-of-range index.
+extern "C" fn rust_led_set_mode(cookie: *mut c_void, index: u32, mode: u16) -> c_int {
+    let state = state_from(cookie);
+    match crate::led::led_reg(index) {
+        Some(reg) => {
+            let regs = state.regs();
+            let cur = regs.read_u16_at(reg);
+            regs.write_u16_at(reg, crate::led::merge_mode(cur, mode));
+            0
+        }
+        None => EINVAL.to_errno(),
+    }
+}
+
+/// LED netdev-trigger offload read-back: return LED `index`'s active LEDSEL
+/// select field (the cshim maps it back to `TRIGGER_NETDEV_*` flags). Returns the
+/// mode (>= 0) or `-EINVAL` for an out-of-range index.
+extern "C" fn rust_led_get_mode(cookie: *mut c_void, index: u32) -> c_int {
+    let state = state_from(cookie);
+    match crate::led::led_reg(index) {
+        Some(reg) => c_int::from(crate::led::mode_from_reg(state.regs().read_u16_at(reg))),
+        None => EINVAL.to_errno(),
+    }
+}
+
 pub(crate) const M4_FULL_OPS: BridgeOps = BridgeOps {
     open: rust_open,
     stop: rust_stop,
@@ -1021,8 +1095,14 @@ pub(crate) const M4_FULL_OPS: BridgeOps = BridgeOps {
     wol_suspend_arm: rust_wol_suspend_arm,
     read_reg: rust_read_reg,
     set_mac_filter: rust_set_mac_filter,
+    led_get_mode: rust_led_get_mode,
+    led_set_mode: rust_led_set_mode,
     xdp_xmit_one: rust_xdp_xmit_one,
     xdp_tx_flush: rust_xdp_tx_flush,
+    xsk_xmit_one: rust_xsk_xmit_one,
+    xsk_kick: rust_xsk_kick,
+    rx_quiesce: rust_rx_quiesce,
+    rx_restore: rust_rx_restore,
 };
 
 // Skeleton vtable retained as a load-test fallback. Flip `ACTIVE_OPS`
@@ -1107,6 +1187,14 @@ extern "C" fn skel_read_reg(_cookie: *mut c_void, _offset: u32) -> u32 {
 
 #[allow(dead_code)]
 extern "C" fn skel_set_mac_filter(_cookie: *mut c_void) {}
+#[allow(dead_code)]
+extern "C" fn skel_led_set_mode(_cookie: *mut c_void, _index: u32, _mode: u16) -> c_int {
+    0
+}
+#[allow(dead_code)]
+extern "C" fn skel_led_get_mode(_cookie: *mut c_void, _index: u32) -> c_int {
+    0
+}
 
 #[allow(dead_code)]
 extern "C" fn skel_xdp_xmit_one(
@@ -1120,6 +1208,27 @@ extern "C" fn skel_xdp_xmit_one(
 
 #[allow(dead_code)]
 extern "C" fn skel_xdp_tx_flush(_cookie: *mut c_void) {}
+
+#[allow(dead_code)]
+extern "C" fn skel_xsk_xmit_one(
+    _cookie: *mut c_void,
+    _umem_dma: u64,
+    _len: u32,
+    _queue_id: u32,
+) -> c_int {
+    -(bindings::ENOSPC as c_int)
+}
+
+#[allow(dead_code)]
+extern "C" fn skel_xsk_kick(_cookie: *mut c_void, _queue_id: u32) {}
+
+#[allow(dead_code)]
+extern "C" fn skel_rx_quiesce(_cookie: *mut c_void, _queue_id: u32) {}
+
+#[allow(dead_code)]
+extern "C" fn skel_rx_restore(_cookie: *mut c_void, _queue_id: u32) -> c_int {
+    0
+}
 
 #[allow(dead_code)]
 pub(crate) const M4_SKELETON_OPS: BridgeOps = BridgeOps {
@@ -1141,8 +1250,14 @@ pub(crate) const M4_SKELETON_OPS: BridgeOps = BridgeOps {
     wol_suspend_arm: skel_wol_suspend_arm,
     read_reg: skel_read_reg,
     set_mac_filter: skel_set_mac_filter,
+    led_get_mode: skel_led_get_mode,
+    led_set_mode: skel_led_set_mode,
     xdp_xmit_one: skel_xdp_xmit_one,
     xdp_tx_flush: skel_xdp_tx_flush,
+    xsk_xmit_one: skel_xsk_xmit_one,
+    xsk_kick: skel_xsk_kick,
+    rx_quiesce: skel_rx_quiesce,
+    rx_restore: skel_rx_restore,
 };
 
 /// Active vtable. `M4_FULL_OPS` is the production path; `M4_SKELETON_OPS`
@@ -1409,15 +1524,30 @@ fn allocate_rx_queue_pool(state: &NetdevState, queue_id: u32) -> Result<()> {
     // frees whatever was allocated and destroys the pool (both idempotent).
     let buf_len = ub::rx_pool_create(ndev, queue_id, RING_LEN)?;
     rx.buf_len.inner.store(buf_len, Ordering::Relaxed);
+    // A zero-copy (AF_XDP) queue tolerates a short umem fill ring at open: post
+    // what we can and leave the rest empty for the NAPI poll / ndo_xsk_wakeup to
+    // top up. A page_pool queue must fill every slot or the open fails.
+    let is_zc = ub::bridge_rxq_is_zc(ndev, queue_id);
+    let mut posted = RING_LEN;
     for i in 0..RING_LEN {
         match ub::rx_alloc(ndev, queue_id) {
             Ok((cpu, dma)) => rx.set_slot(i, RxSlot { cpu, dma }),
             Err(e) => {
-                free_rx_slots(state);
-                return Err(e);
+                if !is_zc {
+                    free_rx_slots(state);
+                    return Err(e);
+                }
+                // Cold start: the umem fill ring is exhausted (contiguous tail
+                // of empty slots). Record how many we posted and stop.
+                for j in i..RING_LEN {
+                    rx.set_slot(j, RxSlot::EMPTY);
+                }
+                posted = i;
+                break;
             }
         }
     }
+    rx.posted.inner.store(posted, Ordering::Relaxed);
     Ok(())
 }
 
@@ -1437,9 +1567,18 @@ fn allocate_rx_pool(state: &NetdevState) -> Result<()> {
 /// frame. `buf_len` is already ≤ `DESC_LEN_MASK` (the cshim caps it).
 fn pre_post_rx_queue_descriptors(rx: &RxQueueState) {
     let buf_len = rx.buf_len.inner.load(Ordering::Relaxed) & regs::DESC_LEN_MASK;
+    // Only the first `posted` slots actually hold a buffer (== RING_LEN for the
+    // page_pool path, possibly fewer at an AF_XDP cold start). Posted slots get
+    // OWN + buffer; the rest are published host-owned with no buffer (the chip
+    // stalls at the first such slot until the poll refills it). EOR always marks
+    // the physical wrap slot so the chip wraps RxHead back to 0.
+    let posted = rx.posted.inner.load(Ordering::Relaxed);
     for i in 0..RING_LEN {
-        let dma = rx.slot(i).dma;
-        let mut opts1 = regs::DESC_OWN | buf_len;
+        let (mut opts1, addr) = if i < posted {
+            (regs::DESC_OWN | buf_len, rx.slot(i).dma)
+        } else {
+            (0, 0)
+        };
         if i == RING_LEN - 1 {
             opts1 |= regs::DESC_EOR;
         }
@@ -1451,7 +1590,7 @@ fn pre_post_rx_queue_descriptors(rx: &RxQueueState) {
             Descriptor {
                 opts1,
                 opts2: 0,
-                addr: dma,
+                addr,
             },
             rx.format,
         );
@@ -2663,6 +2802,121 @@ extern "C" fn rust_xdp_xmit_one(
     xdp_tx_enqueue(state, frame_dma, frame_len, frame)
 }
 
+/// Enqueue one AF_XDP zero-copy TX chunk on the TX ring. Called from the cshim's
+/// `r8125_bridge_xsk_tx` (NAPI poll) **while it holds the txq lock**, same as the
+/// XDP_TX producer. `umem_dma` is the chunk's persistent xsk DMA address (already
+/// synced for the device by the caller); no per-frame DMA mapping exists, so the
+/// slot stores `shadow_len = 0` and the reaper skips the unmap. The slot is tagged
+/// `XskTx` with `queue_id` so the reaper completes the chunk back to that socket's
+/// completion ring. Returns 0 on enqueue, `-ENOSPC` when the ring is full.
+fn xsk_tx_enqueue(state: &NetdevState, umem_dma: u64, len: u32, queue_id: u32) -> c_int {
+    let head = state.tx.head.inner.load(Ordering::Relaxed);
+    let tail = state.tx.tail.inner.load(Ordering::Acquire);
+    if head.wrapping_sub(tail) + 1 >= RING_LEN {
+        return -(bindings::ENOSPC as c_int);
+    }
+    let slot = head % RING_LEN;
+    let mut opts1 =
+        regs::DESC_OWN | regs::DESC_TX_FS | regs::DESC_TX_LS | (len & regs::DESC_LEN_MASK);
+    if slot == RING_LEN - 1 {
+        opts1 |= regs::DESC_EOR;
+    }
+    // No per-frame DMA mapping (xsk owns the umem mapping): shadow_len = 0 so the
+    // reaper skips dma_unmap. shadow ptr stays null (nothing to free directly).
+    state.tx.shadow_dma[slot].store(0, Ordering::Release);
+    state.tx.shadow_len[slot].store(0, Ordering::Release);
+    state.tx.shadow_is_frag[slot].store(false, Ordering::Release);
+    state.tx.shadow_budget_len[slot].store(0, Ordering::Release);
+    state.tx.shadow_xsk_qid[slot].store(queue_id as u8, Ordering::Release);
+    state.tx.shadow_kind[slot].store(TxSlotKind::XskTx as u8, Ordering::Release);
+    state.tx.shadow[slot].store(ptr::null_mut(), Ordering::Release);
+    ub::desc_publish_own(
+        state.tx.desc.cast::<u8>(),
+        slot,
+        Descriptor {
+            opts1,
+            opts2: 0,
+            addr: umem_dma,
+        },
+        crate::ring::RxDescFormat::Legacy,
+    );
+    state
+        .tx
+        .head
+        .inner
+        .store(head.wrapping_add(1), Ordering::Release);
+    0
+}
+
+extern "C" fn rust_xsk_xmit_one(
+    cookie: *mut c_void,
+    umem_dma: u64,
+    len: u32,
+    queue_id: u32,
+) -> c_int {
+    let state = state_from(cookie);
+    xsk_tx_enqueue(state, umem_dma, len, queue_id)
+}
+
+/// AF_XDP zero-copy RX cold-start kick (ndo_xsk_wakeup). Synchronously post umem
+/// buffers into the ZC RX ring so the chip can start receiving — with an empty
+/// ring no RX IRQ can fire, so scheduling NAPI alone never bootstraps. Serialised
+/// against the NAPI poll via the per-queue `xsk_lock` (skips on contention; the
+/// poll then does the refill). No-op for a non-ZC queue.
+extern "C" fn rust_xsk_kick(cookie: *mut c_void, queue_id: u32) {
+    let state = state_from(cookie);
+    let Some(rx) = state.rx_queue(queue_id) else {
+        return;
+    };
+    let ndev = state.ndev.load(Ordering::Acquire);
+    if !ub::bridge_rxq_is_zc(ndev, queue_id) {
+        return;
+    }
+    if rx.try_xsk_lock() {
+        crate::napi::zc_refill_locked(rx, queue_id, ndev);
+        rx.xsk_unlock();
+    }
+}
+
+/// Live per-queue RX reconfigure phase 1 (quiesce) — see `BridgeOps::rx_quiesce`.
+/// Disables the chip RX engine (TX stays on; PHY/IRQ untouched, so the link does
+/// NOT drop) and frees this queue's RX buffers + pool using the CURRENT pool
+/// type. NAPI is already disabled by the C caller; runs before `q->xsk_pool`
+/// toggles, so `free_rx_queue_slots` disposes the slots with the right freer.
+extern "C" fn rust_rx_quiesce(cookie: *mut c_void, queue_id: u32) {
+    let state = state_from(cookie);
+    state.regs().set_chip_cmd(regs::CMD_TX_ENB);
+    free_rx_queue_slots(state, queue_id);
+}
+
+/// Live per-queue RX reconfigure phase 2 (restore) — see `BridgeOps::rx_restore`.
+/// Builds this queue's RX pool for the now-current type (page_pool or, when an
+/// xsk pool is bound, the umem — which posts 0 buffers at a cold start and is
+/// topped up by ndo_xsk_wakeup/the poll), re-posts its descriptors, resets the
+/// chip RX head to the ring base, refreshes RxMaxSize, and re-enables the RX
+/// engine. Returns 0 or a negative errno (RX left disabled on failure).
+extern "C" fn rust_rx_restore(cookie: *mut c_void, queue_id: u32) -> c_int {
+    let state = state_from(cookie);
+    if let Err(e) = allocate_rx_queue_pool(state, queue_id) {
+        return e.to_errno();
+    }
+    let Some(rx) = state.rx_queue(queue_id) else {
+        return EINVAL.to_errno();
+    };
+    rx.reset_index();
+    pre_post_rx_queue_descriptors(rx);
+    let regs = state.regs();
+    // Re-writing the RX ring base resets the chip's RX head to slot 0, matching
+    // the freshly re-posted ring (tail = 0). RX is still disabled here. The live
+    // reconfigure path is single-queue only (queue 0), so use the queue-0
+    // (const-offset) accessor — set_rx_ring_base_queue with this unbounded
+    // queue_id would defeat the MMIO offset bound check.
+    regs.set_rx_ring_base(rx.dma);
+    regs.set_rx_max_size(rx.buf_len.inner.load(Ordering::Relaxed) as u16);
+    regs.set_chip_cmd(regs::CMD_RX_ENB | regs::CMD_TX_ENB);
+    0
+}
+
 /// Ring the TX doorbell once at NAPI-poll end if any XDP_TX frame was enqueued
 /// this poll. Called from `r8125_bridge_xdp_finalize`; the per-queue pending
 /// flag (C side) gates it so a poll with no XDP_TX does no MMIO.
@@ -2771,9 +3025,14 @@ pub(crate) struct NetdevHandle {
 
 impl NetdevHandle {
     /// The registered `net_device` pointer (null after teardown). Used by the
-    /// pci::Driver suspend/resume callbacks to drive the cshim PM path. Gated on
-    /// `r8125_pci_pm` (its only caller) so a stock build raises no dead-code warn.
-    #[cfg(r8125_pci_pm)]
+    /// pci::Driver suspend/resume and shutdown callbacks to drive the cshim
+    /// quiesce path. Gated on those cfgs so a stock build raises no dead-code warn.
+    #[cfg(any(
+        r8125_pci_pm,
+        r8125_pci_shutdown,
+        r8125_pci_reset,
+        r8125_pci_runtime_pm
+    ))]
     pub(crate) fn ndev(&self) -> *mut bindings::net_device {
         self.ndev.load(Ordering::Acquire)
     }

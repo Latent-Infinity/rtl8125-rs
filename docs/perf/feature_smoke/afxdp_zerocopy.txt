@@ -1,0 +1,202 @@
+AF_XDP zero-copy (RX + TX) — implementation status + validation runbook
+========================================================================
+
+Status (2026-06-17): AF_XDP zero-copy (RX + TX) is VALIDATED on-wire — reliable,
+non-disruptive, KASAN-clean. The final fix was the igc-style **surgical per-queue
+RX reconfigure**: the AF_XDP bind/unbind now swaps just the bound queue's RX pool
+(chip RX engine briefly off; TX/PHY/IRQ untouched) instead of a full stop+open,
+so the link NEVER drops and the cold-start bootstrap is deterministic.
+
+FINAL VALIDATION (per-queue reconfigure build, srcversion-verified):
+ - ZC RX, 3 consecutive runs: 2,197,805 / 1,978,502 / 2,251,726 frames zero-copy
+   — link-down count 0 every run, 0 KASAN splats every run. (Was flaky
+   771k/13/0 with the old full-stop+open bind; now consistently ~2M.)
+ - ZC TX: submitted 6,842,816 / completed 6,840,561 zero-copy; peer captured the
+   on-wire frames; link-down 0; 0 splats.
+ - Unbind (app exit) cleanly restores the page_pool RX path: a post-unbind normal
+   flood resumes rx_handed_to_stack (68 -> 358,045); 0 splats.
+ - Non-ZC page_pool production path unaffected throughout.
+
+Earlier (pre-fix) the bind did a full stop+open that dropped the link ~4s and
+raced the cold-start bootstrap (same build yielded 771k / 13 / 0). The per-queue
+reconfigure removed both the link-down and the race.
+
+HARD-WON HARNESS/PROCESS NOTES (cost many cycles — read first):
+ - VERIFY THE RELOAD. `ssh gateway 'rmmod; insmod'` as ONE command frequently
+   returns exit 255 (ssh cuts mid-command) with the rmmod silently not running →
+   insmod hits "File exists" → the STALE module stays loaded. Do rmmod and insmod
+   as SEPARATE ssh calls and CONFIRM `cat /sys/module/r8125_rust/srcversion` ==
+   `modinfo -F srcversion <.ko>` before believing any test. (Hours were lost
+   testing a stale module that lacked the very code under test.)
+ - Run the AF_XDP app via a kept-alive background (the Bash run_in_background
+   tool), NOT shell `&` — shell `&` SIGHUPs the app early (it exits after ~2 loop
+   iterations, so floods hit a dead socket). NEVER SIGKILL the app (skips xsk
+   teardown → stale XDP prog + bound pool breaks the next bind); use SIGINT.
+ - The validation app now line-buffers stdout/stderr; older builds needed
+   `stdbuf -oL` or final prints were lost on kill.
+
+PROVEN-WORKING evidence (2026-06-17, fresh module srcversion-verified)
+---------------------------------------------------------------------
+ - ZC RX: rxdrop socket on enp3s0 q0, UDP flood from the controller →
+   "rxdrop: received 771414 frames (zero-copy)"; rx_handed_to_stack flat (frames
+   went to the socket, not the stack); napi_poll fired 24x; 0 splats.
+ - ZC TX: txonly on enp3s0 q0 → "submitted 8560192, completed 8557929 frames
+   (zero-copy)"; peer tcpdump 'ether proto 0x88b5' captured the on-wire frames
+   (hit the -c 200 cap); napi_poll fired 48x; 0 splats.
+ - So the whole chain works: XDP_SETUP_XSK_POOL bind, MEM_TYPE_XSK_BUFF_POOL RX,
+   xsk_buff_alloc refill, redirect-to-socket, xsk_kick synchronous refill, the
+   xsk_tx_peek_desc drain, and xsk_tx_completed.
+
+The fixes that made it work (kept in tree):
+ - new `xsk_kick` vtable op: ndo_xsk_wakeup posts umem buffers synchronously
+   (rust_xsk_kick -> napi::zc_refill_locked), serialised vs the poll by a
+   per-queue `xsk_lock` try-lock; refill factored into shared `zc_refill_locked`.
+ - at the ZC bind: advertise RX need-wakeup (so the app kicks) + napi_schedule
+   (so the consume+refill poll runs once the fill ring is primed).
+
+RESOLVED BUG — unreliable cold-start bootstrap in the old full-reopen bind path
+-------------------------------------------------------------------------------
+Across identical pre-fix runs the result varied (771k / 13 / 0). Root: the bind's
+full bridge_ndo_stop + bridge_ndo_open re-applied the PHY firmware and
+renegotiated (~4s "Link is Down" then "Up" in dmesg). The cold-start bootstrap
+(post buffers, sustain RX/IRQ) raced that link-down; only when the reconfigure
+left the chip RX/IRQ engine healthy did RX sustain to line rate. Buffers DID get
+posted (traced xsk_rx_alloc reaching n=257) and carrier was up at flood time, yet
+the chip often received only ~13 frames then stalled (no further ROK IRQ → no
+poll).
+
+The landed fix follows the igc per-queue pattern: reconfigure ONLY the affected
+queue's RX ring in place — disable NAPI, briefly disable the chip RX engine, swap
+page_pool<->xsk pool, re-post the ring, re-enable RX/NAPI — WITHOUT touching the
+PHY/link/TX/other queues. This is the final validation build described above.
+
+Earlier (pre-proof) trace notes
+-------------------------------
+Rig: gateway DUT enp3s0 (r8125_rust, 10.0.0.2) <-> controller enp4s0 (igc,
+10.0.0.1); ZC rxdrop socket on the gateway, UDP flood from the controller.
+Method: pr_info traces in pool_setup / xsk_rxq_reg / is_zc / rx_one_packet /
+xsk_rx_consume + per-path uniq -c. (Harness gotchas learned: never SIGKILL the
+app — it skips xsk teardown and leaves a stale XDP prog + bound pool that breaks
+the next bind; reload the module between runs; the app stdout is block-buffered
+over ssh, use stdbuf -oL.)
+
+1. **ZC RX cold-start never bootstraps (ROOT-CAUSED).** Trace proof: with the ZC
+   socket bound (xsk_pool set, XSK mem model registered — all confirmed), a flood
+   produced ZERO is_zc / xsk_rx_consume / rx_one_packet traces and rx_handed_to_stack
+   did NOT move with the flood (frames dropped at the NIC, rx_dropped_error=0).
+   I.e. **no NAPI poll ever runs for the ZC queue**, so the chip never gets umem
+   buffers. Chain: bind happens with the umem fill ring empty -> ndo_open posts 0
+   RX buffers -> chip can't receive -> no RX IRQ -> no NAPI poll -> the ZC refill
+   (process_rx_completions_zc phase 2) never runs -> still 0 buffers. Deadlock.
+   (The earlier "722k to stack" reading was a mis-attribution from non-reset runs
+   where a stale state left the normal path active — disregard it.)
+   Fixes IMPLEMENTED (architecturally correct, kept in tree) — the full bootstrap
+   chain is now present but blocked one level deeper:
+     - driver: synchronous-post in ndo_xsk_wakeup via a new `xsk_kick` vtable op
+       (rust_xsk_kick -> napi::zc_refill_locked), serialised against the poll by a
+       per-queue `xsk_lock` try-lock; the refill is factored into the shared
+       `zc_refill_locked` used by BOTH the poll and the wakeup.
+     - driver: napi_schedule(&q->napi) at the end of the ZC bind to run the first
+       poll (which would advertise RX need-wakeup once the fill ring is empty).
+     - harness: unconditional recvfrom(MSG_DONTWAIT) per loop.
+   NARROWED BLOCKER (trace-proven): the q0 NAPI poll never runs in the ZC state.
+   With traces in is_zc / set_rx_wakeup / xsk_wakeup, a full run produced ZERO
+   `is_zc` traces (process_rx_completions is never entered for q0) AND
+   ndo_xsk_wakeup count stayed 0. So: napi_schedule at bind does NOT produce a
+   poll; need-wakeup is therefore never set; so recvfrom never triggers
+   ndo_xsk_wakeup; so xsk_kick never runs. The synchronous-post fix is correct but
+   gated behind a NAPI poll that simply isn't firing for the ZC queue.
+   NEXT (next session): trace the C `bridge_napi_poll` entry + the q0 NAPI state —
+   why does napi_schedule(&q->napi) not result in a poll? Candidates: the ZC
+   bind's stop+open leaves the q0 NAPI non-pollable; the napi/queue_id wiring for
+   the ZC queue is off; or napi_schedule races the bind's ~4s link-down. Once a
+   poll runs for q0, the rest of the chain (need-wakeup -> recvfrom -> xsk_kick ->
+   zc_refill_locked -> buffers posted -> RX -> redirect -> socket) is in place.
+2. **ZC bind is disruptive (~4s link-down).** r8125_bridge_xsk_pool_setup does a
+   full bridge_ndo_stop + bridge_ndo_open on bind/unbind; ndo_open re-applies the
+   PHY firmware (800 ops) and renegotiates the link (~4s down, confirmed in
+   dmesg: "Link is Down" ... 3-4s ... "Link is Up - 2.5Gbps"). Binding an AF_XDP
+   socket must not drop the link. Fix: a surgical per-queue reconfigure (swap
+   page_pool<->umem for the one queue, re-post its ring) WITHOUT touching the
+   PHY/link, instead of the full-device open.
+
+These confirm the staged ZC needs another implementation iteration, not just a
+validation run. The validation harness (tools/xsk/) + this analysis make that a
+well-scoped next batch.
+
+What landed
+-----------
+- cshim netdev_bridge_xsk.c — the AF_XDP datapath (the xsk kernel API):
+    * XDP_SETUP_XSK_POOL bind/unbind (r8125_bridge_xsk_pool_setup, in
+      netdev_bridge.c for the static ndo_open/stop queue reconfigure):
+      xsk_pool_dma_map + toggle q->xsk_pool between stop and open.
+    * RX: xsk_buff_alloc / MEM_TYPE_XSK_BUFF_POOL xdp_rxq / consume
+      (redirect-to-socket zero-copy, copy-to-skb on XDP_PASS).
+    * TX: xsk_tx_peek_desc drain -> Rust TX-ring producer -> xsk_tx_completed.
+    * ndo_xsk_wakeup + RX/TX need-wakeup management.
+- Rust ring discipline (safe):
+    * src/napi.rs process_rx_completions_zc — a producer/consumer fill-cursor
+      poll (the page_pool path assumes a permanently-full ring; the umem fill
+      ring is usually empty at bind, so ZC tracks a posted window and tops up
+      from the fill ring on poll / ndo_xsk_wakeup).
+    * src/netdev.rs TxSlotKind::XskTx + xsk_tx_enqueue + the reaper arm that
+      batches xsk_tx_completed per RX queue id.
+- xdp_features |= NETDEV_XDP_ACT_XSK_ZEROCOPY.
+- Static gate ci/check_xsk.sh (18 checks) pins the C/Rust split.
+
+Build + CI (controller -> gateway 7.0.0-kasan)
+----------------------------------------------
+- make: clean (r8125_rust.ko + BTF), no new warnings.
+- bash ci/run_checks.sh: PASS (census 95, rustfmt clean, LOC caps OK,
+  host unit tests OK, check_xsk.sh 18/18).
+
+Load + capability advert (gateway enp3s0, RTL8125B)
+---------------------------------------------------
+- rmmod + insmod the fresh .ko: clean. PHY firmware applied (800 ops);
+  link Up 2.5Gbps/Full; no error/warn/oops in dmesg (normal path no-regression).
+- xdp_features via ynl (tools/net/ynl/pyynl/cli.py --dump dev-get):
+    'xdp-features': {'xsk-zerocopy', 'basic', 'redirect', 'ndo-xmit'}
+
+On-wire zero-copy validation runbook (next cycle)
+-------------------------------------------------
+Use the kernel's own AF_XDP selftest (the canonical ZC harness) — its source is
+already on the gateway: /home/firestrand/kbuild/linux-7.0.0/tools/testing/selftests/bpf/
+
+1. Build the selftest tooling on the gateway:
+     cd /home/firestrand/kbuild/linux-7.0.0/tools/testing/selftests/bpf
+     make xskxceiver xdp_helpers       # plus libbpf if not already built
+   (xskxceiver drives both ZC RX and ZC TX with a built-in XSKMAP redirect prog;
+   it does NOT need libxdp.)
+
+2. Two-port loopback on this host's own Realtek <-> a peer port (the gateway
+   topology: enp3s0 <-> a peer NIC, or two Realtek ports cabled together). Put
+   each end in its own netns if using two local ports (see GATEWAY_SETUP /
+   memory: gateway test topology). xskxceiver wants two interfaces.
+
+3. Force zero-copy (not copy mode) so the path under test is the ZC datapath:
+     xskxceiver -i <ifA> -i <ifB> -z        # -z = zero-copy
+   Watch for: BUSY_POLL / SEND_RECEIVE / TX/RX 2K + 4K frame-size cases passing.
+
+4. Manual smoke (alternative, if xdpsock is buildable):
+     xdpsock -i enp3s0 --rxdrop  -z         # ZC RX drop
+     xdpsock -i enp3s0 --txonly  -z         # ZC TX
+     xdpsock -i enp3s0 -l        -z         # ZC l2fwd (RX->TX)
+   Confirm the queue's xsk-features populate while a socket is bound
+   (ynl dev-get) and that ethtool -S shows rx_handed_to_stack stays flat for
+   --rxdrop (frames go to the socket, not the stack).
+
+5. KASAN + soak: run step 3/4 for >= a few minutes under the kasan kernel; the
+   driver loads on 7.0.0-kasan, so any ZC use-after-free / DMA misuse surfaces
+   immediately. Pair with the safe_capture.sh wrapper for any capture.
+
+Things to specifically watch on first ZC bring-up
+-------------------------------------------------
+- RX cold start: at XDP_SETUP_XSK_POOL the umem fill ring is empty, so the ring
+  posts 0 buffers and waits for ndo_xsk_wakeup -> NAPI to fill it. If RX never
+  starts, check that the app populates the FILL ring before the first wakeup and
+  that the chip resumes RX after OWN is set on refill (no explicit RX doorbell is
+  rung — this matches r8169; if the 8125 needs an RX poll kick, that's the first
+  place to look).
+- ZC TX completion routing: the single TX ring is shared; the reaper batches
+  xsk_tx_completed per RX queue id via shadow_xsk_qid. Single-queue is the
+  expected path; multi-socket-multi-queue ZC TX is supported but unvalidated.

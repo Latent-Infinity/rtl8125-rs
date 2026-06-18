@@ -1,0 +1,44 @@
+W2.2 reset_prepare/reset_done + W2.3 AER — status 2026-06-18
+===========================================================
+
+W2.2 reset_prepare / reset_done — CODE COMPLETE + WIRED; full validation needs W2.3
+-----------------------------------------------------------------------------------
+ - kernel-patches/0003-rust-pci-add-reset-callbacks.patch: adds
+   `pci::Driver::reset_prepare`/`reset_done` (default no-ops), the two `pci_dev*`
+   void thunks, an `ERR_HANDLER: pci_error_handlers` const wired via
+   `(*pdrv.get()).err_handler = &Self::ERR_HANDLER`. Applied + kasan rebuilt.
+ - Driver: cfg-gated `reset_prepare` (= bridge_pm_suspend quiesce) + `reset_done`
+   (= bridge_pm_resume re-init), `r8125_pci_reset` cfg / Makefile `RESET=1`. The
+   shared bridge_pm_suspend/resume + ndev cfgs widened to cover all W2 hooks.
+ - Built RESET=1, loaded + bound clean; default `make` still stock-buildable; CI green.
+
+VALIDATION FINDING (important): `echo 1 > /sys/bus/pci/devices/0000:03:00.0/reset`
+on this device does NOT cleanly exercise reset_prepare/reset_done. The device's
+only reset_method is "bus" (secondary bus reset; no FLR/PM reset), and the bus
+reset generates a PCIe **Uncorrectable AER** (UnsupReq, TLP), so the kernel takes
+the AER recovery path instead. dmesg showed:
+   "AER: can't recover (no error_detected callback)"
+which CONFIRMS our err_handler IS registered (the core read it) but bailed because
+we have no `error_detected` (that is W2.3). The link recovered (no phylib WARN, no
+KASAN; datapath OK after), but reset_prepare/reset_done did not fire (the AER path
+bypassed the clean reset phase). So:
+ - reset_prepare/reset_done are correctly WIRED (err_handler registered, proven).
+ - On THIS device the reset is AER-driven, so a full on-wire exercise of
+   reset_prepare/reset_done requires the W2.3 AER handlers — once error_detected/
+   slot_reset/resume exist, the AER recovery proceeds through slot_reset, whose
+   pci_reset path calls reset_prepare/reset_done. W2.2 + W2.3 validate together.
+
+W2.3 AER — NEEDED (this device emits AER on reset) + NEXT
+--------------------------------------------------------
+The above is direct evidence W2.3 matters for THIS hardware: a bus reset -> AER
+-> "can't recover (no error_detected)". W2.3 adds error_detected / mmio_enabled /
+slot_reset / error_resume + the ChannelState (pci_channel_state_t) and ErsResult
+(pci_ers_result_t) enums (bindgen allowlist). Sharp hazard (per the plan): in the
+Frozen channel state MMIO reads 0xFF — handlers must branch on state and touch
+registers only when Normal. Pure `aer_policy(ChannelState) -> ErsResult` should be
+host-tested first. Validation is the SAME `echo 1 > reset` (or aer-inject): with
+the handlers, the AER recovery should succeed (detected -> slot_reset -> resume)
+and the device recover cleanly — directly observable in dmesg, no reboot.
+
+W2.4 runtime-PM — remaining (pm_runtime cshim + idle predicate; live-validatable
+via power/control=auto, no reboot).

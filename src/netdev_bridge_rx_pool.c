@@ -34,7 +34,9 @@
  *   register — the "never let the chip write more than the buffer holds"
  *   rule.
  *
- * Hard cap: 360 LOC. Enforced by ci/check_cshim_loc_caps.sh. Raised from
+ * Hard cap: 400 LOC. Enforced by ci/check_cshim_loc_caps.sh. Raised to 400 for
+ * the AF_XDP zero-copy branches (delegating alloc/free/create/destroy to
+ * netdev_bridge_xsk.c when a queue has an xsk pool bound). Raised earlier from
  * 200 for the page_pool create/destroy + zero-copy refill super-call; the
  * file still owns exactly one concern (the RX buffer lifecycle + the RX
  * streaming-DMA syncs), which is why it stays one translation unit.
@@ -131,6 +133,18 @@ int r8125_bridge_rx_pool_create(struct net_device *ndev, unsigned int queue_id,
 
 	r8125_bridge_rx_geometry(q, READ_ONCE(ndev->mtu));
 
+	/* Zero-copy queue: no page_pool. Register the xdp_rxq against the xsk
+	 * memory model (xsk_rxq_reg also clamps rx_max_len to the umem chunk) and
+	 * report that as the descriptor / RxMaxSize buffer length.
+	 */
+	if (q->xsk_pool) {
+		rc = r8125_bridge_xsk_rxq_reg(ndev, queue_id);
+		if (rc)
+			return rc;
+		*out_buf_len = q->rx_max_len;
+		return 0;
+	}
+
 	pp.order = q->rx_order;
 	pp.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV;
 	/* Zero-copy RX can have up to one ring worth of pages posted to the
@@ -179,7 +193,16 @@ void r8125_bridge_rx_pool_destroy(struct net_device *ndev, unsigned int queue_id
 	struct r8125_bridge *b = netdev_priv(ndev);
 	struct r8125_bridge_rx_queue *q = r8125_bridge_rxq(b, queue_id);
 
-	if (!q || !q->page_pool)
+	if (!q)
+		return;
+	/* Zero-copy queue: no page_pool to destroy; just drop the xdp_rxq (the
+	 * xsk pool itself is unmapped/cleared by xsk_pool_setup on unbind).
+	 */
+	if (q->xsk_pool) {
+		r8125_bridge_xdp_rxq_unreg(ndev, queue_id);
+		return;
+	}
+	if (!q->page_pool)
 		return;
 	/* Unregister the xdp_rxq (it references the pool's memory model) BEFORE
 	 * destroying the pool.
@@ -206,6 +229,10 @@ int r8125_bridge_rx_alloc(struct net_device *ndev, unsigned int queue_id,
 	struct r8125_bridge_rx_queue *q = r8125_bridge_rxq(b, queue_id);
 	struct page *page;
 
+	/* Zero-copy queue: pull the buffer from the xsk umem pool instead. */
+	if (q && q->xsk_pool)
+		return r8125_bridge_xsk_rx_alloc(ndev, queue_id, out_cpu, out_dma);
+
 	if (WARN_ON(!q || !q->page_pool))
 		return -EINVAL;
 
@@ -230,6 +257,12 @@ void r8125_bridge_rx_free(struct net_device *ndev, unsigned int queue_id, void *
 {
 	struct r8125_bridge *b = netdev_priv(ndev);
 	struct r8125_bridge_rx_queue *q = r8125_bridge_rxq(b, queue_id);
+
+	/* Zero-copy queue: return the buffer to the xsk umem pool instead. */
+	if (q && q->xsk_pool) {
+		r8125_bridge_xsk_rx_free(ndev, queue_id, cpu);
+		return;
+	}
 
 	if (!cpu || !q || !q->page_pool)
 		return;
@@ -268,6 +301,10 @@ void r8125_bridge_rx_one_packet(struct net_device *ndev, unsigned int queue_id,
 	const bool hash_enabled = (hash_info >> 61) & 1ULL;
 	const u32 hash_value = (u32)(hash_info & 0xFFFFFFFFULL);
 
+	/* A zero-copy queue never reaches this page_pool super-call: the Rust NAPI
+	 * poll takes a dedicated producer/consumer path that calls
+	 * r8125_bridge_xsk_rx_consume + r8125_bridge_xsk_rx_alloc directly.
+	 */
 	if (WARN_ON_ONCE(!q || !q->page_pool)) {
 		*new_cpu = (void *)buf;
 		*new_dma = dma;

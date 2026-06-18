@@ -282,6 +282,16 @@ struct r8125_bridge_ops {
 	void (*set_mac_filter)(void *priv);
 
 	/*
+	 * led_set_mode(priv, index, mode) / led_get_mode(priv, index) — LED
+	 * netdev-trigger hardware offload. The cshim (netdev_bridge_leds.c) owns the
+	 * led_classdev lifecycle and the kernel TRIGGER_NETDEV_* <-> chip LED_CTRL
+	 * mapping; Rust owns the LEDSEL register choice + masked update. set returns
+	 * 0 / -EINVAL; get returns the active select field (>= 0) / -EINVAL.
+	 */
+	int (*led_set_mode)(void *priv, u32 index, u16 mode);
+	int (*led_get_mode)(void *priv, u32 index);
+
+	/*
 	 * xdp_xmit_one(priv, frame_dma, frame_len, frame) — enqueue one XDP_TX
 	 * frame on the Rust-owned TX ring. Called from the XDP verdict path
 	 * (netdev_bridge_xdp.c) under the txq lock, which serialises this
@@ -301,6 +311,37 @@ struct r8125_bridge_ops {
 	 * signalled to hardware exactly once per poll.
 	 */
 	void (*xdp_tx_flush)(void *priv);
+
+	/*
+	 * xsk_xmit_one(priv, umem_dma, len, queue_id) — AF_XDP zero-copy TX
+	 * producer. Enqueue one umem chunk (already DMA_TO_DEVICE-synced by the
+	 * caller) on the TX ring, tagged so the reaper completes it back to RX
+	 * queue_id's bound xsk pool (xsk_tx_completed). Called from
+	 * r8125_bridge_xsk_tx under the txq lock. Returns 0 on enqueue, -ENOSPC if
+	 * the ring is full.
+	 */
+	int (*xsk_xmit_one)(void *priv, u64 umem_dma, u32 len, u32 queue_id);
+
+	/*
+	 * xsk_kick(priv, queue_id) — AF_XDP zero-copy RX cold-start kick. Post umem
+	 * buffers into the ZC RX ring from the fill ring synchronously. Called from
+	 * ndo_xsk_wakeup: with an empty ring the chip takes no RX IRQ, so the wakeup
+	 * must post buffers itself (serialised against the NAPI poll on the Rust
+	 * side) rather than only scheduling NAPI.
+	 */
+	void (*xsk_kick)(void *priv, u32 queue_id);
+
+	/*
+	 * Live per-queue RX reconfigure (AF_XDP bind/unbind without a full
+	 * stop+open / link-down). Phase 1 rx_quiesce: disable the chip RX engine
+	 * (TX/PHY/IRQ stay up) + free this queue's RX buffers/pool with the CURRENT
+	 * pool type; called under RTNL, NAPI disabled, BEFORE q->xsk_pool toggles.
+	 * Phase 2 rx_restore: build the pool for the NOW-current type, re-post,
+	 * reset the chip RX head, re-enable RX; called AFTER the toggle. Returns 0
+	 * or -errno (RX left off on error).
+	 */
+	void (*rx_quiesce)(void *priv, u32 queue_id);
+	int (*rx_restore)(void *priv, u32 queue_id);
 };
 
 /*

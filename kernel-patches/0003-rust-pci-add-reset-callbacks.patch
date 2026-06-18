@@ -1,0 +1,42 @@
+--- rust/kernel/pci.rs.orig.bak	2026-06-18 01:59:34.117112749 +0000
++++ rust/kernel/pci.rs	2026-06-18 01:59:34.133626977 +0000
+@@ -87,0 +88,1 @@
++            (*pdrv.get()).err_handler = &Self::ERR_HANDLER;
+@@ -153,0 +155,23 @@
++    extern "C" fn reset_prepare_callback(pdev: *mut bindings::pci_dev) {
++        // SAFETY: the PCI core only calls reset_prepare with a valid `pci_dev*`.
++        let pdev = unsafe { &*pdev.cast::<Device<device::CoreInternal>>() };
++        // SAFETY: called between a successful probe and remove, so drvdata holds a `T`.
++        let data = unsafe { pdev.as_ref().drvdata_borrow::<T>() };
++        T::reset_prepare(pdev, data);
++    }
++
++    extern "C" fn reset_done_callback(pdev: *mut bindings::pci_dev) {
++        // SAFETY: see `reset_prepare_callback`.
++        let pdev = unsafe { &*pdev.cast::<Device<device::CoreInternal>>() };
++        // SAFETY: see `reset_prepare_callback`.
++        let data = unsafe { pdev.as_ref().drvdata_borrow::<T>() };
++        T::reset_done(pdev, data);
++    }
++
++    const ERR_HANDLER: bindings::pci_error_handlers = bindings::pci_error_handlers {
++        reset_prepare: Some(Self::reset_prepare_callback),
++        reset_done: Some(Self::reset_done_callback),
++        // SAFETY: zero-initialises the remaining Option<fn> / ptr fields.
++        ..unsafe { core::mem::MaybeUninit::<bindings::pci_error_handlers>::zeroed().assume_init() }
++    };
++
+@@ -424,0 +449,13 @@
++    /// Called before a PCI function reset (secondary-bus / FLR / sysfs reset).
++    /// Default no-op. Override to quiesce (phy_stop, stop DMA) so the reset does
++    /// not catch the device mid-DMA and the link drop does not WARN phylib.
++    fn reset_prepare(dev: &Device<device::Core>, this: Pin<&Self>) {
++        let _ = (dev, this);
++    }
++
++    /// Called after a PCI function reset completes (config space restored by the
++    /// core). Default no-op. Override to re-initialise the device.
++    fn reset_done(dev: &Device<device::Core>, this: Pin<&Self>) {
++        let _ = (dev, this);
++    }
++

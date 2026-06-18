@@ -1,0 +1,38 @@
+PHY LED netdev-trigger hardware offload (W3.1) — validation
+============================================================
+Date:     2026-06-16
+Host:     gateway (bare metal), kernel 7.0.0-kasan
+Driver:   r8125_rust, srcversion 136C849D8D80D2978BCE57B (default `make` build)
+
+Design
+------
+4 RTL8125 LEDs exposed as led_classdev devices with the kernel "netdev"
+hw_control trigger (offload). Split: the led_classdev lifecycle + the
+TRIGGER_NETDEV_* <-> chip LED_CTRL mapping live in the cshim
+(netdev_bridge_leds.c, ported from mainline r8169_leds.c); the LEDSEL register
+selection + masked update are the host-tested Rust `crate::led` encode
+(src/led.rs, 4 host tests) reached via ops.led_set_mode / ops.led_get_mode. No
+direct register poke in C (gate ci/check_led.sh).
+
+LEDSEL registers (r8169 rtl8125_get_led_reg): LED0=0x18, LED1=0x86, LED2=0x84,
+LED3=0x96; select-field mask LEDSEL_MASK_8125=0x23f. Select bits: LINK_10=BIT0,
+LINK_100=BIT1, LINK_1000=BIT3, LINK_2500=BIT5, ACT=BIT9.
+
+Hardware results
+----------------
+- 4 LED class devices registered: /sys/class/leds/r8125_rust-eth0:lan:{0..3};
+  dmesg clean (no WARN from led_classdev_register).
+- Single-flag offload (LED1, set ONLY link_100): LEDSEL1 (0x86) reads 0x0002
+  (LINK_100) exactly — the masked merge replaces the select field cleanly.
+- Combined offload (LED1, link_2500 + tx + rx): LEDSEL1 reads 0x0220
+  (LINK_2500 | ACT) exactly.
+- hw_control_get round-trip: after setting link_100, the led's sysfs flags read
+  back link_100=1 and all others 0 (led_get_mode -> mode_from_reg -> flags).
+- Validity check: setting tx without rx returns "Operation not supported"
+  (-EOPNOTSUPP) — the chip activity condition is combined, so rx==tx is required
+  (r8125_led_mode_valid). Once rx is also set the combo offloads as 0x220.
+
+W3.1 complete: PHY LED netdev-trigger hardware offload, validated end-to-end
+(sysfs class devices + LEDSEL register readback + get round-trip + reject path).
+Physical-LED confirmation by eye is left to the operator; the register-level
+proof shows the offload programs the chip as requested.

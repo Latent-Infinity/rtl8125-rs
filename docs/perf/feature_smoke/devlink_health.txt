@@ -1,0 +1,54 @@
+devlink TX health reporter (W4.7) + upstream selftests (W4.8)
+============================================================
+
+W4.7 devlink health reporter — status 2026-06-17
+------------------------------------------------
+A devlink instance + a "tx" devlink-health reporter (netdev_bridge_devlink.c)
+surface the existing TX-watchdog recovery (ndo_tx_timeout -> reset_work ->
+r8125_bridge_reopen) through the standard devlink-health API. Neither C driver
+(mainline r8169, vendor r8125) exposes this. The recovery POLICY (full chip
+reopen) stays in the bridge; the cshim only wires the kernel devlink objects.
+
+Design:
+ - r8125_bridge_devlink_init (at register): devlink_alloc -> reporter_create ->
+   devlink_register (sub-objects before register, per the modern split rule).
+ - reporter .recover: rtnl_lock + r8125_bridge_reopen (reuse the existing reopen).
+   auto_recover = true (the core sets it from !!ops->recover).
+ - reset_work calls r8125_bridge_devlink_report_tx_timeout() -> the report helper,
+   which records the error and auto-recovers via .recover. Falls back to a direct
+   reopen if the devlink instance failed to allocate.
+ - CONFIG_NET_DEVLINK=y on the rig. Static gate ci/check_devlink.sh.
+
+On-wire validation:
+ - devlink dev show   -> pci/0000:03:00.0 (instance registered).
+ - devlink health show -> "reporter tx  state healthy error 0 recover 0 ...
+   auto_recover true" (reporter registered, healthy, auto-recover on).
+ - dmesg clean (no KASAN/WARN) at register/probe.
+ - `devlink health recover` from the HEALTHY state correctly no-ops (devlink core
+   gates recover on a non-healthy state — see net/devlink/health.c).
+
+BUG FOUND + FIXED (self-deadlock): an earlier revision added a `.test` op that
+called devlink_health_report(). The devlink core invokes .test (and .recover)
+with the reporter lock HELD, and devlink_health_report() re-takes that lock ->
+recursive self-deadlock. Running `devlink health test` wedged the devlink task in
+D-state holding rtnl_mutex (lockdep: "*** DEADLOCK *** ... blocked on a mutex
+likely owned by itself"). FIX: removed the .test op; the report call now lives
+ONLY in reset_work (process context, no devlink lock held). ci/check_devlink.sh
+enforces devlink_health_report() appears exactly once (error path only) so this
+cannot regress. **Consequence: the gateway's rtnl is wedged (D-state, unkillable)
+and needs a REBOOT to clear; the fixed module compiles + is CI-green and is ready
+to re-validate the full report->recover cycle after a reboot.** The automatic
+path (real ndo_tx_timeout -> reset_work -> report) is deadlock-free by
+construction (no devlink lock held there).
+
+W4.8 upstream selftests — status 2026-06-17 (DONE + validated)
+-------------------------------------------------------------
+tools/testing/selftests/net/:
+ - r8125_rust_smoke.sh (pre-existing): load / bound-netdev / ip link / unload.
+ - r8125_rust_features.sh (NEW): capability-matrix, TAP-13, skip-aware — ethtool
+   disposition + page_pool stats, highdma, driver/fw identity, RSS table
+   readback, PHY hwmon temp, xdp_features (incl xsk-zerocopy), channel query.
+ - Makefile TEST_PROGS lists both; ci/check_selftest_smoke.sh enforces both
+   shapes (TAP, skip-aware).
+On-wire run (enp3s0): 7 ok + 1 skip (xdp_features not rendered by this ip -d;
+honest SKIP), 0 failures.

@@ -41,9 +41,32 @@ grep -qE '\brmmod\b' "$SELFTEST" \
 grep -qE 'TEST_PROGS.*r8125_rust_smoke\.sh' "$SELFTEST_MAKEFILE" \
 	|| { red "selftest Makefile must list r8125_rust_smoke.sh in TEST_PROGS"; fail=1; }
 
+# Companion capability-matrix selftest: same TAP/skip-aware shape, registered in
+# TEST_PROGS. It must be skip-aware (no hard failure when a tool/capability is
+# absent) so it runs on any host.
+FEATURES="$ROOT/tools/testing/selftests/net/r8125_rust_features.sh"
+if [[ ! -x "$FEATURES" ]]; then
+	red "missing executable selftest: $FEATURES"
+	fail=1
+elif ! sh -n "$FEATURES"; then
+	red "features selftest shell syntax failed"
+	fail=1
+else
+	grep -q 'SPDX-License-Identifier: GPL-2.0' "$FEATURES" \
+		|| { red "features selftest missing SPDX"; fail=1; }
+	grep -q 'TAP version 13' "$FEATURES" \
+		|| { red "features selftest must emit TAP"; fail=1; }
+	grep -q '1..0 # SKIP' "$FEATURES" \
+		|| { red "features selftest must support kselftest skip-all"; fail=1; }
+	grep -q '# SKIP' "$FEATURES" \
+		|| { red "features selftest must be skip-aware per-test"; fail=1; }
+fi
+grep -qE 'TEST_PROGS.*r8125_rust_features\.sh' "$SELFTEST_MAKEFILE" \
+	|| { red "selftest Makefile must list r8125_rust_features.sh in TEST_PROGS"; fail=1; }
+
 if (( fail )); then
 	exit 1
 fi
 
-grn "r8125_rust net selftest shape is present"
+grn "r8125_rust net selftest shape is present (smoke + features)"
 exit 0
