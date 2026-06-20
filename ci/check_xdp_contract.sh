@@ -51,6 +51,11 @@ need "$NETDEV_C" "NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT |" \
   "xdp_features advertises BASIC and REDIRECT actions"
 need "$NETDEV_C" "NETDEV_XDP_ACT_NDO_XMIT" \
   "xdp_features advertises NDO_XMIT now that ndo_xdp_xmit is implemented"
+# RX_SG (multi-buffer RX) stays UNadvertised: the RTL8125 does not do RX scatter
+# (mainline uses single 16K buffers; the chip drops frames larger than one
+# buffer). The reassembly code is parked. See docs/XDP_MULTIBUF_DESIGN.md.
+reject "$NETDEV_C" "NETDEV_XDP_ACT_RX_SG" \
+  "RX_SG stays unadvertised (RTL8125 has no RX scatter)"
 need "$XDP_C" "r8125_bridge_ndo_xdp_xmit" \
   "ndo_xdp_xmit implementation present (redirect-target side)"
 need "$XDP_C" "flags & ~XDP_XMIT_FLAGS_MASK" \

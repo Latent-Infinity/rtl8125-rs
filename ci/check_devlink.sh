@@ -34,6 +34,12 @@ need "$DL" '\.recover\s*=' "reporter has a .recover op"
 need "$DL" 'r8125_bridge_reopen\(' "recover reuses the bridge reopen"
 need "$DL" 'rtnl_lock\(\)' "recover takes RTNL"
 
+# A .test op makes the reporter exercisable (devlink health test). It MUST be
+# lock-safe: schedule the async reset_work (which reports from process context),
+# never call devlink_health_report() synchronously under the held reporter lock.
+need "$DL" '\.test\s*=' "reporter has a .test op (devlink health test)"
+need "$DL" 'schedule_work\(&b->reset_work\)' ".test schedules async reset_work (no report under the reporter lock)"
+
 # 3. The error is reported from reset_work (process context), and the report path
 #    auto-recovers via the reporter.
 need "$NETDEV_C" 'r8125_bridge_devlink_report_tx_timeout\(b->devlink' "reset_work reports TX timeout to devlink"

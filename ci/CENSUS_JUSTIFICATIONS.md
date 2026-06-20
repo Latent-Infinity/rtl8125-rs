@@ -616,3 +616,33 @@ a device the teardown actually tore down (Frozen path), gated on b->aer_torn_dow
 
 - ADDED `bridge_pm_error_resume(ndev)` — RTNL-free AER re-open. SAFETY: bound
   device (null-checked); runs from the AER resume callback under pci_bus_sem.
+
+## 2026-06-20 — XDP RX multi-buffer (RX_SG) — added then stripped
+
+The multi-buffer code added in this entry was **fully stripped** later the same
+day after hardware investigation proved RTL8125 cannot split frames across
+descriptors with normal buffer sizing. See `docs/XDP_MULTIBUF_DESIGN.md`.
+
+**Added (briefly):** Net +6 `unsafe { ... }` blocks in `src/unsafe_boundary.rs`
+for the RX scatter-gather reassembly cshim super-calls, plus `src/rx_sg.rs` (new
+reassembly state machine), plus multi-buffer branches in `napi.rs`, plus C-shim
+implementations in `netdev_bridge_rx_pool.c`.
+
+**Removed:** `src/rx_sg.rs` (whole module), the 6 `unsafe` wrappers from
+`unsafe_boundary.rs`, the multi-buffer branches from `napi.rs`, the
+`s/packed|partial_skb` fields from `netdev.rs`, the `sg_xdp_*` fields from
+`netdev_bridge_internal.h`, and the C-side super-call implementations from
+`netdev_bridge_rx_pool.c`. The `unsafe` count returned to the pre-multi-buffer
+baseline.
+
+## 2026-06-20 — jumbo MTU enablement bump 102 → 103
+
+Net +1 `unsafe { ... }` block in `src/unsafe_boundary.rs`: `bridge_jumbo_config`,
+the FFI wrapper over `r8125_bridge_jumbo_config` (PCIe `pcie_set_readrq(4096)` +
+PHY pause-disable/aneg-restart for jumbo, mirroring mainline `rtl_jumbo_config`).
+The jumbo decision (MTU > standard) is made in Rust and passed as a `bool`, so the
+frame-size policy stays out of the cshim; the wrapper just forwards one call on a
+bound, registered net_device from the open path.
+
+- ADDED `bridge_jumbo_config(ndev, jumbo)` — readrq + jumbo pause config. SAFETY:
+  bound device with live pdev/phydev (after phy_connect_and_reset, before ndo_stop).

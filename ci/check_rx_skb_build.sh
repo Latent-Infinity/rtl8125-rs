@@ -72,19 +72,37 @@ else
 	grn "RX super-call avoids direct skb tail/len mutation"
 fi
 
-# 5. Hot-path order: refill-alloc -> sync_for_cpu -> build_skb ->
-#    mark_for_recycle -> csum -> GRO.
+# 5. Hot-path order. The finalize (csum + GRO) is factored into the shared
+#    r8125_bridge_rx_finish_skb helper (used by BOTH the single-buffer super-call
+#    and the multi-buffer reassembly path), so check the order across both: in the
+#    super-call body, refill-alloc -> sync_for_cpu -> build_skb ->
+#    mark_for_recycle -> finish_skb; and in the helper, csum -> GRO.
 alloc_line=$(grep -n 'page_pool_dev_alloc_pages(q->page_pool)' <<<"$body" | head -n1 | cut -d: -f1)
 cpu_line=$(grep -nE 'dma_sync_single_for_cpu|page_pool_dma_sync_for_cpu' <<<"$body" | head -n1 | cut -d: -f1)
 build_line=$(grep -n 'napi_build_skb(' <<<"$body" | head -n1 | cut -d: -f1)
 recycle_line=$(grep -n 'skb_mark_for_recycle(skb)' <<<"$body" | head -n1 | cut -d: -f1)
-csum_line=$(grep -n 'r8125_bridge_skb_rx_csum_set' <<<"$body" | head -n1 | cut -d: -f1)
-gro_line=$(grep -n 'napi_gro_receive(&q->napi, skb)' <<<"$body" | head -n1 | cut -d: -f1)
-if [[ -n "$alloc_line" && -n "$cpu_line" && -n "$build_line" && -n "$recycle_line" && -n "$csum_line" && -n "$gro_line" ]] \
-   && (( alloc_line < cpu_line && cpu_line < build_line && build_line < recycle_line && recycle_line < csum_line && csum_line < gro_line )); then
-	grn "RX super-call preserves refill/sync/build/recycle/csum/GRO order"
+finish_line=$(grep -n 'r8125_bridge_rx_finish_skb(' <<<"$body" | head -n1 | cut -d: -f1)
+if [[ -n "$alloc_line" && -n "$cpu_line" && -n "$build_line" && -n "$recycle_line" && -n "$finish_line" ]] \
+   && (( alloc_line < cpu_line && cpu_line < build_line && build_line < recycle_line && recycle_line < finish_line )); then
+	grn "RX super-call preserves refill/sync/build/recycle/finalize order"
 else
-	red "RX super-call order must be alloc-refill -> sync_for_cpu -> build_skb -> mark_for_recycle -> csum -> GRO"
+	red "RX super-call order must be alloc-refill -> sync_for_cpu -> build_skb -> mark_for_recycle -> finish_skb"
+fi
+
+# 5b. The shared finalize helper orders csum before GRO.
+finish_body=$(
+	awk '
+		/^(static )?void r8125_bridge_rx_finish_skb\(/ { in_fn=1 }
+		in_fn { print }
+		in_fn && /^}/ { exit }
+	' "$bridge"
+)
+fcsum_line=$(grep -n 'r8125_bridge_skb_rx_csum_set' <<<"$finish_body" | head -n1 | cut -d: -f1)
+fgro_line=$(grep -n 'napi_gro_receive(&q->napi, skb)' <<<"$finish_body" | head -n1 | cut -d: -f1)
+if [[ -n "$fcsum_line" && -n "$fgro_line" ]] && (( fcsum_line < fgro_line )); then
+	grn "RX finalize helper sets csum before GRO"
+else
+	red "RX finalize helper (r8125_bridge_rx_finish_skb) must set csum before napi_gro_receive"
 fi
 
 # 6. Allocation failure is accounted before returning.

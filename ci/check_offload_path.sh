@@ -109,11 +109,12 @@ grep -q 'NETIF_F_TSO' "$BRIDGE" \
 # produce malformed segments. r8169 handles this in ndo_fix_features;
 # we require the same pairing plus a feature refresh after MTU changes.
 grep -q 'ndo_fix_features' "$BRIDGE" \
-  && grep -q 'ndev->mtu > ETH_DATA_LEN' "$BRIDGE" \
   && grep -q 'NETIF_F_ALL_TSO' "$BRIDGE" \
   && grep -q 'NETIF_F_CSUM_MASK' "$BRIDGE" \
+  && grep -q 'r8125_tx_fix_features' "$BRIDGE" \
+  && grep -q 'fn fix_features' "$TXOFF" \
   && grep -q 'netdev_update_features(ndev)' "$BRIDGE" \
-  && ok "jumbo MTU disables TSO/TX-CSUM and refreshes features on MTU change" \
-  || bad "jumbo MTU must disable TSO/TX-CSUM via ndo_fix_features and netdev_update_features"
+  && ok "jumbo MTU disables TSO/TX-CSUM through Rust policy and refreshes features on MTU change" \
+  || bad "jumbo MTU must disable TSO/TX-CSUM via Rust-owned ndo_fix_features policy and netdev_update_features"
 
 exit $fail

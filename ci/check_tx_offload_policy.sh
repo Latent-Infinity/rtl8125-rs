@@ -25,6 +25,8 @@ UNIT="$ROOT/ci/check_rust_unit_tests.sh"
 
 # 1. The policy + the chip bit values live in Rust, host-tested.
 need "$TXOFF" 'fn decide\(' "TX offload decision is a pure Rust fn"
+need "$TXOFF" 'fn features_check\(' "TX feature-check veto is a pure Rust fn"
+need "$TXOFF" 'fn fix_features\(' "TX MTU feature repair is a pure Rust fn"
 need "$TXOFF" 'TD1_TCP_CS|TD1_UDP_CS|TD1_IPV4_CS' "checksum-v2 bit values are Rust-owned"
 need "$TXOFF" 'TD1_GTSENV4|TD1_GTSENV6' "TSO giant-send bit values are Rust-owned"
 need "$TXOFF" 'GTTCPHO_MAX|TCPHO_MAX' "transport-offset field limits are Rust-owned"
@@ -36,17 +38,25 @@ need "$UNIT" 'src/tx_offload.rs' "offload policy is registered in the host unit-
 
 # 2. The C shim calls the Rust policy + only gathers facts / applies side effects.
 need "$OFFLOAD" 'r8125_tx_offload_decide\(' "C calls the Rust offload decision"
+need "$ROOT/src/netdev_bridge.c" 'r8125_tx_features_check\(' "ndo_features_check delegates chip veto policy to Rust"
+need "$ROOT/src/netdev_bridge.c" 'r8125_tx_fix_features\(' "ndo_fix_features delegates chip MTU policy to Rust"
 need "$OFFLOAD" 'r8125_tx_offload_facts' "C gathers the protocol facts struct"
 need "$UB" 'fn r8125_tx_offload_decide' "the Rust->C decision export exists in the boundary file"
+need "$UB" 'fn r8125_tx_features_check' "the Rust->C feature-check export exists in the boundary file"
+need "$UB" 'fn r8125_tx_fix_features' "the Rust->C fix-features export exists in the boundary file"
 
 # 3. The descriptor-bit POLICY must NOT have leaked back into C.
 reject "$OFFLOAD" 'R8125_TD1_(TCP|UDP|IPV4|IPV6)_CS' "no checksum bit constants in C"
 reject "$OFFLOAD" 'R8125_TD1_GTSENV[46]' "no TSO bit constants in C"
 reject "$OFFLOAD" 'R8125_TCPHO_SHIFT|R8125_GTTCPHO_SHIFT|R8125_TD1_MSS_SHIFT' "no descriptor field shifts in C"
+reject "$ROOT/src/netdev_bridge.c" 'R8125_GTTCPHO_MAX|R8125_TCPHO_MAX' "no descriptor field limits in C"
+reject "$ROOT/src/netdev_bridge.c" 'ndev->mtu > ETH_DATA_LEN' "no MTU descriptor-limit policy in C"
 
 # 4. The FFI structs are defined on both sides (kept in sync by review + ABI).
 need "$HDR" 'struct r8125_tx_offload_facts' "facts struct declared in the shared header"
 need "$HDR" 'struct r8125_tx_offload_decision' "decision struct declared in the shared header"
+need "$HDR" 'r8125_tx_features_check' "feature-check policy export declared in the shared header"
+need "$HDR" 'r8125_tx_fix_features' "fix-features policy export declared in the shared header"
 need "$TXOFF" 'struct Facts' "facts struct defined in Rust"
 need "$TXOFF" 'struct Decision' "decision struct defined in Rust"
 
