@@ -21,6 +21,7 @@
 
 #include <linux/slab.h>
 #include <linux/rtnetlink.h>
+#include <linux/workqueue.h>
 #include <net/devlink.h>
 
 /* Opaque handle stored in r8125_bridge.devlink (set up at register, torn down at
@@ -56,17 +57,31 @@ static int r8125_bridge_devlink_tx_recover(struct devlink_health_reporter *repor
 	return rc;
 }
 
+/*
+ * Reporter .test: let `devlink health test` exercise the TX-timeout recovery on
+ * demand. It must NOT raise the health report directly: the core invokes .test
+ * (and .recover) with the reporter lock HELD, and the report path re-takes that
+ * lock — the recursive self-deadlock that bit us once. Instead schedule the SAME
+ * reset_work the real ndo_tx_timeout watchdog schedules; it reports +
+ * auto-recovers from process context with no reporter lock held, so there is no
+ * re-entrancy. schedule_work is non-blocking and lock-free, safe under .test.
+ * Like a real timeout, the test causes a chip reopen (a brief link blip).
+ */
+static int r8125_bridge_devlink_tx_test(struct devlink_health_reporter *reporter,
+					struct netlink_ext_ack *extack)
+{
+	struct r8125_bridge *b = devlink_health_reporter_priv(reporter);
+
+	(void)extack;
+	schedule_work(&b->reset_work);
+	return 0;
+}
+
 static const struct devlink_health_reporter_ops r8125_bridge_tx_reporter_ops = {
 	.name = "tx",
 	.recover = r8125_bridge_devlink_tx_recover,
+	.test = r8125_bridge_devlink_tx_test,
 };
-/*
- * NOTE: no .test op. The devlink-health core invokes .test/.recover with the
- * reporter lock HELD, so calling that report helper from inside either one
- * self-deadlocks (the report path re-takes that lock). The error path that
- * raises it therefore lives only in reset_work (process
- * context, no devlink lock held); the real ndo_tx_timeout watchdog exercises it.
- */
 
 /*
  * Allocate + register the devlink instance and its TX health reporter. Called

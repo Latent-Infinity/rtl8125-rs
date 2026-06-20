@@ -520,6 +520,7 @@ impl RxQueueState {
                 |_| AtomicU64::new(0)
             ),
             buf_len: CachePadded::new(AtomicU32::new(0)),
+
             tail: CachePadded::new(AtomicUsize::new(0)),
             posted: CachePadded::new(AtomicUsize::new(0)),
             xsk_lock: CachePadded::new(AtomicBool::new(false)),
@@ -1283,6 +1284,7 @@ fn free_rx_queue_slots(state: &NetdevState, queue_id: u32) {
         return;
     };
     let ndev = state.ndev.load(Ordering::Acquire);
+
     for i in 0..RING_LEN {
         let slot = rx.slot(i);
         rx.set_slot(i, RxSlot::EMPTY);
@@ -2173,7 +2175,14 @@ fn ndo_open(state: &NetdevState, feature_flags: u32) -> Result<()> {
     // pool's buffers hold. Set after hw_start, before the RX engine is
     // enabled below. `buf_len` is the pool's device-writable length, ≤
     // RX_MAX_SIZE_JUMBO (0x3FFF), so it fits the 16-bit register.
-    regs.set_rx_max_size(state.rx_queue0().buf_len.inner.load(Ordering::Relaxed) as u16);
+    let buf_len0 = state.rx_queue0().buf_len.inner.load(Ordering::Relaxed);
+    regs.set_rx_max_size(buf_len0 as u16);
+
+    // PCIe readrq + PHY pause config for jumbo MTU. Mirrors mainline
+    // rtl_jumbo_config (called after hw_start, before RX/TX enable). The jumbo
+    // decision (MTU policy) is made HERE in Rust: a jumbo open's per-MTU buf_len
+    // exceeds the standard frame ceiling. The cshim only applies the side effects.
+    ub::bridge_jumbo_config(ndev, buf_len0 > regs::STD_FRAME_MAX);
 
     // Program the chip's RX-filter MAC (IDR0/IDR4) from dev_addr. hw_start's
     // reset clears IDR0, so without this the chip would drop all unicast frames

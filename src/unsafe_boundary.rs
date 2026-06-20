@@ -387,6 +387,7 @@ extern "C" {
     ) -> c_int;
     fn r8125_bridge_phy_connect_and_reset(ndev: *mut bindings::net_device) -> c_int;
     fn r8125_bridge_phy_kick_state_machine(ndev: *mut bindings::net_device) -> c_int;
+    fn r8125_bridge_jumbo_config(ndev: *mut bindings::net_device, jumbo: bool);
     fn r8125_bridge_phy_stop(ndev: *mut bindings::net_device);
     fn r8125_bridge_phy_modify_paged(
         ndev: *mut bindings::net_device,
@@ -1729,6 +1730,19 @@ pub(crate) fn bridge_phy_kick_state_machine(ndev: *mut bindings::net_device) -> 
     to_result(rc)
 }
 
+/// PCIe readrq + PHY pause config. `jumbo` (the MTU-threshold decision — kept in
+/// Rust so frame-size policy stays out of the cshim) tells the shim to drop pause
+/// and restart autoneg for jumbo. Mirrors mainline `rtl_jumbo_config`. Must be
+/// called after the PHY is connected+reset but before RX/TX engines are enabled.
+///
+/// # SAFETY: `ndev` must be a valid net_device with an associated
+/// `r8125_bridge` whose `pdev` and `phydev` are alive (guaranteed after
+/// `bridge_phy_connect_and_reset` succeeds and before `ndo_stop`).
+pub(crate) fn bridge_jumbo_config(ndev: *mut bindings::net_device, jumbo: bool) {
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_jumbo_config(ndev, jumbo) };
+}
+
 /// phy_stop + phy_disconnect — called from ndo_stop.
 ///
 /// # SAFETY: as `bridge_phy_start`. Idempotent if `bridge_phy_start` was
@@ -1909,4 +1923,29 @@ pub(crate) extern "C" fn r8125_tx_offload_decide(
     facts: crate::tx_offload::Facts,
 ) -> crate::tx_offload::Decision {
     crate::tx_offload::decide(&facts)
+}
+
+/// Rust→C export of the per-skb offload feature veto. The cshim supplies skb
+/// facts and the kernel's feature-bit masks; the chip-specific descriptor-field
+/// limits live in `crate::tx_offload` with the rest of the TX policy.
+#[no_mangle]
+pub(crate) extern "C" fn r8125_tx_features_check(
+    facts: crate::tx_offload::Facts,
+    features: u64,
+    all_tso_mask: u64,
+    csum_mask: u64,
+) -> u64 {
+    crate::tx_offload::features_check(&facts, features, all_tso_mask, csum_mask)
+}
+
+/// Rust→C export of the MTU-dependent offload feature repair. C supplies the
+/// netdev MTU and kernel feature masks; Rust owns the chip MSS-field policy.
+#[no_mangle]
+pub(crate) extern "C" fn r8125_tx_fix_features(
+    mtu: u32,
+    features: u64,
+    all_tso_mask: u64,
+    csum_mask: u64,
+) -> u64 {
+    crate::tx_offload::fix_features(mtu, features, all_tso_mask, csum_mask)
 }

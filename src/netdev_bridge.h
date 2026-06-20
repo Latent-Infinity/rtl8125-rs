@@ -648,6 +648,8 @@ void r8125_bridge_rx_one_packet(struct net_device *ndev,
 				u64 hash_info,
 				void **new_cpu, dma_addr_t *new_dma);
 
+
+
 /*
  * Free an skb on the TX-error path (validation reject, DMA-map failure,
  * etc.). Counter: tx_dropped_error++. Calls `dev_kfree_skb_any` exactly
@@ -674,20 +676,12 @@ int  r8125_bridge_reopen_for_mtu(struct net_device *ndev, int new_mtu);
 /* ──────────────────────────────────────────────────────────────────────
  *  HW checksum offload.
  *
- *  The Rust ndo_start_xmit / napi::poll paths don't peek into sk_buff
- *  internals; the cshim does the protocol introspection and tells the
- *  Rust side what TX descriptor bits to OR in (or returns an error if
- *  software checksum completion fails before DMA mapping), and consumes the
- *  RX descriptor `opts1` to set `skb->ip_summed = CHECKSUM_UNNECESSARY`
- *  when the chip validated the checksum.
- *
- *  Bit values mirror both r8169_main.c (TD1_*_CS) and Realtek's r8125
- *  vendor driver (TxTCPCS_C / TxUDPCS_C / TxIPCS_C / TxIPV6F_C):
- *    bit 31 (TxUDPCS_C) — chip computes UDP/IP checksum
- *    bit 30 (TxTCPCS_C) — chip computes TCP/IP checksum
- *    bit 29 (TxIPCS_C)  — chip computes IPv4 checksum
- *    bit 28 (TxIPV6F_C) — frame is IPv6
- *    bits [27:18] TCPHO_SHIFT — transport header offset
+ *  The Rust ndo_start_xmit / napi::poll paths don't peek into sk_buff internals.
+ *  The cshim gathers protocol facts and applies the side effects chosen by the
+ *  Rust TX policy (`src/tx_offload.rs`), including descriptor bits, feature
+ *  vetoes, and software-checksum fallback. On RX, the cshim consumes descriptor
+ *  `opts1` to set `skb->ip_summed = CHECKSUM_UNNECESSARY` when the chip
+ *  validated the checksum.
  *
  *  The RTL8125 pad quirk mirrors r8169/vendor scope: normal short UDP
  *  checksum-partial packets stay on hardware checksum; only PTP event
@@ -844,6 +838,13 @@ struct r8125_bridge_mdio_ops {
  */
 int r8125_bridge_phy_register(struct net_device *ndev,
 			      const struct r8125_bridge_mdio_ops *ops);
+
+/* Jumbo MTU config: raise PCIe readrq to 4096 and, when MTU > ETH_DATA_LEN,
+ * disable pause on the PHY (the chip does not support pause in jumbo mode).
+ * Mirrors mainline r8169's `rtl_jumbo_config`. Safe to call after the PHY
+ * has been connected + reset but before the chip RX/TX engines are enabled.
+ */
+void r8125_bridge_jumbo_config(struct net_device *ndev, bool jumbo);
 
 /* Two-step PHY bring-up matching the r8169 ordering for 8125B (the
  * embedded MAC/PHY couple: phy_soft_reset clobbers ChipCmd, so the

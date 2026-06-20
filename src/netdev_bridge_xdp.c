@@ -16,8 +16,10 @@
  * batches the same producer path. xdp_features is advertised as
  * BASIC | REDIRECT | NDO_XMIT in netdev_bridge.c.
  *
- * Hard cap: 300 LOC. Enforced by ci/check_cshim_loc_caps.sh. Raised from 280 for
- * the ndo_bpf XDP_SETUP_XSK_POOL dispatch arm (AF_XDP zero-copy bind/unbind).
+ * Hard cap: 330 LOC. Enforced by ci/check_cshim_loc_caps.sh.
+ * Previously raised from 280 for the ndo_bpf XDP_SETUP_XSK_POOL dispatch arm
+ * (AF_XDP zero-copy bind/unbind). See docs/XDP_MULTIBUF_DESIGN.md for why
+ * multi-buffer RX was stripped (RTL8125 does not split frames).
  */
 #include "netdev_bridge_internal.h"
 
@@ -26,6 +28,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/filter.h>
 #include <linux/rtnetlink.h>
+#include <net/netmem.h>
 #include <net/page_pool/helpers.h>
 #include <net/xdp.h>
 

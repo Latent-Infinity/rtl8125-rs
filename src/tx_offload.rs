@@ -35,6 +35,9 @@ const MSS_MAX: u32 = 0x7ff;
 
 /// Minimum Ethernet frame for the short-frame pad decision.
 const ETH_ZLEN: u32 = 60;
+/// Standard Ethernet data MTU. Jumbo MTU can produce TCP MSS values that exceed
+/// the RTL8125B descriptor field; disable affected offloads above this value.
+const ETH_DATA_LEN: u32 = 1500;
 
 // ---- Facts flag bits (filled by the C shim) --------------------------------
 /// `skb->ip_summed == CHECKSUM_PARTIAL`.
@@ -191,6 +194,37 @@ pub(crate) fn decide(f: &Facts) -> Decision {
     opts2 |= f.transport_offset << TCPHO_SHIFT;
     opts2 |= vlan;
     Decision::new(ACT_CSUM, 0, opts2, 0, 0)
+}
+
+/// Per-skb feature veto for offloads whose descriptor fields cannot encode this
+/// packet. The C shim supplies the current kernel feature mask plus the kernel's
+/// `NETIF_F_ALL_TSO` / `NETIF_F_CSUM_MASK` values; the RTL8125-specific decision
+/// (which skb facts overflow the chip fields) stays here with the TX descriptor
+/// policy and its host tests.
+pub(crate) fn features_check(
+    f: &Facts,
+    mut features: u64,
+    all_tso_mask: u64,
+    csum_mask: u64,
+) -> u64 {
+    if f.flags & F_IS_GSO != 0 && f.transport_offset > GTTCPHO_MAX {
+        features &= !all_tso_mask;
+    } else if f.flags & F_CSUM_PARTIAL != 0 && (f.len < ETH_ZLEN || f.transport_offset > TCPHO_MAX)
+    {
+        features &= !csum_mask;
+    }
+    features
+}
+
+/// Feature mask repair for MTU-dependent descriptor limits. At jumbo MTU the
+/// TCP MSS can exceed the RTL8125B 11-bit MSS field, so TSO and TX checksum
+/// offloads are disabled and the stack segments/checksums in software.
+pub(crate) fn fix_features(mtu: u32, mut features: u64, all_tso_mask: u64, csum_mask: u64) -> u64 {
+    if mtu > ETH_DATA_LEN {
+        features &= !all_tso_mask;
+        features &= !csum_mask;
+    }
+    features
 }
 
 #[cfg(test)]
@@ -378,5 +412,70 @@ mod tests {
         assert_eq!(d.action, ACT_CSUM);
         assert_eq!(d.opts2 & TX_VLAN_TAG, TX_VLAN_TAG);
         assert_eq!(d.opts2 & TD1_TCP_CS, TD1_TCP_CS);
+    }
+
+    #[test]
+    fn features_check_clears_tso_when_gso_header_offset_exceeds_chip_field() {
+        let mut f = facts();
+        f.flags = F_IS_GSO | F_GSO_TCPV4;
+        f.transport_offset = GTTCPHO_MAX + 1;
+        let all_tso = 0b0011_0000u64;
+        let csum = 0b1100_0000u64;
+        let out = features_check(&f, all_tso | csum | 0b1, all_tso, csum);
+        assert_eq!(out & all_tso, 0);
+        assert_eq!(out & csum, csum);
+        assert_eq!(out & 0b1, 0b1);
+    }
+
+    #[test]
+    fn features_check_clears_csum_for_short_or_far_partial_checksum() {
+        let all_tso = 0b0011_0000u64;
+        let csum = 0b1100_0000u64;
+
+        let mut short = facts();
+        short.flags = F_CSUM_PARTIAL;
+        short.len = ETH_ZLEN - 1;
+        assert_eq!(
+            features_check(&short, all_tso | csum, all_tso, csum) & csum,
+            0
+        );
+
+        let mut far = facts();
+        far.flags = F_CSUM_PARTIAL;
+        far.transport_offset = TCPHO_MAX + 1;
+        assert_eq!(
+            features_check(&far, all_tso | csum, all_tso, csum) & csum,
+            0
+        );
+    }
+
+    #[test]
+    fn features_check_leaves_encodable_packets_unchanged() {
+        let all_tso = 0b0011_0000u64;
+        let csum = 0b1100_0000u64;
+        let features = all_tso | csum | 0b101;
+        assert_eq!(features_check(&facts(), features, all_tso, csum), features);
+    }
+
+    #[test]
+    fn fix_features_disables_tso_and_csum_above_standard_mtu() {
+        let all_tso = 0b0011_0000u64;
+        let csum = 0b1100_0000u64;
+        let other = 0b101u64;
+        assert_eq!(
+            fix_features(9000, all_tso | csum | other, all_tso, csum),
+            other
+        );
+    }
+
+    #[test]
+    fn fix_features_keeps_standard_mtu_unchanged() {
+        let all_tso = 0b0011_0000u64;
+        let csum = 0b1100_0000u64;
+        let features = all_tso | csum | 0b101;
+        assert_eq!(
+            fix_features(ETH_DATA_LEN, features, all_tso, csum),
+            features
+        );
     }
 }

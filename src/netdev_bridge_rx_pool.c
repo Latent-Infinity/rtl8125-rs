@@ -34,7 +34,12 @@
  *   register — the "never let the chip write more than the buffer holds"
  *   rule.
  *
- * Hard cap: 400 LOC. Enforced by ci/check_cshim_loc_caps.sh. Raised to 400 for
+ * Hard cap: 620 LOC. Enforced by ci/check_cshim_loc_caps.sh. Raised from 400 for
+ * the shared rx_finish_skb helper factored out of the single-buffer path and the
+ * AF_XDP zero-copy branches that share the same buffer lifecycle. The multi-buffer
+ * reassembly super-calls (rx_begin_frame / rx_add_frag / rx_finish_frame /
+ * rx_abort_frame / rx_recycle_buf) were removed in the same cycle — see
+ * docs/XDP_MULTIBUF_DESIGN.md. Previously raised to 400 for
  * the AF_XDP zero-copy branches (delegating alloc/free/create/destroy to
  * netdev_bridge_xsk.c when a queue has an xsk pool bound). Raised earlier from
  * 200 for the page_pool create/destroy + zero-copy refill super-call; the
@@ -96,6 +101,22 @@ r8125_bridge_rxq(struct r8125_bridge *b, unsigned int queue_id)
 static void r8125_bridge_rx_geometry(struct r8125_bridge_rx_queue *q,
 				     unsigned int mtu)
 {
+	/*
+	 * Per-MTU single-buffer geometry: each RX buffer is large enough to hold a
+	 * whole frame for the current MTU (one descriptor = one frame, both V3
+	 * First/Last-segment bits set at bits 25/24 → the single-buffer fast path).
+	 *
+	 * The RTL8125 does NOT do RX scatter: mainline r8169 receives jumbo into a
+	 * single 16 KiB buffer (R8169_RX_BUF_SIZE) and never relies on the chip
+	 * splitting a frame across descriptors. Page-size buffers + chip splitting was
+	 * tried and the chip simply dropped any frame larger than one buffer (no
+	 * scatter), so the buffer must fit the whole frame. The chip RxMaxSize (hw.rs)
+	 * is the frame ceiling; the per-descriptor LEN below is the buffer's capacity.
+	 *
+	 * build_skb sets truesize to the whole buffer, so per-MTU sizing keeps
+	 * truesize proportional (a 1.5 KiB frame on a 4 KiB page, a 9 KiB frame on a
+	 * 16 KiB page) — important for TCP receive-memory accounting.
+	 */
 	unsigned int frame_max = mtu + VLAN_ETH_HLEN + ETH_FCS_LEN;
 	size_t data_room = SKB_DATA_ALIGN(R8125_RX_HEADROOM + frame_max);
 	size_t buf_total = data_room +
@@ -271,6 +292,52 @@ void r8125_bridge_rx_free(struct net_device *ndev, unsigned int queue_id, void *
 }
 
 /*
+ * Finalize a built RX skb: RSS hash, hardware checksum, VLAN tag, protocol,
+ * RX counters, then GRO. Used by the single-buffer fast path
+ * (`r8125_bridge_rx_one_packet`). The multi-buffer finish (`r8125_bridge_rx_finish_frame`)
+ * was removed — RTL8125 does not split frames across descriptors.
+ * `len` is the full frame length; metadata (csum/vlan/hash) comes from the
+ * frame's descriptor.
+ */
+void r8125_bridge_rx_finish_skb(struct net_device *ndev,
+				struct r8125_bridge_rx_queue *q,
+				struct sk_buff *skb, u32 desc_opts1,
+				u32 desc_opts2, u64 hash_info,
+				unsigned int len)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+	const bool hash_valid = (hash_info >> 63) & 1ULL;
+	const bool hash_l4 = (hash_info >> 62) & 1ULL;
+	const bool hash_enabled = (hash_info >> 61) & 1ULL;
+	const u32 hash_value = (u32)(hash_info & 0xFFFFFFFFULL);
+
+	skb->protocol = eth_type_trans(skb, ndev);
+	if (!hash_enabled) {
+		this_cpu_inc(*b->rx_hash_disabled);
+	} else if (hash_valid) {
+		if (hash_l4) {
+			skb_set_hash(skb, hash_value, PKT_HASH_TYPE_L4);
+			this_cpu_inc(*b->rx_hash_l4);
+		} else {
+			skb_set_hash(skb, hash_value, PKT_HASH_TYPE_L3);
+			this_cpu_inc(*b->rx_hash_l3);
+		}
+	} else {
+		this_cpu_inc(*b->rx_hash_missing);
+	}
+	r8125_bridge_skb_rx_csum_set(skb, desc_opts1);
+	if (desc_opts2 & R8125_RX_VLAN_TAG)
+		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
+				       swab16(desc_opts2 & R8125_RX_VLAN_MASK));
+	this_cpu_inc(*b->rx_handed_to_stack);
+	dev_sw_netstats_rx_add(ndev, len);
+	/* Per-queue counters for netdev_stat_ops; single-writer (this NAPI). */
+	q->rx_packets++;
+	q->rx_bytes += len;
+	napi_gro_receive(&q->napi, skb);
+}
+
+/*
  * `r8125_bridge_rx_one_packet` — zero-copy RX super-call with refill.
  *
  * Alloc-before-consume: grab a fresh page for the slot FIRST. If that
@@ -297,10 +364,6 @@ void r8125_bridge_rx_one_packet(struct net_device *ndev, unsigned int queue_id,
 	struct sk_buff *skb;
 	unsigned int xoff, xlen;
 	struct device *dev = &b->pdev->dev;
-	const bool hash_valid = (hash_info >> 63) & 1ULL;
-	const bool hash_l4 = (hash_info >> 62) & 1ULL;
-	const bool hash_enabled = (hash_info >> 61) & 1ULL;
-	const u32 hash_value = (u32)(hash_info & 0xFFFFFFFFULL);
 
 	/* A zero-copy queue never reaches this page_pool super-call: the Rust NAPI
 	 * poll takes a dedicated producer/consumer path that calls
@@ -347,33 +410,8 @@ void r8125_bridge_rx_one_packet(struct net_device *ndev, unsigned int queue_id,
 		skb_mark_for_recycle(skb);
 		skb_reserve(skb, xoff);
 		__skb_put(skb, xlen);
-		skb->protocol = eth_type_trans(skb, ndev);
-		if (!hash_enabled) {
-			this_cpu_inc(*b->rx_hash_disabled);
-		} else if (hash_valid) {
-			if (hash_l4) {
-				skb_set_hash(skb, hash_value, PKT_HASH_TYPE_L4);
-				this_cpu_inc(*b->rx_hash_l4);
-			} else {
-				skb_set_hash(skb, hash_value, PKT_HASH_TYPE_L3);
-				this_cpu_inc(*b->rx_hash_l3);
-			}
-		} else {
-			this_cpu_inc(*b->rx_hash_missing);
-		}
-		r8125_bridge_skb_rx_csum_set(skb, desc_opts1);
-		if (desc_opts2 & R8125_RX_VLAN_TAG)
-			__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
-						  swab16(desc_opts2 &
-							 R8125_RX_VLAN_MASK));
-		this_cpu_inc(*b->rx_handed_to_stack);
-		dev_sw_netstats_rx_add(ndev, xlen);
-		/* Per-queue counters for netdev_stat_ops; single-writer (this NAPI),
-		 * kept next to the device total so the two stay consistent.
-		 */
-		q->rx_packets++;
-		q->rx_bytes += xlen;
-		napi_gro_receive(&q->napi, skb);
+		r8125_bridge_rx_finish_skb(ndev, q, skb, desc_opts1, desc_opts2,
+					   hash_info, xlen);
 	}
 
 	*new_cpu = page_address(newpage);

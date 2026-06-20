@@ -66,16 +66,6 @@
 #include <asm/barrier.h>
 
 /*
- * TX-descriptor transport-offset limits for the checksum-v2 engine (RTL8125B
- * is MAC_VER_63 = csum v2). Ported from r8169 GTTCPHO_MAX / TCPHO_MAX: a TCP
- * header offset beyond these cannot be encoded in the descriptor, so
- * ndo_features_check drops TSO / checksum offload for such skbs and lets the
- * stack do it in software.
- */
-#define R8125_GTTCPHO_MAX	0x7f
-#define R8125_TCPHO_MAX		0x3ff
-
-/*
  * Raised from 64 (r8169 default) to 128: at MTU-1500 line rate (~166k pps)
  * the Rust RX poll is more per-packet-expensive than r8169's C path, so a
  * deeper per-poll drain reduces re-arm churn and ring-overrun drops. Eval
@@ -128,6 +118,31 @@ static void bridge_napi_del_all(struct r8125_bridge *b)
 
 	for (i = 0; i < R8125_BRIDGE_RX_QUEUE_COUNT; i++)
 		netif_napi_del(&b->rxq[i].napi);
+}
+
+/*
+ * r8125_bridge_jumbo_config — PCIe readrq + PHY pause config for jumbo MTU.
+ *
+ * Mirrors mainline r8169's `rtl_jumbo_config`: raises the PCIe Max-Read-Request
+ * to 4096 (chip default may be smaller, which chokes DMA for frames > ~1.6 KiB),
+ * and — when `jumbo` — clears pause from the PHY advertising + restarts autoneg
+ * (the chip does not support pause in jumbo mode). The jumbo decision (the MTU
+ * threshold) is made by the Rust caller, so the frame-size policy stays in Rust;
+ * this shim only applies the kernel-object side effects.
+ *
+ * Safe to call repeatedly (idempotent at every ndo_open).
+ */
+void r8125_bridge_jumbo_config(struct net_device *ndev, bool jumbo)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+
+	pcie_set_readrq(b->pdev, 4096);
+
+	/* Chip doesn't support pause in jumbo mode */
+	if (jumbo) {
+		phy_set_asym_pause(b->phydev, false, false);
+		phy_start_aneg(b->phydev);
+	}
 }
 
 static int bridge_ndo_open(struct net_device *ndev)
@@ -255,47 +270,29 @@ static int bridge_ndo_change_mtu(struct net_device *ndev, int new_mtu)
 	return rc;
 }
 
-/*
- * `bridge_ndo_fix_features` — RTL8125B feature mask vs MTU rule, ported
- * from `rtl8169_fix_features` in `r8169_main.c:1799`. Without this,
- * jumbo MTU + TSO produces frames whose MSS field wraps in the TX
- * descriptor's 11-bit slot, and the chip silently emits malformed
- * segments. Same workaround applies to HW CSUM at jumbo on MAC_VER
- * > 06. RTL8125B is MAC_VER_63, so both bits trip.
- */
 static netdev_features_t bridge_ndo_fix_features(struct net_device *ndev,
 						  netdev_features_t features)
 {
-	if (ndev->mtu > ETH_DATA_LEN) {
-		features &= ~NETIF_F_ALL_TSO;
-		features &= ~NETIF_F_CSUM_MASK;
-	}
-	return features;
+	return (netdev_features_t)r8125_tx_fix_features(ndev->mtu, features,
+							NETIF_F_ALL_TSO,
+							NETIF_F_CSUM_MASK);
 }
 
-/*
- * `ndo_features_check` — per-skb offload veto, ported from
- * `rtl8169_features_check`. RTL8125B uses the checksum-v2 engine, whose TX
- * descriptor encodes the transport-header offset in a limited field. For a GSO
- * skb whose TCP header sits beyond GTTCPHO_MAX, or a CHECKSUM_PARTIAL skb whose
- * header sits beyond TCPHO_MAX (or a runt < ETH_ZLEN), the chip would emit
- * malformed segments, so strip the offending offload and let the stack handle
- * it. fix_features (MTU rule) handles the jumbo case separately.
- */
 static netdev_features_t bridge_ndo_features_check(struct sk_buff *skb,
 						   struct net_device *ndev,
 						   netdev_features_t features)
 {
-	if (skb_is_gso(skb)) {
-		if (skb_transport_offset(skb) > R8125_GTTCPHO_MAX)
-			features &= ~NETIF_F_ALL_TSO;
-	} else if (skb->ip_summed == CHECKSUM_PARTIAL) {
-		if (skb->len < ETH_ZLEN)
-			features &= ~NETIF_F_CSUM_MASK;
-		if (skb_transport_offset(skb) > R8125_TCPHO_MAX)
-			features &= ~NETIF_F_CSUM_MASK;
-	}
+	struct r8125_tx_offload_facts f = {0};
 
+	f.len = skb->len;
+	f.transport_offset = skb_transport_offset(skb);
+	if (skb_is_gso(skb))
+		f.flags |= R8125_TXO_F_IS_GSO;
+	if (skb->ip_summed == CHECKSUM_PARTIAL)
+		f.flags |= R8125_TXO_F_CSUM_PARTIAL;
+	features = (netdev_features_t)r8125_tx_features_check(f, features,
+							      NETIF_F_ALL_TSO,
+							      NETIF_F_CSUM_MASK);
 	return vlan_features_check(skb, features);
 }
 
@@ -631,6 +628,11 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	 * xdp_do_redirect + a once-per-poll xdp_do_flush; XSK_ZEROCOPY binds a umem
 	 * pool per queue (ndo_bpf XDP_SETUP_XSK_POOL + ndo_xsk_wakeup). The advertised
 	 * set is exactly what works; BASIC|REDIRECT also unlocks copy-mode AF_XDP.
+	 *
+	 * RX_SG is NOT advertised: the RTL8125 does not do multi-descriptor RX
+	 * splitting (mainline r8169 receives jumbo into a single 16 KiB buffer).
+	 * Jumbo RX uses a single large per-MTU buffer; multi-buffer RX cannot be
+	 * delivered on this chip. See docs/XDP_MULTIBUF_DESIGN.md.
 	 */
 	ndev->xdp_features = NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT |
 			     NETDEV_XDP_ACT_NDO_XMIT | NETDEV_XDP_ACT_XSK_ZEROCOPY;

@@ -142,6 +142,10 @@ fn process_rx_completions(state: &NetdevState, queue_id: u32, budget_u: usize) -
     // so the hot loop has no per-packet `match RxDescFormat` and no double read.
     let parse = crate::ring::RxParse::new(rx.format);
     let rx_ring = rx.desc.cast::<u8>();
+    // RX scatter-gather reassembly state, restored from the per-queue atomics so
+    // a jumbo frame that straddled the previous poll's budget resumes correctly.
+    // Idle (zero / null) on the single-buffer fast path. Persisted back at exit.
+
     while work_done < budget_u {
         // Cheap OWN check first (single word read, pre-barrier). If the slot is
         // still device-owned it isn't filled yet — stop.
@@ -166,13 +170,6 @@ fn process_rx_completions(state: &NetdevState, queue_id: u32, budget_u: usize) -
         let slot_dma = rx.slot_dma[rx_tail].load(Ordering::Relaxed);
         let mut post_dma = slot_dma;
         if len > 0 {
-            // RX super-call (zero-copy + per-MTU):
-            // zero-copy napi_build_skb + page-pool recycle, with
-            // alloc-before-consume refill. The received page is handed to
-            // the stack (no copy) and the slot is refilled with a fresh
-            // page; the call returns the slot's new (cpu, dma). On a refill
-            // failure it drops the frame and returns the old (cpu, dma)
-            // unchanged. The cshim handles all counter accounting.
             let slot_cpu = rx.slot_cpu[rx_tail].load(Ordering::Relaxed);
             let hash_info = if !rx_hash_enabled {
                 0
@@ -188,6 +185,11 @@ fn process_rx_completions(state: &NetdevState, queue_id: u32, budget_u: usize) -
                         | (u64::from(h.value) & RX_HASH_INFO_VALUE_MASK)
                 })
             };
+            // Fast path: every RX descriptor carries a complete frame (the chip
+            // never splits across 16K-per-slot buffers). The vendor and mainline
+            // drivers treat fragmented frames as over-MTU errors and drop them.
+            // Multi-descriptor RX is not supported on this hardware. See
+            // docs/XDP_MULTIBUF_DESIGN.md.
             let (new_cpu, new_dma) = ub::bridge_rx_one_packet(
                 ndev,
                 queue_id,
@@ -198,9 +200,6 @@ fn process_rx_completions(state: &NetdevState, queue_id: u32, budget_u: usize) -
                 completion.opts2,
                 hash_info,
             );
-            // Publish the refilled buffer into the slot shadow so the next
-            // wrap-around reads the live page, not the one now owned by the
-            // stack. (No-op store on the drop path — values are unchanged.)
             rx.set_slot(
                 rx_tail,
                 RxSlot {

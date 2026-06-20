@@ -439,6 +439,12 @@ pub(crate) const RX_MAX_SIZE_DEFAULT: u16 = 1536;
 /// (16383) plus we round to the chip's 14-bit length field cap.
 pub(crate) const RX_MAX_SIZE_JUMBO: u16 = 0x3FFF;
 
+/// Largest L2 frame at the standard Ethernet MTU = `ETH_DATA_LEN(1500) +
+/// VLAN_ETH_HLEN(18) + ETH_FCS_LEN(4)`. The per-MTU `buf_len` equals this at MTU
+/// 1500; a larger `buf_len` means jumbo. Used by the open path to decide jumbo
+/// (the MTU policy decision lives in Rust, not the cshim — `ci/check_tx_offload_policy.sh`).
+pub(crate) const STD_FRAME_MAX: u32 = 1522;
+
 // ── Jumbo-buffer sizing — paired with src/netdev_bridge_rx_pool.c ────────
 /// 9 KiB jumbo cap (the standard Ethernet-industry limit; switches and
 /// SFPs commonly support up to here, and our chip's TSO `max_segs = 10`

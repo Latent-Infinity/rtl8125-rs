@@ -82,6 +82,10 @@ struct r8125_tx_offload_decision {
 /* Implemented in Rust (src/tx_offload.rs); pure + scalar ABI. */
 struct r8125_tx_offload_decision
 r8125_tx_offload_decide(struct r8125_tx_offload_facts facts);
+u64 r8125_tx_features_check(struct r8125_tx_offload_facts facts, u64 features,
+			    u64 all_tso_mask, u64 csum_mask);
+u64 r8125_tx_fix_features(u32 mtu, u64 features, u64 all_tso_mask,
+			  u64 csum_mask);
 
 struct r8125_bridge_rx_queue {
 	struct r8125_bridge *bridge;
@@ -308,5 +312,13 @@ int  r8125_bridge_ndo_xdp_xmit(struct net_device *ndev, int n,
  * XDP_TX frame's page to its origin page_pool at TX completion.
  */
 void r8125_bridge_xdp_return_frame(void *frame);
+
+/* Finalize a built RX skb (hash/csum/vlan/protocol/counters + GRO). Shared by
+ * the single-buffer path and the XDP_PASS path. Defined in netdev_bridge_rx_pool.c.
+ */
+void r8125_bridge_rx_finish_skb(struct net_device *ndev,
+				struct r8125_bridge_rx_queue *q,
+				struct sk_buff *skb, u32 desc_opts1,
+				u32 desc_opts2, u64 hash_info, unsigned int len);
 
 #endif /* _R8125_NETDEV_BRIDGE_INTERNAL_H */
