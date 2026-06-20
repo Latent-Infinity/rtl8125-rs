@@ -44,6 +44,23 @@ trap 'rm -f "$FAILLOG"' EXIT
 
 log(){ printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$LOG"; }
 faults(){ dmesg | grep -icE 'KASAN|UBSAN|BUG:|Oops|general protection|use-after-free|out-of-bounds|slab-out-of-bounds|DMA-API.*(WARN|error|warning)|WARNING:|possible.*deadlock|kmemleak: [0-9]+ new'; }
+# r8125-scoped fault count: only kernel-debug splats whose report block references
+# the driver, its cshim, a hot-path symbol, the DUT interface, or the DUT BDF.
+# This drives the PASS/FAIL verdict so an UNRELATED subsystem on the same host
+# (e.g. the gateway's WiFi wpa_supplicant faulting under KASAN) cannot fail the
+# r8125 soak. The broad faults() above is kept as an informational column. A
+# splat "belongs to us" if any of the ~60 lines after its trigger names us.
+r8125_faults(){
+  dmesg | awk -v dev="$DEV" -v bdf="${BDF:-}" '
+    function endwin(){ if (win>0 && hit) n++; win=0; hit=0 }
+    BEGIN{ IGNORECASE=1; n=0; win=0; hit=0 }
+    /KASAN|UBSAN|BUG:|Oops|general protection|use-after-free|out-of-bounds|slab-out-of-bounds|DMA-API.*(WARN|error|warning)|WARNING:|possible.*deadlock|kmemleak: [0-9]+ new/ { endwin(); win=60; hit=0 }
+    win>0 {
+      if ($0 ~ /r8125|netdev_bridge|tx_offload|rust_xmit|rust_stop|rust_open|process_tx|process_rx|gphy_ocp|mac_ocp/ || index($0,dev)>0 || (bdf!="" && index($0,bdf)>0)) hit=1
+      win--
+    }
+    END{ endwin(); print n+0 }'
+}
 es(){ ethtool -S "$DEV" 2>/dev/null | awk -v k="$1:" '$1==k{print $2}'; }   # ethtool -S field (in dut ns: prefix with $DUT)
 # all values read inside dut netns
 duts(){ $DUT ethtool -S "$DEV" 2>/dev/null; }
@@ -64,7 +81,7 @@ sudo dmesg -C 2>/dev/null || true
 
 ACTIVE=$($DUT ethtool -l "$DEV" 2>/dev/null | awk '/Current/{f=1} f&&/RX:/{print $2; exit}')
 log "carrier=$(carrier) active_rx_queues=$ACTIVE mac=$($DUT cat /sys/class/net/$DEV/address)"
-echo "ts,elapsed_s,tx_received,rx_handed,gap,gbps,faults,hw_err_delta,hw_drop_delta,carrier_flaps,memavail_kb,slab_kb,kmemleak_new,aer" > "$CSV"
+echo "ts,elapsed_s,tx_received,rx_handed,gap,gbps,faults,kernel_faults,hw_err_delta,hw_drop_delta,carrier_flaps,memavail_kb,slab_kb,kmemleak_new,aer" > "$CSV"
 
 # ── background bidirectional traffic (respawn to dodge long-run iperf3 wedge) ─
 start=$(date +%s); deadline=$((start + SOAK_SECS))
@@ -101,7 +118,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   dtx=$((tx-prev_tx)); drx=$((rx-prev_rx)); gap=$((tx-tc-tb-td))
   # throughput estimate from tx_received packets (avg ~1500B wire) over interval
   gbps=$(awk -v p="$dtx" -v i="$SAMPLE_INTERVAL" 'BEGIN{printf "%.3f", (p*1500*8)/(i*1e9)}')
-  f=$(faults)
+  f=$(r8125_faults); kf=$(faults)   # f = r8125-scoped (verdict); kf = all-kernel (context)
   # Separate TRUE hardware errors (must stay 0) from drops. tx_dropped/rx_dropped
   # legitimately grow on the intentional link-flap churn and on queue-stop, so
   # they are recorded but never fail the soak. Error indices in ipstat order
@@ -115,7 +132,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   # cache + KASAN shadow, so it is recorded for trend but does NOT fail the run).
   echo scan | sudo tee /sys/kernel/debug/kmemleak >/dev/null 2>&1; sleep 3
   kml=$(sudo cat /sys/kernel/debug/kmemleak 2>/dev/null | grep -c 'unreferenced object')
-  echo "$(date -u +%H:%M:%S),$elapsed,$tx,$rx,$gap,$gbps,$f,$hwd,$hwdrop,$carrier_flaps,$mem,$slb,$kml,$a" >> "$CSV"
+  echo "$(date -u +%H:%M:%S),$elapsed,$tx,$rx,$gap,$gbps,$f,$kf,$hwd,$hwdrop,$carrier_flaps,$mem,$slb,$kml,$a" >> "$CSV"
   # liveness + throughput: skip for one sample after a churn (link-flap briefly
   # interrupts traffic). While traffic should be running, both counters advance.
   if [ "$grace" = 0 ] && kill -0 "$TRAFFIC_PID" 2>/dev/null && { [ "$dtx" -le 0 ] || [ "$drx" -le 0 ]; }; then
@@ -125,11 +142,11 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   if [ "$grace" = 0 ] && [ "$dtx" -gt 0 ] && awk -v g="$gbps" -v fl="$TPUT_FLOOR_GBPS" 'BEGIN{exit !(g<fl)}'; then
     low_tput=$((low_tput+1)); echo "LOW_TPUT=$gbps<$fl @${elapsed}s" >>"$FAILLOG"
   fi
-  [ "$f" -gt 0 ] && { echo "FAULTS=$f @${elapsed}s" >>"$FAILLOG"; dmesg | grep -E 'KASAN|BUG:|WARNING:|use-after-free|DMA-API|kmemleak: [0-9]+ new' | tail -5 >>"$FAILLOG"; }
+  [ "$f" -gt 0 ] && { echo "FAULTS=$f (r8125-scoped; kernel-wide=$kf) @${elapsed}s" >>"$FAILLOG"; dmesg | grep -E 'KASAN|BUG:|WARNING:|use-after-free|DMA-API|kmemleak: [0-9]+ new' -A20 | grep -iE 'r8125|netdev_bridge|tx_offload|rust_|process_tx|process_rx|'"$DEV" | tail -8 >>"$FAILLOG"; }
   [ "$hwd" -gt 0 ] && echo "HW_ERR_GROWTH=$hwd @${elapsed}s ($cur_hw)" >>"$FAILLOG"
   [ "$kml" -gt 0 ] && echo "KMEMLEAK=$kml @${elapsed}s" >>"$FAILLOG"
   [ "$mem" -lt "$min_mem" ] && min_mem=$mem
-  log "  s$samples t=${elapsed}s gbps=$gbps faults=$f hw_err=+$hwd drop=+$hwdrop flaps=$carrier_flaps memavail=${mem}kb kmemleak=$kml gap=$gap"
+  log "  s$samples t=${elapsed}s gbps=$gbps faults=$f (kernel=$kf) hw_err=+$hwd drop=+$hwdrop flaps=$carrier_flaps memavail=${mem}kb kmemleak=$kml gap=$gap"
   prev_tx=$tx; prev_rx=$rx; grace=0
   # periodic control-plane churn: link flap + ethtool reads (chip recovery + ops coverage)
   if [ $((now - last_churn)) -ge "$CHURN_INTERVAL" ]; then
@@ -145,9 +162,10 @@ kill "$TRAFFIC_PID" 2>/dev/null; wait "$TRAFFIC_PID" 2>/dev/null
 mem_drop=$((base_mem - min_mem))
 
 # ── verdict ──────────────────────────────────────────────────────────────────
-total_faults=$(faults); iperf_fails=$([ -s "$FAILLOG" ] && grep -c 'iperf .* failed' "$FAILLOG" || echo 0)
+total_faults=$(r8125_faults); kernel_faults=$(faults)   # verdict on r8125-scoped only
+iperf_fails=$([ -s "$FAILLOG" ] && grep -c 'iperf .* failed' "$FAILLOG" || echo 0)
 pass=1; reasons=""
-[ "$total_faults" -gt 0 ] && { pass=0; reasons+="kernel-debug-faults=$total_faults; "; }
+[ "$total_faults" -gt 0 ] && { pass=0; reasons+="r8125-debug-faults=$total_faults; "; }
 [ "$stalls" -gt 0 ] && { pass=0; reasons+="counter-stalls=$stalls; "; }
 [ "$low_tput" -gt 0 ] && { pass=0; reasons+="low-throughput-samples=$low_tput; "; }
 grep -q 'HW_ERR_GROWTH' "$FAILLOG" 2>/dev/null && { pass=0; reasons+="hw-error-growth; "; }
@@ -168,7 +186,8 @@ grep -q 'KMEMLEAK' "$FAILLOG" 2>/dev/null && { pass=0; reasons+="kmemleak; "; }
   echo
   echo "| metric | value |"
   echo "|---|---|"
-  echo "| kernel-debug faults | $total_faults |"
+  echo "| r8125 debug faults (verdict) | $total_faults |"
+  echo "| kernel-wide faults (context, NOT in verdict) | $kernel_faults |"
   echo "| counter stalls | $stalls / $samples |"
   echo "| carrier flaps | $carrier_flaps |"
   echo "| MemAvailable drop (max) | ${mem_drop} kB (base $base_mem, min $min_mem) |"

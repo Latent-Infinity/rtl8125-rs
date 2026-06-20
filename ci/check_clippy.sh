@@ -64,4 +64,8 @@ if [[ "$warn_count" -gt 0 ]]; then
 fi
 
 grn "kernel-build Clippy clean (no warnings)"
+# This pass uses the DEFAULT cfgs, so the cfg-gated PCI surfaces (AER /
+# runtime-PM / PM / shutdown / reset) are NOT compiled and NOT linted here —
+# check_clippy_fullcfg.sh covers them against a patched kernel tree.
+printf '\033[1;33mNOTE\033[0m default-cfg only; cfg-gated PCI code linted by check_clippy_fullcfg.sh\n'
 exit 0

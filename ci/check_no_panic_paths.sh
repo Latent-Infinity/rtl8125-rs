@@ -16,16 +16,20 @@ grn() { printf '\033[1;32mPASS\033[0m %s\n' "$*"; }
 patterns='unwrap[[:space:]]*\(|expect[[:space:]]*\(|panic!|unreachable!|todo!|debug_assert!'
 
 # Emit "file:line:content" for every source line EXCEPT those inside a
-# `#[cfg(test)]` module. Host unit tests legitimately use unwrap/assert and are
-# compiled out of the kernel build (cfg(test) is never set there), so they must
-# not trip the runtime-panic discipline. The test module is a top-level item, so
-# its closing brace sits at column 0 - skip from `#[cfg(test)]` to that `^}`.
+# `#[cfg(test)]` module or a `const _: () = { ... };` compile-time block. Host
+# unit tests legitimately use unwrap/assert and are compiled out of the kernel
+# build (cfg(test) is never set there); a const-eval block's assert!s fail the
+# BUILD, not at runtime, so neither must trip the runtime-panic discipline. Both
+# are top-level items whose closing brace sits at column 0 - skip from the opener
+# (`#[cfg(test)]` / `const _: () = {`) to that `^}` / `^};`.
 src_lines="$(
 	find "$ROOT/src" -name '*.rs' -print0 2>/dev/null | while IFS= read -r -d '' f; do
 		awk '
 			/#\[cfg\(test\)\]/ { skip = 1 }
-			{ if (!skip) printf "%s:%d:%s\n", FILENAME, FNR, $0 }
+			/const _: \(\) = \{/ { cskip = 1 }
+			{ if (!skip && !cskip) printf "%s:%d:%s\n", FILENAME, FNR, $0 }
 			skip && /^}/ { skip = 0 }
+			cskip && /^};/ { cskip = 0 }
 		' "$f"
 	done
 )"

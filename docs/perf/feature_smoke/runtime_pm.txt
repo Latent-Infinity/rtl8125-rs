@@ -1,0 +1,90 @@
+PCI runtime-PM (autosuspend) + AER×runtime lockdep fix — validation
+===================================================================
+
+Build : make PCI_PM=1 SHUTDOWN=1 RESET=1 AER=1 RUNTIME_PM=1
+Cfgs  : r8125_pci_pm + _shutdown + _reset + _aer + _runtime_pm
+Patches: kernel-patches 0001-0005 (rust/kernel/pci.rs extensions)
+
+RUNTIME-PM MODEL (W2.4)
+-----------------------
+Closed-interface autosuspend, deadlock-safe by construction:
+- runtime_idle vetoes (-EBUSY) whenever netif_running -> the device only ever
+  autosuspends while the interface is administratively DOWN, so the
+  suspend/resume callbacks never touch rings/RTNL (the close already quiesced
+  the HW; the PCI core does the D-state).
+- The ndo open/stop pm_runtime get/put_sync brackets live in dedicated *_entry
+  wrappers (registered in netdev_ops), NOT in bridge_ndo_open/stop — those are
+  reused by the PM/reset/AER resume paths where pm_runtime_get_sync would
+  deadlock. Brackets are gated on a runtime_pm flag set only on a RUNTIME_PM=1
+  build, so the default build is byte-identical.
+- Autosuspend is gated on pci_dev_run_wake (mirrors r8169): only a device that
+  can wake from D3 is allowed to autosuspend.
+
+RUNTIME-PM TRANSITIONS — validated on the GATEWAY (real run-wake HW), 2026-06-18
+-------------------------------------------------------------------------------
+ power/control=auto, iface UP   -> runtime_status=active     (idle vetoes)
+ ip link set <dut> down         -> runtime_status=suspended  (D3)
+ ip link set <dut> up           -> runtime_status=active     (link 2.5G)
+(The lockdep fix below did NOT change the runtime_suspend/resume/idle callbacks,
+ so this transition result carries over to the fixed build.)
+
+AER × RUNTIME-PM LOCKDEP ABBA — found + fixed
+---------------------------------------------
+The COMBINED AER=1+RUNTIME_PM=1 build tripped a lockdep circular dependency
+(individual AER-only and RUNTIME_PM-only builds were each clean):
+  edge A: ndo_open/stop hold rtnl -> pm_runtime get/put_sync -> D-state ->
+          pcie_aspm_pm_state_change -> down_read(pci_bus_sem)   [rtnl -> pci_bus_sem]
+  edge B: AER core runs error_detected/resume under pci_walk_bus's pci_bus_sem,
+          and our callbacks took rtnl                            [pci_bus_sem -> rtnl]
+  => ABBA. Both D0-resume and low-power paths in pci.c take pci_bus_sem, so
+     edge A cannot be removed from the runtime-PM side.
+
+FIX: make the AER callbacks RTNL-FREE (the igb io_error_detected model), removing
+edge B entirely:
+- error_detected: a non-fatal (Normal) channel does NOTHING (returns CanRecover;
+  the device still works / was already re-init'd by reset_done). Only
+  Frozen/unknown channels take the full-stop RTNL-free
+  r8125_bridge_pm_error_detach path; permanent failure is detach-only because the
+  core returns Disconnect and may not call resume.
+- resume: new RTNL-free r8125_bridge_pm_error_resume (was reusing the rtnl-taking
+  bridge_pm_resume); re-opens only what the teardown tore down (b->aer_torn_down).
+- reset_prepare/reset_done keep rtnl: they run under device_lock (pci_reset_*),
+  not pci_bus_sem, so no cycle there.
+CI gate ci/check_aer.sh statically enforces both AER callbacks are rtnl_lock-free.
+
+KVM VALIDATION (rtl8125-guest, kernel 7.0.0 PROVE_LOCKING + KASAN), 2026-06-18
+-----------------------------------------------------------------------------
+Module cross-built on the controller against the patched 7.0.0 tree (vermagic +
+C-symbol CRCs match the guest's running kernel), BTF section stripped (BTF base
+differs across builds), insmod'd on the guest's lockdep+KASAN kernel:
+  - combined AER+RUNTIME_PM build builds with all 5 patches, LOADS, runs.
+  - 0 circular-locking / deadlock / KASAN / BUG across load + runtime-PM cfg
+    exercise (power/control=auto, idle veto) + clean reload. Driver brings the
+    PHY up at 2.5Gbps.
+  - The ABBA could NOT be reproduced here: the VFIO-passthrough device structurally
+    cannot do the triggering transitions — pci_dev_run_wake is false (no usable
+    PME), so it never autosuspends (no edge-A D-state change); and VFIO does not
+    forward the sysfs reset / AER to the guest (no edge B). A phylib state-machine
+    WARN (phy.c:1352) appeared ONLY when attempting the VFIO-unsupported
+    `echo 1 > reset` (aborted mid-sequence, "Inappropriate ioctl") — a passthrough
+    artifact, absent in normal operation.
+
+GATEWAY DEFINITIVE RE-CONFIRMATION (real run-wake HW + PROVE_LOCKING + KASAN), 2026-06-19
+----------------------------------------------------------------------------------------
+After the gateway was power-cycled, the FIXED combined AER+RUNTIME_PM build
+(srcversion 6089241E...) was loaded on 7.0.0-kasan and BOTH ABBA edges were
+exercised for real (unlike the KVM passthrough, which could do neither):
+  EDGE A (runtime-PM real D3): power/control=auto + ifdown -> runtime_status=
+          suspended (genuine D-state transition under rtnl); ifup -> active.
+  EDGE B (real AER): echo 1 > .../reset -> UnsupReq -> error_detected
+          "Normal -> CanRecover" -> "AER: device recovery successful".
+  3x interleaved runtime-PM + reset/AER cycles: 3 suspends, 3 AER recoveries,
+  3 UnsupReq (1:1, no storm), datapath ping 0% loss afterwards.
+  *** 0 circular-locking / deadlock / KASAN / WARNING / BUG / Call Trace ***
+This is the exact scenario that tripped the lockdep ABBA on the PRE-FIX build;
+with the rtnl-free AER callbacks it is clean. The ABBA fix is CONFIRMED on real
+hardware, and the rtnl-free AER revision's recovery is re-validated (no storm).
+
+STATUS: COMPLETE. W2.3 (AER) + W2.4 (runtime-PM) implemented, fixed, and validated
+live on the gateway; combined build is lockdep/KASAN-clean. Lockdep fix is both
+sound by construction (CI-gate-enforced rtnl-free AER) and confirmed live.

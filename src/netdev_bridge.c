@@ -8,7 +8,18 @@
  * has no stable Rust API today: net_device + net_device_ops + NAPI +
  * sk_buff plumbing.
  *
- * Hard cap: 1200 LOC including comments. Raised from 1110 for the AF_XDP
+ * Hard cap: 1380 LOC including comments. Raised from 1360 for reviewed
+ * AER/runtime-PM failure handling: permanent-failure AER is detach-only (so a
+ * later unregister cannot double-disable NAPI) and pm_runtime_get_sync failures
+ * unwind with pm_runtime_put_noidle before any MMIO. Raised from 1220 for the
+ * runtime-PM
+ * surface (ndo_open/stop entry wrappers that bracket the stack open/close with
+ * pm_runtime get/put, the runtime idle/suspend/resume helpers that autosuspend a
+ * closed interface, and the probe/unbind usage-ref enable/disable). Previously
+ * raised from 1200 for the PCIe AER error_detected teardown helper
+ * (r8125_bridge_pm_error_detach: detach + full balanced stop, reused across
+ * recovered channel states, re-init deferred to the shared pm_resume).
+ * Previously raised from 1110 for the AF_XDP
  * zero-copy surgical per-queue RX reconfigure (r8125_bridge_xsk_reconfig_queue:
  * swap one queue's RX pool with the chip RX engine briefly off, no full
  * stop+open / link-down), including failure rollback to the previous pool, on
@@ -45,6 +56,7 @@
 #include <linux/if_vlan.h>
 #include <linux/interrupt.h>
 #include <linux/phy.h>
+#include <linux/pm_runtime.h>
 #include <linux/rtnetlink.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
@@ -149,6 +161,64 @@ static int bridge_ndo_stop(struct net_device *ndev)
 	bridge_napi_disable_all(b);
 	b->ops.stop(b->priv);
 	return 0;
+}
+
+/*
+ * ndo_open / ndo_stop entry wrappers — the netdev_ops-registered entry points.
+ * They exist ONLY to bracket the stack-initiated open/close with the runtime-PM
+ * get/put (resume a runtime-suspended device before touching MMIO; release the
+ * reference + arm the idle check after a close). The brackets are gated on
+ * b->runtime_pm, set only on a RUNTIME_PM=1 build — so on the default build they
+ * compile to a bare call and behaviour is byte-identical.
+ *
+ * Crucially the brackets live HERE, not in bridge_ndo_open/stop: those are also
+ * called by the PM / reset / AER resume paths (bridge_pm_resume etc.), and
+ * pm_runtime_get_sync() from inside a runtime_resume callback would deadlock.
+ * Only the stack entry (via netdev_ops) goes through these wrappers; every
+ * internal re-open keeps calling bridge_ndo_open/stop directly, bracket-free.
+ *
+ * pm_runtime_get_sync may run our runtime_resume (rtnl-free: it only attaches),
+ * so taking it here while the stack holds RTNL is safe.
+ */
+static int bridge_ndo_open_entry(struct net_device *ndev)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+	int pmrc;
+	int rc;
+
+	if (b->runtime_pm) {
+		pmrc = pm_runtime_get_sync(&b->pdev->dev);
+		if (pmrc < 0) {
+			pm_runtime_put_noidle(&b->pdev->dev);
+			return pmrc;
+		}
+	}
+	rc = bridge_ndo_open(ndev);
+	if (b->runtime_pm)
+		pm_runtime_put_sync(&b->pdev->dev);
+	return rc;
+}
+
+static int bridge_ndo_stop_entry(struct net_device *ndev)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+	int pmrc;
+	int rc;
+
+	if (b->runtime_pm) {
+		pmrc = pm_runtime_get_sync(&b->pdev->dev);
+		if (pmrc < 0) {
+			pm_runtime_put_noidle(&b->pdev->dev);
+			return pmrc;
+		}
+	}
+	rc = bridge_ndo_stop(ndev);
+	/* The matching put arms the idle check: with the interface now closed,
+	 * runtime_idle allows the autosuspend (interface-up vetoes it).
+	 */
+	if (b->runtime_pm)
+		pm_runtime_put_sync(&b->pdev->dev);
+	return rc;
 }
 
 static netdev_tx_t bridge_ndo_start_xmit(struct sk_buff *skb,
@@ -430,8 +500,8 @@ static const struct netdev_stat_ops bridge_stat_ops = {
 };
 
 static const struct net_device_ops bridge_ops = {
-	.ndo_open		= bridge_ndo_open,
-	.ndo_stop		= bridge_ndo_stop,
+	.ndo_open		= bridge_ndo_open_entry,
+	.ndo_stop		= bridge_ndo_stop_entry,
 	.ndo_start_xmit		= bridge_ndo_start_xmit,
 	.ndo_change_mtu		= bridge_ndo_change_mtu,
 	.ndo_fix_features	= bridge_ndo_fix_features,
@@ -554,13 +624,13 @@ struct net_device *r8125_bridge_alloc(struct pci_dev *pdev, void *priv,
 	 * it lives in features (not hw_features).
 	 */
 	ndev->features |= NETIF_F_HIGHDMA;
-	/* XDP: BASIC (attach + XDP_PASS/DROP/TX/ABORTED), REDIRECT, and NDO_XMIT
-	 * (the redirect-target transmit side, ndo_xdp_xmit) are all implemented
-	 * (netdev_bridge_xdp.c). XDP_TX/NDO_XMIT enqueue on the Rust TX ring via
-	 * ops.xdp_xmit_one; REDIRECT goes through xdp_do_redirect + a once-per-poll
-	 * xdp_do_flush. XSK zero-copy is not implemented yet, so its bit stays clear
-	 * — the advertised set is exactly what works. Advertising BASIC|REDIRECT
-	 * also unlocks copy-mode AF_XDP for free.
+	/* XDP: BASIC (attach + XDP_PASS/DROP/TX/ABORTED), REDIRECT, NDO_XMIT
+	 * (the redirect-target transmit side, ndo_xdp_xmit) and XSK_ZEROCOPY are all
+	 * implemented (netdev_bridge_xdp.c + netdev_bridge_xsk.c). XDP_TX/NDO_XMIT
+	 * enqueue on the Rust TX ring via ops.xdp_xmit_one; REDIRECT goes through
+	 * xdp_do_redirect + a once-per-poll xdp_do_flush; XSK_ZEROCOPY binds a umem
+	 * pool per queue (ndo_bpf XDP_SETUP_XSK_POOL + ndo_xsk_wakeup). The advertised
+	 * set is exactly what works; BASIC|REDIRECT also unlocks copy-mode AF_XDP.
 	 */
 	ndev->xdp_features = NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT |
 			     NETDEV_XDP_ACT_NDO_XMIT | NETDEV_XDP_ACT_XSK_ZEROCOPY;
@@ -909,7 +979,12 @@ static int r8125_bridge_xsk_reconfig_queue(struct net_device *ndev,
 	int rc;
 	int rollback_rc;
 
-	bridge_napi_disable_all(b);
+	/* Surgical = touch ONLY this queue's NAPI (not bridge_napi_*_all). The
+	 * caller gates this path on the single-active-queue case, but scoping to
+	 * &q->napi keeps it correct if that ever relaxes: other queues' RX is not
+	 * disturbed by a single-queue pool swap.
+	 */
+	napi_disable(&q->napi);
 	b->ops.rx_quiesce(b->priv, queue_id);	/* RX engine off + free old pool */
 	q->xsk_pool = new_pool;			/* toggle between free and build */
 	rc = b->ops.rx_restore(b->priv, queue_id);	/* build new pool + RX on */
@@ -921,7 +996,7 @@ static int r8125_bridge_xsk_reconfig_queue(struct net_device *ndev,
 				   "AF_XDP queue %u restore failed (%d), rollback failed (%d)\n",
 				   queue_id, rc, rollback_rc);
 	}
-	bridge_napi_enable_all(b);
+	napi_enable(&q->napi);
 	return rc;
 }
 
@@ -1089,6 +1164,120 @@ int r8125_bridge_pm_resume(struct net_device *ndev)
 			netif_device_attach(ndev);
 	}
 	rtnl_unlock();
+	return rc;
+}
+
+/*
+ * Runtime PM (autosuspend). Reached only via the r8125_pci_runtime_pm-gated Rust
+ * callbacks. Policy: autosuspend ONLY while the interface is administratively
+ * DOWN (closed). runtime_idle vetoes (-EBUSY) whenever the interface is up, so
+ * the suspend/resume callbacks only ever run on a closed device — they need no
+ * RTNL and touch no rings (the close already quiesced the hardware); the PCI
+ * core handles the D-state + config save/restore. This deliberately forgoes the
+ * (riskier) suspend-while-up-on-link-down optimisation in favour of a path with
+ * no RTNL / ring-manipulation hazards.
+ */
+int r8125_bridge_runtime_idle(struct net_device *ndev)
+{
+	/* 0 = idle, let the core autosuspend; -EBUSY = keep active. */
+	return netif_running(ndev) ? -EBUSY : 0;
+}
+
+void r8125_bridge_runtime_suspend(struct net_device *ndev)
+{
+	/* Closed device (idle vetoes while up): just hide it from the stack; the
+	 * PCI core saves config + enters D3 (arming PME if wake is enabled).
+	 */
+	netif_device_detach(ndev);
+}
+
+void r8125_bridge_runtime_resume(struct net_device *ndev)
+{
+	/* The PCI core restored D0 + config; re-expose the (still closed) device.
+	 * A subsequent ndo_open does the real bring-up. RTNL-free on purpose: this
+	 * runs from the ndo_open get_sync bracket, which already holds RTNL.
+	 */
+	netif_device_attach(ndev);
+}
+
+/*
+ * Enable runtime PM at probe end: flip the flag that activates the ndo open/stop
+ * pm_runtime brackets, then drop the usage reference the PCI core took around
+ * probe so the device can actually autosuspend once idle. Gated on
+ * pci_dev_run_wake so we only allow autosuspend for a device that can wake from
+ * D3 (PME) — mirrors r8169. Balanced by _disable at unbind.
+ */
+void r8125_bridge_pm_runtime_enable(struct net_device *ndev)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+
+	b->runtime_pm = true;
+	if (pci_dev_run_wake(b->pdev))
+		pm_runtime_put_sync(&b->pdev->dev);
+}
+
+void r8125_bridge_pm_runtime_disable(struct net_device *ndev)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+
+	/* Re-take the reference dropped in _enable so unbind/remove runs against a
+	 * resumed, runtime-PM-quiescent device (balances the probe-end put). The
+	 * PCI core has already pm_runtime_get_sync'd the device before remove.
+	 */
+	if (b->runtime_pm && pci_dev_run_wake(b->pdev))
+		pm_runtime_get_noresume(&b->pdev->dev);
+}
+
+/*
+ * PCIe AER error_detected teardown. Reached only via the r8125_pci_aer-gated Rust
+ * error_detected callback. A non-fatal (Normal) channel keeps working and is left
+ * untouched (the Rust side skips this call entirely). For a Frozen / unknown
+ * channel, hide the device from the stack and, if it was up, do the same full
+ * balanced stop as a normal close; the matching r8125_bridge_pm_error_resume
+ * re-opens it. For a permanent failure, detach only: the AER core returns
+ * Disconnect and may not call resume, so final teardown belongs to remove.
+ *
+ * RTNL-FREE on purpose: the AER core invokes error_detected from pci_walk_bus
+ * while holding pci_bus_sem, and the runtime-PM D-state path takes pci_bus_sem
+ * under RTNL — so taking RTNL here would create an ABBA cycle (caught by
+ * lockdep). Mirrors igb's rtnl-free io_error_detected, which likewise calls its
+ * down() path without RTNL; the AER recovery is serialised by the PCI core.
+ */
+void r8125_bridge_pm_error_detach(struct net_device *ndev, bool full_stop)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+
+	netif_device_detach(ndev);
+	/* Mark recoverable teardowns, not permanent-failure detach-only. This still
+	 * covers the Frozen-while-interface-DOWN case (full_stop=true, but no
+	 * bridge_ndo_stop) so error_resume re-attaches the closed device without a
+	 * spurious reopen. It deliberately leaves permanent failure unmarked: the
+	 * AER core returns Disconnect there, and remove owns final teardown.
+	 */
+	b->aer_torn_down = full_stop;
+	if (full_stop && netif_running(ndev))
+		bridge_ndo_stop(ndev);
+}
+
+/*
+ * PCIe AER resume. Reached via the r8125_pci_aer-gated Rust resume callback,
+ * which the core calls (under pci_bus_sem) for every recovered channel. Re-open
+ * ONLY if error_detected actually tore the device down (Frozen path); for a
+ * non-fatal channel there is nothing to restore. RTNL-free for the same reason
+ * as the teardown. Returns 0 or a negative re-open errno.
+ */
+int r8125_bridge_pm_error_resume(struct net_device *ndev)
+{
+	struct r8125_bridge *b = netdev_priv(ndev);
+	int rc = 0;
+
+	if (b->aer_torn_down) {
+		if (netif_running(ndev))
+			rc = bridge_ndo_open(ndev);
+		if (rc == 0)
+			netif_device_attach(ndev);
+		b->aer_torn_down = false;
+	}
 	return rc;
 }
 

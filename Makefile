@@ -52,6 +52,20 @@ endif
 ifeq ($(RESET),1)
 KRUSTFLAGS += --cfg=r8125_pci_reset
 endif
+# PCIe AER recovery handlers (error_detected/slot_reset/resume) require the
+# kernel-Rust PCI AER extension (kernel-patches/0004-rust-pci-add-aer-callbacks.patch).
+# Gated on the `r8125_pci_aer` cfg.
+#   make AER=1 -> AER recovery compiled in (requires an AER-extended kernel)
+ifeq ($(AER),1)
+KRUSTFLAGS += --cfg=r8125_pci_aer
+endif
+# PCI runtime-PM (autosuspend a closed interface) requires the kernel-Rust PCI
+# runtime-PM extension (kernel-patches/0005-rust-pci-add-runtime-pm-callbacks.patch).
+# Gated on the `r8125_pci_runtime_pm` cfg.
+#   make RUNTIME_PM=1 -> runtime PM compiled in (requires a runtime-PM-extended kernel)
+ifeq ($(RUNTIME_PM),1)
+KRUSTFLAGS += --cfg=r8125_pci_runtime_pm
+endif
 
 all default modules:
 	$(MAKE) -C $(KDIR) M=$(CURDIR)/src RUSTC=$(RUSTC) BINDGEN=$(BINDGEN) CLIPPY_DRIVER=$(CLIPPY_DRIVER) CC=$(CC) KRUSTFLAGS="$(KRUSTFLAGS)" CONFIG_DEBUG_INFO_BTF_MODULES= modules

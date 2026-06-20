@@ -303,6 +303,20 @@ extern "C" {
     fn r8125_bridge_pm_suspend(ndev: *mut bindings::net_device);
     #[cfg(any(r8125_pci_pm, r8125_pci_reset, r8125_pci_runtime_pm))]
     fn r8125_bridge_pm_resume(ndev: *mut bindings::net_device) -> c_int;
+    #[cfg(r8125_pci_aer)]
+    fn r8125_bridge_pm_error_detach(ndev: *mut bindings::net_device, full_stop: bool);
+    #[cfg(r8125_pci_aer)]
+    fn r8125_bridge_pm_error_resume(ndev: *mut bindings::net_device) -> c_int;
+    #[cfg(r8125_pci_runtime_pm)]
+    fn r8125_bridge_runtime_idle(ndev: *mut bindings::net_device) -> c_int;
+    #[cfg(r8125_pci_runtime_pm)]
+    fn r8125_bridge_runtime_suspend(ndev: *mut bindings::net_device);
+    #[cfg(r8125_pci_runtime_pm)]
+    fn r8125_bridge_runtime_resume(ndev: *mut bindings::net_device);
+    #[cfg(r8125_pci_runtime_pm)]
+    fn r8125_bridge_pm_runtime_enable(ndev: *mut bindings::net_device);
+    #[cfg(r8125_pci_runtime_pm)]
+    fn r8125_bridge_pm_runtime_disable(ndev: *mut bindings::net_device);
     fn r8125_bridge_irq_pin_cpu(irq: u32, cpu: c_int) -> c_int;
     fn r8125_bridge_irq_clear_hint(irq: u32);
     fn r8125_bridge_num_online_cpus() -> c_uint;
@@ -604,7 +618,7 @@ pub(crate) fn alloc_irq_vectors(
 /// the call sites pass the number into `request_threaded_irq`, which
 /// takes a bare `u32`.
 ///
-/// # SAFETY
+/// # SAFETY contract
 ///
 /// Must be called AFTER a successful `pci_alloc_irq_vectors` for `pdev`.
 /// The caller guarantees that — at probe time we do the allocation
@@ -1119,6 +1133,110 @@ pub(crate) fn bridge_pm_resume(ndev: *mut bindings::net_device) -> Result {
     to_result(unsafe { r8125_bridge_pm_resume(ndev) })
 }
 
+/// PCIe AER `error_detected` teardown: always detach; optionally do a full
+/// balanced stop for channels that will later run resume. Permanent failure uses
+/// detach-only because the AER core may return Disconnect without a matching
+/// resume, and remove owns final teardown.
+///
+/// Gated on `r8125_pci_aer` — only reachable from the AER callbacks that require
+/// the kernel-Rust PCI AER extension (see `pci.rs`).
+///
+/// # SAFETY: see [`bridge_pm_suspend`]. Called from the AER `error_detected`
+/// callback while the device is still bound.
+#[cfg(r8125_pci_aer)]
+pub(crate) fn bridge_pm_error_detach(ndev: *mut bindings::net_device, full_stop: bool) {
+    if ndev.is_null() {
+        return;
+    }
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_pm_error_detach(ndev, full_stop) };
+}
+
+/// PCIe AER resume: re-open the device iff the matching [`bridge_pm_error_detach`]
+/// tore it down (Frozen path); a no-op for a non-fatal channel. RTNL-free (runs
+/// under `pci_bus_sem`). Gated on `r8125_pci_aer`.
+///
+/// # SAFETY: see [`bridge_pm_error_detach`]. Called from the AER resume callback
+/// while the device is still bound.
+#[cfg(r8125_pci_aer)]
+pub(crate) fn bridge_pm_error_resume(ndev: *mut bindings::net_device) -> Result {
+    if ndev.is_null() {
+        return Ok(());
+    }
+    // SAFETY: see fn-level contract.
+    to_result(unsafe { r8125_bridge_pm_error_resume(ndev) })
+}
+
+/// Runtime-PM idle check: `Ok(())` lets the core autosuspend (interface closed),
+/// `Err(EBUSY)` vetoes it (interface up). Gated on `r8125_pci_runtime_pm`.
+///
+/// # SAFETY: `ndev` is the registered net_device; the cshim only reads
+/// `netif_running`. Called from the runtime_idle PM callback while bound.
+#[cfg(r8125_pci_runtime_pm)]
+pub(crate) fn bridge_runtime_idle(ndev: *mut bindings::net_device) -> Result {
+    if ndev.is_null() {
+        return Ok(());
+    }
+    // SAFETY: see fn-level contract.
+    to_result(unsafe { r8125_bridge_runtime_idle(ndev) })
+}
+
+/// Runtime-PM suspend: hide the (closed) device from the stack; the PCI core does
+/// the D3 transition. RTNL-free. Gated on `r8125_pci_runtime_pm`.
+///
+/// # SAFETY: see [`bridge_runtime_idle`]. Only ever runs on a closed interface
+/// (runtime_idle vetoes while up).
+#[cfg(r8125_pci_runtime_pm)]
+pub(crate) fn bridge_runtime_suspend(ndev: *mut bindings::net_device) {
+    if ndev.is_null() {
+        return;
+    }
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_runtime_suspend(ndev) };
+}
+
+/// Runtime-PM resume: re-expose the (still closed) device after D0 restore.
+/// RTNL-free (runs from the ndo_open get_sync bracket, which holds RTNL). Gated
+/// on `r8125_pci_runtime_pm`.
+///
+/// # SAFETY: see [`bridge_runtime_idle`].
+#[cfg(r8125_pci_runtime_pm)]
+pub(crate) fn bridge_runtime_resume(ndev: *mut bindings::net_device) {
+    if ndev.is_null() {
+        return;
+    }
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_runtime_resume(ndev) };
+}
+
+/// Enable runtime PM at probe end (flip the bracket flag + drop the core's probe
+/// usage ref so the device can autosuspend). Gated on `r8125_pci_runtime_pm`.
+///
+/// # SAFETY: see [`bridge_runtime_idle`]. Called once at the end of probe, after
+/// the net_device is registered.
+#[cfg(r8125_pci_runtime_pm)]
+pub(crate) fn bridge_pm_runtime_enable(ndev: *mut bindings::net_device) {
+    if ndev.is_null() {
+        return;
+    }
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_pm_runtime_enable(ndev) };
+}
+
+/// Disable runtime PM at unbind (re-take the ref dropped by enable). Gated on
+/// `r8125_pci_runtime_pm`.
+///
+/// # SAFETY: see [`bridge_runtime_idle`]. Called at the start of unbind, before
+/// the net_device is torn down.
+#[cfg(r8125_pci_runtime_pm)]
+pub(crate) fn bridge_pm_runtime_disable(ndev: *mut bindings::net_device) {
+    if ndev.is_null() {
+        return;
+    }
+    // SAFETY: see fn-level contract.
+    unsafe { r8125_bridge_pm_runtime_disable(ndev) };
+}
+
 /// Suggest IRQ CPU affinity for the chip's MSI-X / MSI / INTx vector.
 /// Latency-aligned default (see `docs/RX_OPTIMIZATION_CANDIDATES.md`).
 /// Best-effort: the kernel may
@@ -1347,7 +1465,7 @@ pub(crate) fn pci_dev_raw<Ctx: device::DeviceContext>(
 
 /// Allocate a net_device + bridge state via the cshim.
 ///
-/// # SAFETY
+/// # SAFETY contract
 ///
 /// - `pdev` is borrowed only for this call; the cshim records the raw
 ///   pointer in its private area but the kernel guarantees the pci_dev
@@ -1374,7 +1492,7 @@ pub(crate) fn bridge_alloc<Ctx: device::DeviceContext>(
 
 /// Free an alloc'd-but-not-registered net_device (error path).
 ///
-/// # SAFETY
+/// # SAFETY contract
 ///
 /// Caller must own a net_device returned by `bridge_alloc` that has NOT
 /// been passed to `bridge_register`. After this call the pointer is
@@ -1387,7 +1505,7 @@ pub(crate) fn bridge_free(ndev: *mut bindings::net_device) {
 
 /// Register a net_device with the kernel network stack.
 ///
-/// # SAFETY
+/// # SAFETY contract
 ///
 /// Caller must own a net_device returned by `bridge_alloc`. On success
 /// the kernel takes a reference; the caller must arrange for an eventual
@@ -1401,7 +1519,7 @@ pub(crate) fn bridge_register(ndev: *mut bindings::net_device) -> Result<()> {
 /// Unregister + free a registered net_device. Idempotent only in that
 /// the caller must call it exactly once per successful register.
 ///
-/// # SAFETY
+/// # SAFETY contract
 ///
 /// `ndev` must be a registered net_device returned by `bridge_alloc`.
 /// After this call the pointer is invalid; the kernel reference is
@@ -1414,7 +1532,7 @@ pub(crate) fn bridge_unregister_and_free(ndev: *mut bindings::net_device) {
 /// `dev_kfree_skb_any` via the cshim — the "drop_with_error"
 /// path. Counter `tx_dropped_error` increments inside the cshim.
 ///
-/// # SAFETY
+/// # SAFETY contract
 ///
 /// `skb` must be a kernel-allocated `sk_buff` to which the driver holds
 /// the unique reference (i.e., it was just received from ndo_start_xmit
@@ -1570,7 +1688,7 @@ pub(crate) fn netdev_completed_queue(ndev: *mut bindings::net_device, pkts: usiz
 /// Rust extern "C" callbacks the bus will use for MDIO transactions.
 /// Must be called after `bridge_register` succeeds.
 ///
-/// # SAFETY
+/// # SAFETY contract
 ///
 /// `ndev` is a registered net_device returned by `bridge_alloc`. `ops`
 /// is borrowed only for the duration of the call (the cshim copies the
@@ -1777,4 +1895,18 @@ pub(crate) extern "C" fn r8125_rust_mdio_write_c45(
     } else {
         errno_to_c_int(kernel::error::code::ENODEV)
     }
+}
+
+/// Rust→C export of the TX-offload descriptor-bit policy. The cshim
+/// (`netdev_bridge_offload.c`) gathers the protocol facts and applies the
+/// returned decision; the bit policy itself is the pure, host-tested
+/// `crate::tx_offload::decide`. `#[no_mangle]` lives here because the crate root
+/// denies `unsafe_code` (no_mangle is an unsafe attribute) and this is the
+/// audited boundary file; the wrapper body is itself safe (pure call, scalar
+/// `#[repr(C)]` ABI), so it adds nothing to the unsafe census.
+#[no_mangle]
+pub(crate) extern "C" fn r8125_tx_offload_decide(
+    facts: crate::tx_offload::Facts,
+) -> crate::tx_offload::Decision {
+    crate::tx_offload::decide(&facts)
 }

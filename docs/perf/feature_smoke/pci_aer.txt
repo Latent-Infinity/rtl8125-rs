@@ -1,0 +1,85 @@
+PCIe AER recovery (error_detected / slot_reset / resume) — live validation
+==========================================================================
+
+Driver build : make PCI_PM=1 SHUTDOWN=1 RESET=1 AER=1   (cfg r8125_pci_aer)
+Kernel       : 7.0.0-kasan, rust/kernel/pci.rs carrying patches 0001-0004
+DUT          : gateway 0000:03:00.0 (RTL8125B, MAC_VER_63), enp3s0 @ dut netns
+Trigger      : echo 1 > /sys/bus/pci/devices/0000:03:00.0/reset
+               (this controller's only reset_method is "bus" = secondary-bus
+                reset; the chip answers every bus reset with an Uncorrectable
+                non-fatal AER, UnsupReq — which is what exercises the AER path)
+
+WHY THIS IS NEEDED
+------------------
+Before patch 0004 the same reset logged:
+    pcieport 0000:00:03.1: AER: can't recover (no error_detected callback)
+i.e. the err_handler was registered (0003) but the AER core bailed for lack of
+error_detected. W2.3 adds the three recovery callbacks so the recovery completes.
+
+VERDICT POLICY (src/aer.rs, host-tested)
+----------------------------------------
+The first cut returned NEED_RESET for the non-fatal channel (the igc pattern).
+On THIS device that looped forever: NEED_RESET -> AER core does a slot reset ->
+slot reset is a secondary-bus reset -> chip emits another UnsupReq -> AER fires
+again -> ... a reset storm (one new Uncorrectable error every ~3s, indefinitely).
+Fix = the igb pattern: a non-fatal (pci_channel_io_normal) channel returns
+CAN_RECOVER (recover in place, no extra reset); only a fatal/frozen channel
+returns NEED_RESET. The core still calls resume on the CAN_RECOVER path
+(drivers/pci/pcie/err.c: CAN_RECOVER -> RECOVERED -> report_resume), so the
+device is rebuilt either way. The original validation build tore down and
+reopened on the Normal path too; the current lockdep-fixed implementation keeps
+Normal untouched because reset_done has already rebuilt it, and only
+Frozen/unknown channels use the balanced full-stop/resume pair. Permanent failure
+is detach-only because the AER core returns Disconnect and may not call resume.
+
+SINGLE RESET — clean recovery (dmesg, unfiltered)
+-------------------------------------------------
+ RTL8125 reset_prepare: quiescing across PCI reset      <- W2.2
+ ndo_stop ...
+ enp3s0: Link is Down
+ pcieport 0000:00:03.1: AER: Uncorrectable (Non-Fatal) ... [20] UnsupReq (First)
+ PHY firmware applied (800 ops) ... ndo_open complete    <- W2.2 reset_done re-init
+ RTL8125 AER error_detected: channel state Normal -> CanRecover   <- W2.3
+ ndo_stop ...
+ PHY firmware applied (800 ops) ... ndo_open complete    <- W2.3 resume re-init
+ pcieport 0000:00:03.1: AER: device recovery successful  <- was "can't recover"
+ enp3s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+ # ping 10.0.0.1: 2 received, 0% packet loss
+
+REPEATABILITY (3 back-to-back resets)
+-------------------------------------
+ "device recovery successful"   count = 3   (one per reset)
+ "UnsupReq" AER error events    count = 3   (1:1 with resets — NO storm)
+ AER verdicts                   3x "Normal -> CanRecover"
+ KASAN/BUG/WARN/can't-recover   count = 0
+ final link                     enp3s0 UP 10.0.0.2/24, ping 0% loss
+
+RESULT: PASS. error_detected/slot_reset/resume wired via patch 0004; AER
+recovery completes cleanly and deterministically, no reset storm, no splats,
+datapath restored. W2.2 (reset_prepare/done) and W2.3 (AER) cooperate on the
+same physical reset. Captured 2026-06-18.
+
+REVISION 2026-06-18 — AER callbacks made RTNL-FREE (lockdep fix)
+---------------------------------------------------------------
+After the combined AER+RUNTIME_PM build exposed a lockdep ABBA (rtnl <-> pci_bus_sem;
+see docs/perf/feature_smoke/runtime_pm.txt), error_detected/resume were revised to
+the igb rtnl-free model: a non-fatal (Normal) channel now does NOTHING in
+error_detected (returns CanRecover; the device keeps working / was re-init'd by
+reset_done) instead of the earlier detach+stop+reopen. Frozen/unknown channels
+take the RTNL-free full-stop r8125_bridge_pm_error_detach path and resume uses
+the new RTNL-free r8125_bridge_pm_error_resume (gated on b->aer_torn_down).
+Permanent failure is detach-only so a later unregister cannot double-disable NAPI
+after a Disconnect result. The verdict policy (Normal->CanRecover,
+Frozen->NeedReset, PermFailure->Disconnect) is unchanged, so the validated
+recovery outcome above still holds; the device now re-inits ONCE (via reset_done)
+on the echo-1>reset path instead of twice.
+
+RE-CONFIRMATION 2026-06-19 — fixed combined AER + runtime-PM build
+------------------------------------------------------------------
+After the gateway power-cycle, the fixed AER+RUNTIME_PM build was loaded on
+7.0.0-kasan and exercised on real run-wake hardware: runtime-PM D3 ifdown/ifup
+cycles interleaved with 3x `echo 1 > .../reset` AER recoveries. Results: 3
+suspends, 3 successful AER recoveries, 3 UnsupReq events (1:1, no storm), final
+datapath ping 0% loss, and 0 circular-locking / deadlock / KASAN / WARNING / BUG
+/ Call Trace. The rtnl-free AER revision is therefore live-confirmed on the
+gateway.

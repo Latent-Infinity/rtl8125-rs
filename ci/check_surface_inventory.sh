@@ -58,6 +58,8 @@ ROWS=(
   # ---- PRESENT: PM (via kernel-Rust pci PM extension; PCI_PM=1 build) ----
   "PRESENT|pm_ops_suspend|bridge_pm_suspend|$NETDEV_C"
   "PRESENT|pm_ops_resume|bridge_pm_resume|$NETDEV_C"
+  # ---- PRESENT: PCIe AER recovery (kernel-Rust pci AER extension; AER=1 build) ----
+  "PRESENT|aer_error_detach|bridge_pm_error_detach|$NETDEV_C"
   "PRESENT|get_ringparam|.get_ringparam|$ETH_C"
   "PRESENT|get_pauseparam|.get_pauseparam|$ETH_C"
   "PRESENT|set_pauseparam|.set_pauseparam|$ETH_C"

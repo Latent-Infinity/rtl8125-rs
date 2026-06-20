@@ -50,7 +50,9 @@ else
 	grn "NetdevState array fields avoid core::array::from_fn stack temporaries"
 fi
 
-if ! grep -A4 'fn unbind' "$pci" | grep -q '_netdev.shutdown();'; then
+# -A12 (was -A4): unbind may carry a cfg-gated runtime-PM disable + its doc
+# comment before the shutdown call; shutdown still runs there, before devres.
+if ! grep -A12 'fn unbind' "$pci" | grep -q '_netdev.shutdown();'; then
 	red "R8125Driver::unbind does not shut netdev down before devres release"
 else
 	grn "R8125Driver::unbind drains netdev before devres release"

@@ -1,0 +1,88 @@
+--- rust/kernel/pci.rs.pre0005.bak	2026-06-18 04:32:07.181797489 +0000
++++ rust/kernel/pci.rs	2026-06-18 04:32:07.200889372 +0000
+@@ -232,6 +232,45 @@
+         })
+     }
+
++    unsafe extern "C" fn runtime_suspend_callback(dev: *mut bindings::device) -> c_int {
++        // SAFETY: see `suspend_callback`.
++        let pdev = unsafe {
++            &*container_of!(dev, bindings::pci_dev, dev).cast::<Device<device::CoreInternal>>()
++        };
++        // SAFETY: called between probe and remove, so drvdata holds a `T`.
++        let data = unsafe { pdev.as_ref().drvdata_borrow::<T>() };
++        from_result(|| {
++            T::runtime_suspend(pdev, data)?;
++            Ok(0)
++        })
++    }
++
++    unsafe extern "C" fn runtime_resume_callback(dev: *mut bindings::device) -> c_int {
++        // SAFETY: see `suspend_callback`.
++        let pdev = unsafe {
++            &*container_of!(dev, bindings::pci_dev, dev).cast::<Device<device::CoreInternal>>()
++        };
++        // SAFETY: see `suspend_callback`.
++        let data = unsafe { pdev.as_ref().drvdata_borrow::<T>() };
++        from_result(|| {
++            T::runtime_resume(pdev, data)?;
++            Ok(0)
++        })
++    }
++
++    unsafe extern "C" fn runtime_idle_callback(dev: *mut bindings::device) -> c_int {
++        // SAFETY: see `suspend_callback`.
++        let pdev = unsafe {
++            &*container_of!(dev, bindings::pci_dev, dev).cast::<Device<device::CoreInternal>>()
++        };
++        // SAFETY: see `suspend_callback`.
++        let data = unsafe { pdev.as_ref().drvdata_borrow::<T>() };
++        from_result(|| {
++            T::runtime_idle(pdev, data)?;
++            Ok(0)
++        })
++    }
++
+     const PM_OPS: bindings::dev_pm_ops = bindings::dev_pm_ops {
+         suspend: Some(Self::suspend_callback),
+         resume: Some(Self::resume_callback),
+@@ -239,6 +278,9 @@
+         thaw: Some(Self::resume_callback),
+         poweroff: Some(Self::suspend_callback),
+         restore: Some(Self::resume_callback),
++        runtime_suspend: Some(Self::runtime_suspend_callback),
++        runtime_resume: Some(Self::runtime_resume_callback),
++        runtime_idle: Some(Self::runtime_idle_callback),
+         // SAFETY: zero-initialises the remaining Option<fn> fields to None.
+         ..unsafe { core::mem::MaybeUninit::<bindings::dev_pm_ops>::zeroed().assume_init() }
+     };
+@@ -444,6 +486,29 @@
+         let _ = (dev, this);
+         Ok(())
+     }
++
++    /// Runtime (autosuspend) suspend. Default no-op. Override to quiesce when the
++    /// PM core decides the device is idle (e.g. link down). Distinct from the
++    /// system-sleep `suspend` so a driver can choose a lighter quiesce.
++    fn runtime_suspend(dev: &Device<device::Core>, this: Pin<&Self>) -> Result {
++        let _ = (dev, this);
++        Ok(())
++    }
++
++    /// Runtime (autosuspend) resume. Default no-op. Override to re-init on the
++    /// first activity after a runtime suspend.
++    fn runtime_resume(dev: &Device<device::Core>, this: Pin<&Self>) -> Result {
++        let _ = (dev, this);
++        Ok(())
++    }
++
++    /// Runtime idle check. Returning `Ok(())` lets the PM core autosuspend; an
++    /// `Err` (typically `EBUSY`) vetoes it. Default `Ok(())`. Override to keep the
++    /// device active while the link is up / traffic may flow.
++    fn runtime_idle(dev: &Device<device::Core>, this: Pin<&Self>) -> Result {
++        let _ = (dev, this);
++        Ok(())
++    }
+
+     /// Device shutdown (reboot / kexec / poweroff). Default no-op. Override to
+     /// quiesce the device (stop DMA, mask IRQs) so it is quiet for the next

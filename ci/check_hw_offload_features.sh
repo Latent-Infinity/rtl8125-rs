@@ -71,12 +71,15 @@ else
 	red "Rust must program RTL8125 RX VLAN via RCR and RX checksum via CPlusCmd"
 fi
 
-if grep -q 'R8125_TX_VLAN_TAG' "$OFFLOAD" &&
-   grep -q 'skb_vlan_tag_present' "$OFFLOAD" &&
+# TX VLAN: the C shim gathers tag presence + raw TCI (facts); the Rust offload
+# policy (src/tx_offload.rs) sets the tag-valid bit + byte-swapped TCI in opts2.
+TXOFF="$ROOT/src/tx_offload.rs"
+if grep -q 'skb_vlan_tag_present' "$OFFLOAD" &&
    grep -q 'skb_vlan_tag_get' "$OFFLOAD" &&
-   grep -q 'swab16' "$OFFLOAD" &&
-   grep -q 'r8125_bridge_skb_tx_vlan_opts' "$OFFLOAD"; then
-	grn "TX VLAN tag encoding is wired into descriptor opts2"
+   grep -q 'R8125_TXO_F_VLAN' "$OFFLOAD" &&
+   grep -q 'TX_VLAN_TAG' "$TXOFF" &&
+   grep -q 'swap_bytes' "$TXOFF"; then
+	grn "TX VLAN tag encoding is wired into descriptor opts2 (C facts + Rust policy)"
 else
 	red "TX VLAN offload must encode tag-present and swapped TCI in opts2"
 fi

@@ -30,58 +30,26 @@ use kernel::time::{delay::udelay, Delta};
 use crate::mmio::Regs;
 use crate::regs;
 
-/// MAC version naming kept aligned with r8169's `RTL_GIGA_MAC_VER_*` enum so
-/// future cross-references stay obvious. Only the variants this driver
-/// actually supports are listed; expanding the list is the supported way to
-/// add a new sub-revision (and gets the strictest review).
-#[derive(Copy, Clone, Debug)]
-pub(crate) enum MacVersion {
-    /// RTL8125B (XID 0x641 / `RTL_GIGA_MAC_VER_63` in r8169).
-    Rtl8125B,
-}
+// The pure XID decode + dispatch table live in the kernel-free, host-tested
+// `crate::chip_id` (so the "no silent fallback" acceptance gate is unit-tested);
+// `hw` keeps the MMIO read and re-exports the decode for `pci::probe`.
+pub(crate) use crate::chip_id::xid_from_tx_config;
+use crate::chip_id::{self, ChipInfo};
 
-/// One row of the chip dispatch table. `(xid & mask) == val` decides the
-/// match, exactly the predicate r8169 uses.
-#[derive(Copy, Clone)]
-pub(crate) struct ChipInfo {
-    pub(crate) mask: u32,
-    pub(crate) val: u32,
-    pub(crate) mac_version: MacVersion,
-    pub(crate) name: &'static str,
-    /// Per-revision jumbo cap. RTL8125B supports up to the chip's
-    /// `R8169_RX_BUF_SIZE = 16383`; we ship the industry-standard
-    /// `JUMBO_9K_BYTES = 9000` as the advertised max so peers/switches
-    /// won't drop oversized frames. A future chip revision that
-    /// doesn't support jumbo can ship `ETH_DATA_LEN` here and the
-    /// bridge will refuse `change_mtu` above 1500 without code surgery.
-    /// Currently informational only — the cshim's `max_mtu` value is
-    /// the hardcoded `9000` until the alloc path is plumbed to pass
-    /// `info.max_mtu` to `r8125_bridge_alloc`.
-    #[allow(dead_code)]
-    pub(crate) max_mtu: usize,
-}
-
-/// Known-chip dispatch table — carries only the validated entry. Adding
-/// a row here is the supported way to support a new RTL8125 sub-revision.
-pub(crate) const KNOWN: &[ChipInfo] = &[ChipInfo {
-    mask: 0x7cf,
-    val: 0x641,
-    mac_version: MacVersion::Rtl8125B,
-    name: "RTL8125B",
-    max_mtu: crate::regs::JUMBO_9K_BYTES,
-}];
-
-/// Extract the XID from a raw `TxConfig` value (the r8169 formula).
-pub(crate) fn xid_from_tx_config(tx_config: u32) -> u32 {
-    (tx_config >> regs::XID_SHIFT) & regs::XID_MASK
-}
+// `chip_id` is compiled standalone under `rustc --test`, so it carries its own
+// copies of these constants. Pin them to the canonical `regs::` values at
+// compile time — a divergence fails the build instead of mis-identifying silicon.
+const _: () = {
+    assert!(chip_id::XID_SHIFT == regs::XID_SHIFT);
+    assert!(chip_id::XID_MASK == regs::XID_MASK);
+    assert!(chip_id::KNOWN[0].max_mtu == regs::JUMBO_9K_BYTES);
+};
 
 /// Identify the chip from the current `TxConfig` value. Returns `Some(info)`
-/// on a match against [`KNOWN`], `None` for an XID the driver does not
-/// claim support for.
+/// on a match against `chip_id::KNOWN`, `None` for an XID the driver does not
+/// claim support for (probe turns `None` into `-ENODEV`).
 pub(crate) fn identify(regs: &Regs<'_>) -> Option<&'static ChipInfo> {
-    let xid = xid_from_tx_config(regs.tx_config());
-    KNOWN.iter().find(|info| (xid & info.mask) == info.val)
+    chip_id::match_chip(xid_from_tx_config(regs.tx_config()))
 }
 
 /// MAC OCP poll: wait for register 0xE00E bit 13 to clear. Mirrors r8169

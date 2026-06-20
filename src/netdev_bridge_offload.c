@@ -29,15 +29,10 @@
 #include <linux/udp.h>
 #include <net/ip6_checksum.h>
 
-/* TX descriptor opts2 bits (8125 family). */
-#define R8125_TD1_IPV6_CS	BIT(28)
-#define R8125_TD1_IPV4_CS	BIT(29)
-#define R8125_TD1_TCP_CS	BIT(30)
-#define R8125_TD1_UDP_CS	BIT(31)
-#define R8125_TCPHO_SHIFT	18
-#define R8125_TCPHO_MAX		0x3ffU
-#define R8125_TX_CSUM_OPTS_DROP	0xffffffffU
-#define R8125_TX_VLAN_TAG	BIT(17)
+/* TX checksum-v2 + TSO descriptor-bit POLICY moved to Rust (src/tx_offload.rs);
+ * this file now only gathers protocol facts + applies the decision. The RX
+ * checksum bits below stay here (read on the RX completion path).
+ */
 
 /* RX descriptor opts1 bits. */
 #define R8125_RX_PID0		BIT(17)	/* TCP if set */
@@ -87,70 +82,6 @@ static unsigned int r8125_quirk_udp_padto(struct sk_buff *skb)
 	return padto;
 }
 
-static u32 r8125_sw_csum_after_pad(struct sk_buff *skb, unsigned int padto)
-{
-	if (padto && __skb_put_padto(skb, padto, false))
-		return R8125_TX_CSUM_OPTS_DROP;
-	if (skb_checksum_help(skb))
-		return R8125_TX_CSUM_OPTS_DROP;
-	return 0;
-}
-
-static u32 r8125_bridge_skb_tx_vlan_opts(struct sk_buff *skb)
-{
-	if (skb_vlan_tag_present(skb))
-		return R8125_TX_VLAN_TAG | swab16(skb_vlan_tag_get(skb));
-	return 0;
-}
-
-static u32 r8125_bridge_skb_tx_csum_opts(struct sk_buff *skb)
-{
-	u32 opts2 = 0;
-	unsigned int padto = 0;
-	u8 ip_proto;
-
-	if (skb->len < ETH_ZLEN)
-		padto = ETH_ZLEN;
-
-	if (skb->ip_summed != CHECKSUM_PARTIAL) {
-		if (padto && __skb_put_padto(skb, padto, false))
-			return R8125_TX_CSUM_OPTS_DROP;
-		return 0;
-	}
-
-	switch (vlan_get_protocol(skb)) {
-	case htons(ETH_P_IP):
-		opts2 |= R8125_TD1_IPV4_CS;
-		ip_proto = ip_hdr(skb)->protocol;
-		break;
-	case htons(ETH_P_IPV6):
-		opts2 |= R8125_TD1_IPV6_CS;
-		ip_proto = ipv6_hdr(skb)->nexthdr;
-		break;
-	default:
-		return r8125_sw_csum_after_pad(skb, padto);
-	}
-
-	if (skb_transport_offset(skb) > R8125_TCPHO_MAX)
-		return r8125_sw_csum_after_pad(skb, padto);
-
-	if (ip_proto == IPPROTO_TCP) {
-		if (padto)
-			return r8125_sw_csum_after_pad(skb, padto);
-		opts2 |= R8125_TD1_TCP_CS;
-	} else if (ip_proto == IPPROTO_UDP) {
-		padto = max_t(unsigned int, padto, r8125_quirk_udp_padto(skb));
-		if (padto)
-			return r8125_sw_csum_after_pad(skb, padto);
-		opts2 |= R8125_TD1_UDP_CS;
-	} else {
-		return r8125_sw_csum_after_pad(skb, padto);
-	}
-
-	opts2 |= (u32)skb_transport_offset(skb) << R8125_TCPHO_SHIFT;
-	return opts2;
-}
-
 void r8125_bridge_skb_rx_csum_set(struct sk_buff *skb, u32 desc_opts1)
 {
 	u32 pid = desc_opts1 & R8125_RX_PID_MASK;
@@ -189,17 +120,6 @@ void r8125_bridge_account_tx(struct net_device *ndev, unsigned int bytes)
 }
 
 /* ── Scatter-gather + TSO ────────────────────────────────────────────── */
-
-/* TX descriptor opts1 bits used only by the TSO path. Same prefix
- * scheme as the CSUM opts2 bits above. Realtek vendor + r8169 agree
- * on these values (r8125_n.c GiantSendv4/v6 vs rtl_tx_desc_bit_1
- * TD1_GTSENV4/V6).
- */
-#define R8125_TD1_GTSENV6	BIT(25)
-#define R8125_TD1_GTSENV4	BIT(26)
-#define R8125_GTTCPHO_SHIFT	18
-#define R8125_GTTCPHO_MAX	0x7fU
-#define R8125_TD1_MSS_SHIFT	18	/* opts2 MSS position (11 bits) */
 
 int r8125_bridge_skb_data_dma_map(struct device *dev, struct sk_buff *skb,
 				  dma_addr_t *out_handle, unsigned int *out_len)
@@ -245,64 +165,88 @@ int r8125_bridge_skb_frag_dma_map(struct device *dev, struct sk_buff *skb,
 	return 0;
 }
 
-static bool r8125_bridge_skb_tso_setup(struct sk_buff *skb,
-				       u32 *opts1_bits, u32 *opts2_bits)
+/* Gather the protocol facts the Rust offload-policy needs, plus the UDP/PTP pad
+ * quirk (which needs the udp header — a kernel API). Pure reads; no side effects.
+ */
+static struct r8125_tx_offload_facts r8125_bridge_tx_offload_facts(struct sk_buff *skb)
 {
 	struct skb_shared_info *shinfo = skb_shinfo(skb);
-	unsigned int mss = shinfo->gso_size;
-	unsigned int trans_off;
+	struct r8125_tx_offload_facts f = {0};
 
-	*opts1_bits = 0;
-	*opts2_bits = 0;
-
-	if (mss == 0)
-		return false;
-
-	trans_off = skb_transport_offset(skb);
-	if (trans_off > R8125_GTTCPHO_MAX)
-		return false;	/* header too far in; chip can't reach it */
-
-	if (shinfo->gso_type & SKB_GSO_TCPV4) {
-		*opts1_bits |= R8125_TD1_GTSENV4;
-	} else if (shinfo->gso_type & SKB_GSO_TCPV6) {
-		/* Prep pseudo-header CSUM for chip-segmented v6 frames. */
-		if (skb_cow_head(skb, 0))
-			return false;
-		tcp_v6_gso_csum_prep(skb);
-		*opts1_bits |= R8125_TD1_GTSENV6;
-	} else {
-		/* Other GSO types (UDP frag, GRE, etc.) — chip can't TSO,
-		 * the kernel will fall back to software segmentation.
-		 */
-		return false;
+	f.len = skb->len;
+	f.transport_offset = skb_transport_offset(skb);
+	if (shinfo->gso_size) {
+		f.flags |= R8125_TXO_F_IS_GSO;
+		f.mss = shinfo->gso_size;
+		if (shinfo->gso_type & SKB_GSO_TCPV4)
+			f.flags |= R8125_TXO_F_GSO_TCPV4;
+		else if (shinfo->gso_type & SKB_GSO_TCPV6)
+			f.flags |= R8125_TXO_F_GSO_TCPV6;
 	}
+	if (skb->ip_summed == CHECKSUM_PARTIAL)
+		f.flags |= R8125_TXO_F_CSUM_PARTIAL;
 
-	*opts1_bits |= (u32)trans_off << R8125_GTTCPHO_SHIFT;
-	*opts2_bits |= (u32)mss << R8125_TD1_MSS_SHIFT;
-	return true;
+	switch (vlan_get_protocol(skb)) {
+	case htons(ETH_P_IP):
+		f.l3 = 4;
+		f.l4 = ip_hdr(skb)->protocol;
+		break;
+	case htons(ETH_P_IPV6):
+		f.l3 = 6;
+		f.l4 = ipv6_hdr(skb)->nexthdr;
+		break;
+	default:
+		break;
+	}
+	if (f.l4 == IPPROTO_UDP)
+		f.udp_quirk_padto = r8125_quirk_udp_padto(skb);
+	if (skb_vlan_tag_present(skb)) {
+		f.flags |= R8125_TXO_F_VLAN;
+		f.vlan_tag = skb_vlan_tag_get(skb);
+	}
+	return f;
 }
 
 int r8125_bridge_skb_tx_offload_prepare(struct sk_buff *skb, u32 *opts1_bits,
 					u32 *opts2_bits,
 					unsigned int *nr_frags)
 {
-	bool is_gso = skb_shinfo(skb)->gso_size;
+	struct r8125_tx_offload_facts f = r8125_bridge_tx_offload_facts(skb);
+	struct r8125_tx_offload_decision d = r8125_tx_offload_decide(f);
 
 	*opts1_bits = 0;
 	*opts2_bits = 0;
 
-	if (is_gso) {
-		if (!r8125_bridge_skb_tso_setup(skb, opts1_bits, opts2_bits))
+	/* Apply the side effect the Rust policy chose (the bit values are already
+	 * decided); any kernel-API failure becomes a TX drop (-EIO).
+	 */
+	switch (d.action) {
+	case R8125_TXO_ACT_DROP:
+		return -EIO;
+	case R8125_TXO_ACT_TSO:
+		if (d.flags & R8125_TXO_D_NEED_V6_CSUM_PREP) {
+			if (skb_cow_head(skb, 0))
+				return -EIO;
+			tcp_v6_gso_csum_prep(skb);
+		}
+		break;
+	case R8125_TXO_ACT_SWFALLBACK:
+		if (d.padto && __skb_put_padto(skb, d.padto, false))
 			return -EIO;
-		*opts2_bits |= r8125_bridge_skb_tx_vlan_opts(skb);
-		*nr_frags = (unsigned int)skb_shinfo(skb)->nr_frags;
-		return 0;
+		if (skb_checksum_help(skb))
+			return -EIO;
+		break;
+	case R8125_TXO_ACT_NOOFFLOAD:
+		if (d.padto && __skb_put_padto(skb, d.padto, false))
+			return -EIO;
+		break;
+	case R8125_TXO_ACT_CSUM:
+	default:
+		break;
 	}
 
-	*opts2_bits = r8125_bridge_skb_tx_csum_opts(skb);
-	if (*opts2_bits == R8125_TX_CSUM_OPTS_DROP)
-		return -EIO;
-	*opts2_bits |= r8125_bridge_skb_tx_vlan_opts(skb);
+	*opts1_bits = d.opts1;
+	*opts2_bits = d.opts2;
 	*nr_frags = (unsigned int)skb_shinfo(skb)->nr_frags;
 	return 0;
 }

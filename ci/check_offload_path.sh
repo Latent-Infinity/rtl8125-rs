@@ -12,6 +12,10 @@ NETDEV=src/netdev.rs
 BRIDGE=src/netdev_bridge.c
 HEADER=src/netdev_bridge.h
 OFFLOAD=src/netdev_bridge_offload.c
+# The descriptor-bit POLICY (which CS/TSO bits, field shifts, limits) moved to
+# host-tested Rust (src/tx_offload.rs); the C shim gathers facts + applies the
+# decision's side effects. Checks below split accordingly.
+TXOFF=src/tx_offload.rs
 
 # TX offload prep (TSO setup OR CSUM bit computation) must precede DMA
 # mapping because both paths can mutate skb data (skb_cow_head +
@@ -42,21 +46,25 @@ grep -q 'dma_unmap_single(dev, handle, len, DMA_TO_DEVICE)' "$BRIDGE" \
   && ok "TX linear DMA unmap uses shadowed map length" \
   || bad "TX DMA unmap must use the saved DMA map length, not descriptor length"
 
-grep -q 'opts2 |= R8125_TD1_UDP_CS' "$OFFLOAD" \
-  && ok "normal UDP CHECKSUM_PARTIAL stays on hardware checksum" \
+grep -q 'opts2 |= TD1_UDP_CS' "$TXOFF" \
+  && ok "normal UDP CHECKSUM_PARTIAL stays on hardware checksum (Rust policy)" \
   || bad "normal UDP checksum-partial packets must set the hardware UDP checksum bit"
 
-grep -q 'R8125_TX_CSUM_OPTS_DROP' "$OFFLOAD" \
+# Drop disposition: the Rust policy returns ACT_DROP / chooses SWFALLBACK; the C
+# shim turns a side-effect failure (checksum_help / pad / cow_head) into -EIO,
+# and Rust frees the skb through the error counter (no partial-csum transmit).
+grep -q 'ACT_DROP' "$TXOFF" \
+  && grep -q 'R8125_TXO_ACT_DROP' "$OFFLOAD" \
   && grep -q 'return -EIO' "$OFFLOAD" \
   && grep -q 'Err(_)' "$NETDEV" \
   && grep -q 'skb.free_with_error()' "$NETDEV" \
-  && ok "checksum-help failure drops before DMA map" \
+  && ok "offload-prep failure drops before DMA map" \
   || bad "checksum-help failure must not transmit a partially checksummed skb"
 
 grep -q 'R8125_PTP_EVENT_PORT0' "$OFFLOAD" \
   && grep -q 'R8125_PTP_EVENT_PORT1' "$OFFLOAD" \
   && grep -q 'r8125_quirk_udp_padto' "$OFFLOAD" \
-  && grep -q '__skb_put_padto(skb, padto, false)' "$OFFLOAD" \
+  && grep -q '__skb_put_padto(skb, d.padto, false)' "$OFFLOAD" \
   && grep -q 'skb_checksum_help(skb)' "$OFFLOAD" \
   && ok "UDP pad/software-checksum quirk is scoped to r8169/vendor cases" \
   || bad "UDP pad/software-checksum fallback must be scoped to PTP/runt/ETH_ZLEN cases"

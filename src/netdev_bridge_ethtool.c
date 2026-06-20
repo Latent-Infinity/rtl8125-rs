@@ -32,6 +32,7 @@
 #include <linux/ethtool.h>
 #include <linux/netdevice.h>
 #include <linux/pci.h>
+#include <asm/barrier.h>
 #include <net/page_pool/helpers.h>
 #include <net/page_pool/types.h>
 
@@ -378,7 +379,15 @@ static int bridge_set_eee(struct net_device *ndev, struct ethtool_keee *data)
  */
 static bool bridge_tally_refresh(struct r8125_bridge *b)
 {
-	return b->tally_vaddr && !b->ops.tally_dump(b->priv, b->tally_dma);
+	if (!b->tally_vaddr || b->ops.tally_dump(b->priv, b->tally_dma))
+		return false;
+	/* tally_dump (mmio.rs) only issues the dump command + the MMIO completion
+	 * poll; pair it with a DMA read barrier so the following reads of the
+	 * coherent tally buffer are ordered after the poll on weakly-ordered CPUs.
+	 * Matches the dma_rmb() ndo_get_stats64 does before reading the same buffer.
+	 */
+	dma_rmb();
+	return true;
 }
 
 static void bridge_get_pause_stats(struct net_device *ndev,

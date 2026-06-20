@@ -45,8 +45,20 @@ echo
 echo "== AF_XDP zero-copy datapath contract =="
 bash "$CI/check_xsk.sh" || rc=1
 echo
+echo "== TX-slot disposition parity (hot vs stop reaper) =="
+bash "$CI/check_tx_disposition.sh" || rc=1
+echo
+echo "== TX-offload descriptor-bit policy boundary (Rust) =="
+bash "$CI/check_tx_offload_policy.sh" || rc=1
+echo
 echo "== devlink health-reporter contract =="
 bash "$CI/check_devlink.sh" || rc=1
+echo
+echo "== PCIe AER recovery contract =="
+bash "$CI/check_aer.sh" || rc=1
+echo
+echo "== PCI runtime-PM (autosuspend) contract =="
+bash "$CI/check_runtime_pm.sh" || rc=1
 echo
 echo "== multi-queue RSS hazard harness contract =="
 bash "$CI/check_rss_multiqueue_hazard.sh" || rc=1
@@ -140,8 +152,11 @@ bash "$CI/check_irq_mode_contract.sh" || rc=1
 bash "$CI/check_rx_pool_pages.sh" || rc=1
 bash "$CI/check_jumbo_mtu_chip.sh" || rc=1
 echo
-echo "== kernel-build Clippy gate =="
+echo "== kernel-build Clippy gate (default cfgs) =="
 bash "$CI/check_clippy.sh" || rc=1
+echo
+echo "== full-cfg Clippy gate (cfg-gated PCI surfaces, patched tree) =="
+bash "$CI/check_clippy_fullcfg.sh" || rc=1
 echo
 echo "== deferred to guest CI (need validated kernel toolchain) =="
 cat <<'EOF'

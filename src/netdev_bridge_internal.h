@@ -32,6 +32,57 @@ struct xdp_buff;
  */
 #define R8125_BRIDGE_RX_QUEUE_COUNT	4
 
+/* Chip RX descriptor LEN field is 14 bits, so the device-writable byte count
+ * per buffer (RxMaxSize / per-slot clamp) tops out here. Single source of truth
+ * shared by the page_pool path and the AF_XDP zero-copy path; mirrors the Rust
+ * `regs::DESC_LEN_MASK`.
+ */
+#define R8125_RX_DESC_MAX		0x3FFF
+
+/* TX hardware-offload decision FFI. The descriptor-bit POLICY (checksum-v2 +
+ * TSO) lives in Rust (src/tx_offload.rs); this shim only gathers the protocol
+ * FACTS and applies the returned DECISION (skb side effects + the opts bits).
+ * Both structs are all-u32 and MUST match the #[repr(C)] structs in
+ * src/tx_offload.rs field-for-field.
+ */
+struct r8125_tx_offload_facts {
+	u32 flags;		/* R8125_TXO_F_* */
+	u32 len;		/* skb->len */
+	u32 l3;			/* 4 = IPv4, 6 = IPv6, 0 = other */
+	u32 l4;			/* IPPROTO_TCP/UDP, else 0 */
+	u32 transport_offset;	/* skb_transport_offset */
+	u32 mss;		/* gso_size */
+	u32 udp_quirk_padto;	/* r8125_quirk_udp_padto (0 unless UDP+quirk) */
+	u32 vlan_tag;		/* raw skb_vlan_tag_get (Rust byte-swaps) */
+};
+
+struct r8125_tx_offload_decision {
+	u32 action;		/* R8125_TXO_ACT_* */
+	u32 opts1;		/* TX descriptor opts1 bits */
+	u32 opts2;		/* TX descriptor opts2 bits */
+	u32 padto;		/* pad target for NOOFFLOAD / SWFALLBACK */
+	u32 flags;		/* R8125_TXO_D_* */
+};
+
+/* Facts flags */
+#define R8125_TXO_F_CSUM_PARTIAL	(1u << 0)
+#define R8125_TXO_F_IS_GSO		(1u << 1)
+#define R8125_TXO_F_GSO_TCPV4		(1u << 2)
+#define R8125_TXO_F_GSO_TCPV6		(1u << 3)
+#define R8125_TXO_F_VLAN		(1u << 4)
+/* Decision actions */
+#define R8125_TXO_ACT_NOOFFLOAD		0u
+#define R8125_TXO_ACT_CSUM		1u
+#define R8125_TXO_ACT_TSO		2u
+#define R8125_TXO_ACT_SWFALLBACK	3u
+#define R8125_TXO_ACT_DROP		4u
+/* Decision flags */
+#define R8125_TXO_D_NEED_V6_CSUM_PREP	(1u << 0)
+
+/* Implemented in Rust (src/tx_offload.rs); pure + scalar ABI. */
+struct r8125_tx_offload_decision
+r8125_tx_offload_decide(struct r8125_tx_offload_facts facts);
+
 struct r8125_bridge_rx_queue {
 	struct r8125_bridge *bridge;
 	struct napi_struct napi;
@@ -110,6 +161,25 @@ struct r8125_bridge {
 	 * only under RTNL in the PM callbacks.
 	 */
 	bool wol_suspended;
+
+	/* Runtime-PM enabled flag, set by the Rust probe ONLY when the driver is
+	 * built with runtime PM (r8125_pci_runtime_pm / RUNTIME_PM=1). When false
+	 * (the default build) the ndo open/stop entry wrappers skip the pm_runtime
+	 * get/put brackets entirely, so behaviour is byte-identical to a build
+	 * without runtime PM. See r8125_bridge_pm_runtime_enable.
+	 */
+	bool runtime_pm;
+
+	/* Set by the AER error_detected full-stop teardown (Frozen / unknown
+	 * channel) and consumed by the AER resume so it only re-opens a device it
+	 * actually tore down. Non-fatal (Normal) keeps working; permanent failure is
+	 * detach-only because the core may not call resume and remove owns final
+	 * teardown. The AER callbacks stay RTNL-free (they run under pci_bus_sem
+	 * during pci_walk_bus; taking RTNL there would invert the lock order the
+	 * runtime-PM D-state path establishes). Mirrors igb's rtnl-free
+	 * io_error_detected.
+	 */
+	bool aer_torn_down;
 
 	/* PHY MCU firmware version string (from rtl8125b-2.fw), set by Rust after
 	 * a successful firmware apply; reported via ethtool -i. NUL-terminated

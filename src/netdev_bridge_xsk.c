@@ -44,11 +44,12 @@ int r8125_bridge_xsk_rxq_reg(struct net_device *ndev, unsigned int queue_id)
 	}
 	q->xdp_rxq_registered = true;
 	/* Clamp the device-writable length to the umem frame size so the chip
-	 * cannot DMA past a single umem chunk (0x3FFF = the 14-bit descriptor LEN
-	 * ceiling, matching R8125_RX_DESC_MAX in netdev_bridge_rx_pool.c).
+	 * cannot DMA past a single umem chunk, bounded by the 14-bit descriptor
+	 * LEN ceiling (R8125_RX_DESC_MAX, shared via netdev_bridge_internal.h).
 	 */
 	q->rx_max_len = min_t(unsigned int,
-			      xsk_pool_get_rx_frame_size(q->xsk_pool), 0x3FFFu);
+			      xsk_pool_get_rx_frame_size(q->xsk_pool),
+			      R8125_RX_DESC_MAX);
 	return 0;
 }
 

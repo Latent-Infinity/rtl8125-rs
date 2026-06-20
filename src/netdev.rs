@@ -113,9 +113,19 @@ use crate::unsafe_boundary::{self as ub, BridgeOps};
 /// `NETDEV_TX_OK` / `NETDEV_TX_BUSY` from `include/linux/netdevice.h`.
 const NETDEV_TX_OK: c_int = 0;
 const NETDEV_TX_BUSY: c_int = 0x10;
-const BRIDGE_FEATURE_RXCSUM: u32 = 0x0000_0001;
-const BRIDGE_FEATURE_RXVLAN: u32 = 0x0000_0002;
-const BRIDGE_FEATURE_RXHASH: u32 = 0x0000_0004;
+
+// The RX feature-flag -> register-bit mapping (RXCSUM/RXVLAN/RXHASH) is pure +
+// host-tested in `crate::rx_features`; the bring-up below calls its helpers. Pin
+// its standalone constant copies to the canonical values so they can't drift.
+use crate::rx_features::{rx_feature_cpluscmd, rx_feature_rcr, rxhash_enabled};
+const _: () = {
+    assert!(crate::rx_features::BRIDGE_FEATURE_RXCSUM == 0x0000_0001);
+    assert!(crate::rx_features::BRIDGE_FEATURE_RXVLAN == 0x0000_0002);
+    assert!(crate::rx_features::BRIDGE_FEATURE_RXHASH == 0x0000_0004);
+    assert!(crate::rx_features::RX_VLAN_8125 == regs::RX_VLAN_8125);
+    assert!(crate::rx_features::CPLUSCMD_RX_CHKSUM == regs::CPLUSCMD_RX_CHKSUM);
+};
+
 pub(crate) const RX_QUEUE0: u32 = 0;
 /// Compile-time maximum RX queues = the DMA rings, NAPI instances, and per-queue
 /// state arrays the driver allocates. RTL8125B's `HwSuppNumRxQueues` is 4. The
@@ -1301,29 +1311,6 @@ fn free_rx_slots(state: &NetdevState) {
 // is direction-sensitive — is visible where it matters.
 
 #[inline]
-fn rx_feature_rcr(base: u32, feature_flags: u32) -> u32 {
-    if feature_flags & BRIDGE_FEATURE_RXVLAN != 0 {
-        base | regs::RX_VLAN_8125
-    } else {
-        base & !regs::RX_VLAN_8125
-    }
-}
-
-#[inline]
-fn rx_feature_cpluscmd(feature_flags: u32) -> u16 {
-    if feature_flags & BRIDGE_FEATURE_RXCSUM != 0 {
-        regs::CPLUSCMD_RX_CHKSUM
-    } else {
-        0
-    }
-}
-
-#[inline]
-fn rxhash_enabled(feature_flags: u32) -> bool {
-    RXHASH_FEATURE_GATE && (feature_flags & BRIDGE_FEATURE_RXHASH != 0)
-}
-
-#[inline]
 fn requested_rss_queues(state: &NetdevState) -> u8 {
     // ethtool set_channels writes a runtime override (`requested_rx_queues`);
     // 0 means "fall back to the load-time module param". This lets `ethtool -L`
@@ -1479,7 +1466,8 @@ fn apply_netdev_features(state: &NetdevState, feature_flags: u32) {
     // RXHASH needs the V3 descriptor's hash fields. On the legacy-descriptor
     // fallback (`rx_legacy_desc=1`) there is no hash field, so force it off
     // regardless of the advertised feature bit.
-    let enable = rxhash_enabled(feature_flags) && state.rx_queue0().format != RxDescFormat::Legacy;
+    let enable = rxhash_enabled(RXHASH_FEATURE_GATE, feature_flags)
+        && state.rx_queue0().format != RxDescFormat::Legacy;
     state.rx_hash_enabled.store(enable, Ordering::Relaxed);
 }
 
@@ -1795,11 +1783,15 @@ fn quiesce_chip(regs: &Regs<'_>) {
     regs.set_chip_cmd(0);
 }
 
-/// Walk the TX shadow at `ndo_stop` and release any DMA mapping +
-/// skb the chip didn't complete before we masked it. Each slot's
-/// per-fragment `is_frag` flag picks `dma_unmap_page` vs
-/// `dma_unmap_single`; the (last-frag-only) skb pointer is freed via
-/// `skb_free_error` so the disposition counter records a TX error.
+/// Walk the TX shadow at `ndo_stop` and release any DMA mapping + buffer the
+/// chip didn't complete before we masked it. Each slot's per-fragment `is_frag`
+/// flag picks `dma_unmap_page` vs `dma_unmap_single`; the slot pointer is then
+/// released BY KIND (`shadow_kind`), mirroring `process_tx_completions`: an
+/// `Skb` slot's (last-frag-only) skb is freed via `skb_free_error` so the
+/// disposition counter records a TX error; an `Xdp` slot's `xdp_frame` is
+/// returned to its page_pool via `xdp_return_frame`; an `XskTx` slot holds a
+/// socket-owned umem chunk (null pointer, nothing to free). Freeing all kinds
+/// as skbs would type-confuse the xdp_frame pointer and leak its page.
 fn reap_inflight_tx_shadow(state: &NetdevState) {
     let ndev = state.ndev.load(Ordering::Acquire);
     let bql_was_active = bql_active(state);
@@ -1817,15 +1809,40 @@ fn reap_inflight_tx_shadow(state: &NetdevState) {
                 ub::skb_dma_unmap_tx(&state.pdev, handle, len);
             }
         }
-        let raw_skb = state.tx.shadow[i].swap(ptr::null_mut(), Ordering::AcqRel);
-        if let Some(skb) = crate::skb::DriverOwnedSkb::from_raw_nullable(raw_skb) {
-            if bql_was_active {
-                bql_bytes += skb.wire_len();
-                bql_pkts += 1;
+        // Reclaim the disposition tag + slot pointer together and release by
+        // kind — this MUST mirror `process_tx_completions` (napi.rs). Freeing
+        // every non-null shadow as an skb would type-confuse an XDP_TX
+        // `xdp_frame*` (KASAN UAF) and leak its page_pool page. The DMA unmap
+        // above is kind-agnostic (driven by `shadow_len`); only the pointer
+        // disposition differs by kind. `ci/check_tx_disposition.sh` pins this.
+        let kind = TxSlotKind::from_u8(
+            state.tx.shadow_kind[i].swap(TxSlotKind::Skb as u8, Ordering::AcqRel),
+        );
+        let raw = state.tx.shadow[i].swap(ptr::null_mut(), Ordering::AcqRel);
+        match kind {
+            TxSlotKind::Xdp => {
+                // xdp_frame still posted at stop: return its page to the origin
+                // page_pool. This runs before the RX page_pool teardown later in
+                // ndo_stop, so the pool is still alive. Not a BQL/skb slot.
+                if !raw.is_null() {
+                    ub::xdp_return_frame(raw.cast());
+                }
             }
-            // Reclaim the disposition obligation from the shadow and
-            // route the skb through the error counter.
-            skb.free_with_error();
+            TxSlotKind::XskTx => {
+                // umem chunk owned by the AF_XDP socket (null shadow, no DMA
+                // unmap). The pool is being torn down; nothing to free here.
+            }
+            TxSlotKind::Skb => {
+                if let Some(skb) = crate::skb::DriverOwnedSkb::from_raw_nullable(raw) {
+                    if bql_was_active {
+                        bql_bytes += skb.wire_len();
+                        bql_pkts += 1;
+                    }
+                    // Reclaim the disposition obligation from the shadow and
+                    // route the skb through the error counter.
+                    skb.free_with_error();
+                }
+            }
         }
     }
     // Balance any packets that were counted by netdev_sent_queue but were

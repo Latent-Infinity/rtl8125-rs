@@ -126,6 +126,40 @@ pub(crate) struct R8125Driver {
     pdev: ARef<pci::Device>,
 }
 
+/// Compile-time ABI pin for the AER policy. `crate::aer` hardcodes the
+/// `pci_channel_state` / `pci_ers_result` enumerator values so it stays
+/// host-testable off-target (where `bindings` does not exist); this asserts
+/// those values still equal the kernel's real constants. If a future kernel
+/// renumbers them, the AER build fails here instead of silently handing the AER
+/// core a wrong verdict. Only meaningful on an AER build (where `bindings` and
+/// `crate::aer` are both present).
+#[cfg(r8125_pci_aer)]
+const _: () = {
+    use kernel::bindings;
+    // Channel-state inputs decoded by `aer::ChannelState::from_raw`.
+    assert!(bindings::pci_channel_io_normal == 1);
+    assert!(bindings::pci_channel_io_frozen == 2);
+    assert!(bindings::pci_channel_io_perm_failure == 3);
+    // Recovery verdicts encoded by `aer::ErsResult::to_raw`.
+    assert!(bindings::pci_ers_result_PCI_ERS_RESULT_NONE == crate::aer::ErsResult::None.to_raw());
+    assert!(
+        bindings::pci_ers_result_PCI_ERS_RESULT_CAN_RECOVER
+            == crate::aer::ErsResult::CanRecover.to_raw()
+    );
+    assert!(
+        bindings::pci_ers_result_PCI_ERS_RESULT_NEED_RESET
+            == crate::aer::ErsResult::NeedReset.to_raw()
+    );
+    assert!(
+        bindings::pci_ers_result_PCI_ERS_RESULT_DISCONNECT
+            == crate::aer::ErsResult::Disconnect.to_raw()
+    );
+    assert!(
+        bindings::pci_ers_result_PCI_ERS_RESULT_RECOVERED
+            == crate::aer::ErsResult::Recovered.to_raw()
+    );
+};
+
 impl pci::Driver for R8125Driver {
     type IdInfo = IdInfo;
     const ID_TABLE: pci::IdTable<Self::IdInfo> = &PCI_TABLE;
@@ -144,6 +178,12 @@ impl pci::Driver for R8125Driver {
     /// observes the drained sentinel and skips the redundant
     /// `unregister_netdev` call.
     fn unbind(_dev: &pci::Device<Core>, this: Pin<&Self>) {
+        // Re-take the runtime-PM usage reference dropped at probe end BEFORE
+        // teardown, so the netdev shutdown runs against a non-autosuspending
+        // device (balances bridge_pm_runtime_enable). No-op unless built with
+        // runtime PM. The PCI core has already resumed the device for remove.
+        #[cfg(r8125_pci_runtime_pm)]
+        unsafe_boundary::bridge_pm_runtime_disable(this._netdev.ndev());
         this._netdev.shutdown();
     }
 
@@ -218,6 +258,116 @@ impl pci::Driver for R8125Driver {
         if let Err(e) = unsafe_boundary::bridge_pm_resume(this._netdev.ndev()) {
             dev_warn!(dev, "RTL8125 reset_done re-init failed: {e:?}\n");
         }
+    }
+
+    /// PCIe AER `error_detected` (`pci_error_handlers.error_detected`). The first
+    /// recovery step: a bus error affecting this function was reported. Decide a
+    /// verdict from the channel state ([`crate::aer::aer_policy`]) and quiesce.
+    ///
+    /// This controller's only `reset_method` is a secondary-bus reset, so
+    /// `echo 1 > /sys/.../reset` cycles the MAC and the resulting Uncorrectable
+    /// error enters AER recovery here. Without an `error_detected` callback the
+    /// AER core logs "can't recover (no error_detected callback)"; with it the
+    /// recovery runs cleanly and the device comes back. The verdict
+    /// ([`crate::aer::aer_policy`]) returns CanRecover for a non-fatal channel
+    /// (NOT NeedReset) precisely because this chip errors on every bus reset, so
+    /// a reset-based recovery would loop — see `crate::aer` for the storm note.
+    ///
+    /// Gated on `r8125_pci_aer` (Makefile `AER=1`): the
+    /// `pci::Driver::error_detected`/`slot_reset`/`error_resume` hooks only exist
+    /// on a kernel carrying kernel-patches/0004-rust-pci-add-aer-callbacks.patch.
+    #[cfg(r8125_pci_aer)]
+    fn error_detected(
+        dev: &pci::Device<Core>,
+        this: Pin<&Self>,
+        state: kernel::bindings::pci_channel_state_t,
+    ) -> kernel::bindings::pci_ers_result_t {
+        let cs = crate::aer::ChannelState::from_raw(state);
+        let verdict = crate::aer::aer_policy(cs);
+        dev_warn!(
+            dev,
+            "RTL8125 AER error_detected: channel state {cs:?} -> {verdict:?}\n"
+        );
+        // Normal: keep running. Frozen/unknown: full stop, then resume reopens.
+        // Permanent failure: detach only. The AER core returns Disconnect and may
+        // not call resume, so a full stop here could leave NAPI disabled while
+        // netif_running remains true, making the later unregister ndo_stop double
+        // disable it. This mirrors igb's perm-failure branch: detach, report
+        // Disconnect, and let removal own final teardown.
+        match cs {
+            crate::aer::ChannelState::Normal => {}
+            crate::aer::ChannelState::PermFailure => {
+                unsafe_boundary::bridge_pm_error_detach(this._netdev.ndev(), false);
+            }
+            crate::aer::ChannelState::Frozen | crate::aer::ChannelState::Unknown(_) => {
+                unsafe_boundary::bridge_pm_error_detach(this._netdev.ndev(), true);
+            }
+        }
+        verdict.to_raw()
+    }
+
+    /// PCIe AER `slot_reset` (`pci_error_handlers.slot_reset`). The core has
+    /// completed the slot reset and restored config space (incl. bus-master), so
+    /// MMIO is live again. Chip re-init is deferred to `error_resume` (which
+    /// reopens the netdev), so there is nothing device-specific to do here but
+    /// report the slot usable. See [`error_detected`](Self::error_detected) for
+    /// the `r8125_pci_aer` cfg rationale.
+    #[cfg(r8125_pci_aer)]
+    fn slot_reset(
+        dev: &pci::Device<Core>,
+        _this: Pin<&Self>,
+    ) -> kernel::bindings::pci_ers_result_t {
+        dev_info!(
+            dev,
+            "RTL8125 AER slot_reset: slot recovered, re-init deferred to resume\n"
+        );
+        crate::aer::ErsResult::Recovered.to_raw()
+    }
+
+    /// PCIe AER `resume` (`pci_error_handlers.resume`). Traffic may flow again:
+    /// rebuild the device through the same balanced open+attach used by
+    /// system-sleep resume. The C callback is void, so a failed reopen is logged
+    /// here (the cshim leaves the interface detached). Named `error_resume` to
+    /// avoid colliding with the system-sleep [`resume`](Self::resume) hook.
+    #[cfg(r8125_pci_aer)]
+    fn error_resume(dev: &pci::Device<Core>, this: Pin<&Self>) {
+        // RTNL-free re-open (runs under pci_bus_sem); a no-op unless
+        // error_detected tore the device down on a Frozen channel.
+        if let Err(e) = unsafe_boundary::bridge_pm_error_resume(this._netdev.ndev()) {
+            dev_warn!(dev, "RTL8125 AER resume re-init failed: {e:?}\n");
+        }
+    }
+
+    /// Runtime-PM idle check (`dev_pm_ops.runtime_idle`). Vetoes autosuspend
+    /// (`EBUSY`) while the interface is up; allows it when the interface is
+    /// administratively down. Policy lives in the cshim (`netif_running` test) so
+    /// the suspend/resume callbacks only ever run on a closed device — no RTNL,
+    /// no ring work. See `r8125_bridge_runtime_idle` for why we forgo the
+    /// suspend-while-up-on-link-down optimisation.
+    ///
+    /// Gated on `r8125_pci_runtime_pm` (Makefile `RUNTIME_PM=1`): the
+    /// `pci::Driver::runtime_*` hooks only exist on a kernel carrying
+    /// kernel-patches/0005-rust-pci-add-runtime-pm-callbacks.patch.
+    #[cfg(r8125_pci_runtime_pm)]
+    fn runtime_idle(_dev: &pci::Device<Core>, this: Pin<&Self>) -> Result {
+        unsafe_boundary::bridge_runtime_idle(this._netdev.ndev())
+    }
+
+    /// Runtime-PM suspend (`dev_pm_ops.runtime_suspend`). Only reached on a closed
+    /// interface (runtime_idle vetoes while up): detach from the stack and let the
+    /// PCI core do the D3 transition. See [`runtime_idle`](Self::runtime_idle).
+    #[cfg(r8125_pci_runtime_pm)]
+    fn runtime_suspend(_dev: &pci::Device<Core>, this: Pin<&Self>) -> Result {
+        unsafe_boundary::bridge_runtime_suspend(this._netdev.ndev());
+        Ok(())
+    }
+
+    /// Runtime-PM resume (`dev_pm_ops.runtime_resume`). Re-expose the device after
+    /// the PCI core restores D0; the next `ndo_open` does the real bring-up.
+    #[cfg(r8125_pci_runtime_pm)]
+    fn runtime_resume(_dev: &pci::Device<Core>, this: Pin<&Self>) -> Result {
+        unsafe_boundary::bridge_runtime_resume(this._netdev.ndev());
+        Ok(())
     }
 
     fn probe(pdev: &pci::Device<Core>, _info: &Self::IdInfo) -> impl PinInit<Self, Error> {
@@ -593,7 +743,17 @@ impl pci::Driver for R8125Driver {
                         }? kernel::error::Error),
                         GFP_KERNEL,
                     )?;
-                    NetdevHandle::new_with_state(pdev, state, &mac)?
+                    let handle = NetdevHandle::new_with_state(pdev, state, &mac)?;
+                    // Enable runtime PM now that the net_device is registered:
+                    // arm the ndo open/stop pm_runtime brackets and drop the
+                    // core's probe usage ref so the (closed) device can
+                    // autosuspend once an admin opts in via power/control=auto.
+                    // No-op unless built with RUNTIME_PM=1; gated on run-wake
+                    // capability inside the cshim. Mirrors r8169's probe-end
+                    // pm_runtime_put_sync.
+                    #[cfg(r8125_pci_runtime_pm)]
+                    unsafe_boundary::bridge_pm_runtime_enable(handle.ndev());
+                    handle
                 },
                 pdev: pdev.into(),
             }))

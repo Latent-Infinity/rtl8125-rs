@@ -62,6 +62,12 @@
 #![deny(unsafe_code)]
 #![allow(clippy::unnecessary_safety_comment)]
 
+// PCIe AER recovery policy. Only linked into the driver when the AER callbacks
+// are compiled in (`AER=1`, needs an AER-extended kernel — see Makefile); the
+// pure logic is still host-tested standalone via `rustc --test` regardless.
+#[cfg(r8125_pci_aer)]
+mod aer;
+mod chip_id;
 mod dma;
 mod hw;
 mod layout;
@@ -69,6 +75,7 @@ mod led;
 mod mmio;
 mod napi;
 mod netdev;
+mod ocp;
 mod pci;
 mod phy;
 mod phy_config;
@@ -77,7 +84,9 @@ mod pm;
 mod regs;
 mod ring;
 mod rss;
+mod rx_features;
 mod skb;
+mod tx_offload;
 mod unsafe_boundary;
 
 // `authors` accepts a list of "Name <email>" strings. Before posting to

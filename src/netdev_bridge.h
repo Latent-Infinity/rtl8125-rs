@@ -568,6 +568,26 @@ int r8125_bridge_reopen(struct net_device *ndev);
 void r8125_bridge_pm_suspend(struct net_device *ndev);
 int r8125_bridge_pm_resume(struct net_device *ndev);
 
+/* PCIe AER teardown + resume (RTNL-free; called under pci_bus_sem). detach is
+ * full-stop for Frozen/unknown channels (sets a flag the resume consumes so it
+ * re-opens only what it tore down) and detach-only for permanent failure (the
+ * AER core may not call resume; remove owns final teardown). Rust-gated on
+ * r8125_pci_aer.
+ */
+void r8125_bridge_pm_error_detach(struct net_device *ndev, bool full_stop);
+int r8125_bridge_pm_error_resume(struct net_device *ndev);
+
+/* Runtime PM (autosuspend while the interface is closed). Rust-gated on
+ * r8125_pci_runtime_pm. idle returns 0 (idle) / -EBUSY (keep active);
+ * suspend/resume only detach/attach (closed device); enable/disable manage the
+ * probe/unbind usage reference + the b->runtime_pm bracket flag.
+ */
+int r8125_bridge_runtime_idle(struct net_device *ndev);
+void r8125_bridge_runtime_suspend(struct net_device *ndev);
+void r8125_bridge_runtime_resume(struct net_device *ndev);
+void r8125_bridge_pm_runtime_enable(struct net_device *ndev);
+void r8125_bridge_pm_runtime_disable(struct net_device *ndev);
+
 /* Link-state helpers — Rust calls these after detecting carrier change. */
 void r8125_bridge_carrier_on(struct net_device *ndev);
 void r8125_bridge_carrier_off(struct net_device *ndev);

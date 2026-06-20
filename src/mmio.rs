@@ -32,6 +32,10 @@ const _: () = assert!(regs::CONFIG5_LANWAKE == crate::layout::CONFIG5_LANWAKE);
 const _: () = assert!(regs::CONFIG5_UWF == crate::layout::CONFIG5_UWF);
 const _: () = assert!(regs::CONFIG5_MWF == crate::layout::CONFIG5_MWF);
 const _: () = assert!(regs::CONFIG5_BWF == crate::layout::CONFIG5_BWF);
+// The host-tested `crate::ocp` carries its own copies of these (it compiles
+// standalone under `rustc --test`); pin them to the canonical `regs::` values.
+const _: () = assert!(crate::ocp::OCPAR_FLAG == regs::OCPAR_FLAG);
+const _: () = assert!(crate::ocp::OCP_STD_PHY_BASE == regs::OCP_STD_PHY_BASE);
 
 /// Lightweight view over the device's mapped MMIO BAR. `&Regs` is what the
 /// rest of the crate consumes — `pci.rs` / `hw.rs` / `pm.rs` never see the
@@ -509,12 +513,12 @@ impl<'a> Regs<'a> {
     // value on the next read of OCPDR.
 
     pub(crate) fn mac_ocp_write(&self, reg: u32, data: u16) {
-        let cmd = regs::OCPAR_FLAG | ((reg & 0xFFFF) << 15) | u32::from(data);
-        self.bar.write32(cmd, regs::OCPDR);
+        self.bar
+            .write32(crate::ocp::ocp_write_cmd(reg, data), regs::OCPDR);
     }
 
     pub(crate) fn mac_ocp_read(&self, reg: u32) -> u16 {
-        self.bar.write32((reg & 0xFFFF) << 15, regs::OCPDR);
+        self.bar.write32(crate::ocp::ocp_read_cmd(reg), regs::OCPDR);
         (self.bar.read32(regs::OCPDR) & 0xFFFF) as u16
     }
 
@@ -544,8 +548,7 @@ impl<'a> Regs<'a> {
     ///
     /// Returns `Err(EIO)` on timeout (the chip never cleared OCPAR_FLAG).
     pub(crate) fn gphy_ocp_write(&self, ocp_addr: u32, data: u16) -> kernel::error::Result<()> {
-        // OCPAR_FLAG | (ocp_addr << 15) | data
-        let cmd = regs::OCPAR_FLAG | ((ocp_addr & 0xFFFF) << 15) | u32::from(data);
+        let cmd = crate::ocp::ocp_write_cmd(ocp_addr, data);
         self.bar.write32(cmd, regs::GPHY_OCP);
         let step = Delta::from_micros(10);
         for _ in 0..25 {
@@ -559,7 +562,7 @@ impl<'a> Regs<'a> {
 
     /// Read a 16-bit value from a PHY OCP register. See `gphy_ocp_write`.
     pub(crate) fn gphy_ocp_read(&self, ocp_addr: u32) -> kernel::error::Result<u16> {
-        let cmd = (ocp_addr & 0xFFFF) << 15;
+        let cmd = crate::ocp::ocp_read_cmd(ocp_addr);
         self.bar.write32(cmd, regs::GPHY_OCP);
         let step = Delta::from_micros(10);
         for _ in 0..25 {
@@ -577,22 +580,12 @@ impl<'a> Regs<'a> {
     /// non-default pages r8169 subtracts 0x10 from the reg (see
     /// `r8168g_mdio_read`).
     pub(crate) fn mdio_read(&self, ocp_base: u32, reg: u8) -> kernel::error::Result<u16> {
-        let reg_adj = if ocp_base != regs::OCP_STD_PHY_BASE && reg >= 0x10 {
-            reg - 0x10
-        } else {
-            reg
-        };
-        self.gphy_ocp_read(ocp_base + u32::from(reg_adj) * 2)
+        self.gphy_ocp_read(crate::ocp::mdio_ocp_addr(ocp_base, reg))
     }
 
     /// MDIO-style PHY write — same page logic as `mdio_read`.
     pub(crate) fn mdio_write(&self, ocp_base: u32, reg: u8, val: u16) -> kernel::error::Result<()> {
-        let reg_adj = if ocp_base != regs::OCP_STD_PHY_BASE && reg >= 0x10 {
-            reg - 0x10
-        } else {
-            reg
-        };
-        self.gphy_ocp_write(ocp_base + u32::from(reg_adj) * 2, val)
+        self.gphy_ocp_write(crate::ocp::mdio_ocp_addr(ocp_base, reg), val)
     }
 
     /// Zero the per-MAC_VER_63 interrupt-coalescing table:

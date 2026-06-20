@@ -565,3 +565,54 @@ buffer pointer / DMA address / count across the boundary:
   the umem fill ring is exhausted/replenished. SAFETY: reads only the bound pool.
 - ADDED `bridge_rxq_is_zc(ndev, qid)` — read whether a ZC pool is bound to the
   queue (drives the RX branch). SAFETY: bounds-checks qid, reads one bridge field.
+
+## 2026-06-18 — PCIe AER recovery teardown bump 95 → 96
+
+Net +1 `unsafe { ... }` block in `src/unsafe_boundary.rs`, a thin FFI wrapper over
+the new `r8125_bridge_pm_error_detach` cshim helper (`src/netdev_bridge.c`). Gated
+on `r8125_pci_aer`. The recovery policy (channel-state decode, verdict mapping,
+ABI values) is safe, host-tested Rust in `src/aer.rs`; the kernel callbacks in
+`src/pci.rs` are safe delegations. The one new unsafe block only crosses the FFI
+boundary to run the balanced teardown:
+
+- ADDED `bridge_pm_error_detach(ndev, full_stop)` — AER `error_detected` quiesce:
+  detach from the stack and, for Frozen/unknown channels, full balanced
+  `ndo_stop`; permanent failure uses detach-only because the core may return
+  Disconnect without a matching resume. SAFETY: `ndev` is the registered
+  net_device (null-checked; the cshim no-ops on a down/detached device); called
+  from the AER callback while the device is still bound. Mirrors the existing
+  `bridge_pm_suspend` / `bridge_pm_resume` wrappers (same contract).
+
+## 2026-06-18 — PCI runtime-PM bump 96 → 101
+
+Net +5 `unsafe { ... }` blocks in `src/unsafe_boundary.rs`, all thin FFI wrappers
+over the new runtime-PM cshim helpers (`src/netdev_bridge.c`). Gated on
+`r8125_pci_runtime_pm`. Policy is safe Rust: the suspend/resume callbacks
+(`src/pci.rs`) only run on a closed interface (runtime_idle vetoes while up), so
+they never touch rings/RTNL. The wrappers only cross the FFI boundary:
+
+- ADDED `bridge_runtime_idle(ndev)` — `netif_running` veto check (0 idle / EBUSY
+  busy). SAFETY: reads one netdev flag; bound device.
+- ADDED `bridge_runtime_suspend(ndev)` — `netif_device_detach` (closed device;
+  PCI core does D3). SAFETY: bound device, RTNL-free, no ring work.
+- ADDED `bridge_runtime_resume(ndev)` — `netif_device_attach` after D0 restore.
+  SAFETY: as above; runs from the ndo_open get_sync bracket.
+- ADDED `bridge_pm_runtime_enable(ndev)` — probe-end: set the bracket flag + drop
+  the core's usage ref (gated on pci_dev_run_wake). SAFETY: called once after the
+  netdev is registered.
+- ADDED `bridge_pm_runtime_disable(ndev)` — unbind: re-take the ref. SAFETY:
+  called at unbind start, device still bound + resumed by the core.
+
+## 2026-06-18 — AER resume split (RTNL-free) bump 101 → 102
+
+Net +1 `unsafe { ... }` block in `src/unsafe_boundary.rs`: `bridge_pm_error_resume`,
+the FFI wrapper over the new RTNL-free `r8125_bridge_pm_error_resume` cshim. The
+AER resume previously reused `bridge_pm_resume` (which takes RTNL); under
+pci_bus_sem (where the AER core runs the callbacks) that inverts the lock order
+the runtime-PM D-state path establishes (rtnl -> pci_bus_sem), an ABBA cycle
+lockdep flagged once AER and runtime PM were built together. The dedicated
+RTNL-free resume (and the now RTNL-free detach) break the cycle; it re-opens only
+a device the teardown actually tore down (Frozen path), gated on b->aer_torn_down.
+
+- ADDED `bridge_pm_error_resume(ndev)` — RTNL-free AER re-open. SAFETY: bound
+  device (null-checked); runs from the AER resume callback under pci_bus_sem.

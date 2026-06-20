@@ -66,8 +66,9 @@
  */
 #define R8125_RX_HEADROOM	max(NET_SKB_PAD, XDP_PACKET_HEADROOM)
 
-/* 14-bit descriptor LEN / RxMaxSize ceiling (DESC_LEN_MASK on the Rust side). */
-#define R8125_RX_DESC_MAX	0x3FFF
+/* R8125_RX_DESC_MAX (14-bit descriptor LEN ceiling) is shared via
+ * netdev_bridge_internal.h so the page_pool and AF_XDP paths agree.
+ */
 #define R8125_RX_VLAN_TAG	BIT(16)
 #define R8125_RX_VLAN_MASK	0xffffU
 

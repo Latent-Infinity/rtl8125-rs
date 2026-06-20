@@ -408,4 +408,60 @@ mod tests {
         run(&p, &mut m);
         assert_eq!(m.delays, [7]);
     }
+
+    #[test]
+    fn run_bjmpn_backward_loop_terminates() {
+        // Loop op0..op2 until the READ count reaches 3, then fall through to the
+        // trailing WRITE. Exercises PHY_BJMPN (backward jump), PHY_READ count
+        // accumulation, and PHY_READCOUNT_EQ_SKIP as the loop exit.
+        let b = blob(&[
+            op(PHY_READ, 0x00, 0),           // count++ each iteration
+            op(PHY_READCOUNT_EQ_SKIP, 0, 3), // count==3 -> skip the BJMPN (exit)
+            op(PHY_BJMPN, 2, 0),             // jump back to op0 (index - 2)
+            op(PHY_WRITE, 0x10, 0x00ff),     // runs exactly once after the loop
+        ]);
+        let p = parse(&b).unwrap();
+        let mut m = mock();
+        run(&p, &mut m);
+        assert_eq!(m.events, [(FwTarget::Phy, 0x10, 0x00ff)]);
+    }
+
+    #[test]
+    fn run_comp_eq_and_neq_skipn() {
+        // predata = 0x00ab (from READ): COMP_EQ 0x00ab skips the next op, then
+        // COMP_NEQ 0x0099 (0xab != 0x99) skips its next op; only the final
+        // WRITE survives. Exercises PHY_COMP_EQ_SKIPN + PHY_COMP_NEQ_SKIPN.
+        let b = blob(&[
+            op(PHY_READ, 0x00, 0),
+            op(PHY_COMP_EQ_SKIPN, 1, 0x00ab), // 0xab == 0xab -> skip op2
+            op(PHY_WRITE, 0x10, 0xdead),      // skipped
+            op(PHY_COMP_NEQ_SKIPN, 1, 0x0099), // 0xab != 0x99 -> skip op4
+            op(PHY_WRITE, 0x11, 0xbeef),      // skipped
+            op(PHY_WRITE, 0x12, 0x1234),      // runs
+        ]);
+        let p = parse(&b).unwrap();
+        let mut m = mock();
+        m.read_val = 0x00ab;
+        run(&p, &mut m);
+        assert_eq!(m.events, [(FwTarget::Phy, 0x12, 0x1234)]);
+    }
+
+    #[test]
+    fn run_clear_readcount_resets_skip_predicate() {
+        // Two READs but a CLEAR_READCOUNT between them, so count==1 (not 2) at
+        // the skip test -> the skip fires and the dead WRITE is bypassed. Without
+        // the clear, count would be 2 and the dead WRITE would run instead.
+        let b = blob(&[
+            op(PHY_READ, 0x00, 0),           // count = 1
+            op(PHY_CLEAR_READCOUNT, 0, 0),   // count = 0
+            op(PHY_READ, 0x00, 0),           // count = 1
+            op(PHY_READCOUNT_EQ_SKIP, 0, 1), // count==1 -> skip op4
+            op(PHY_WRITE, 0x10, 0xdead),     // skipped iff the clear worked
+            op(PHY_WRITE, 0x12, 0x0001),     // runs
+        ]);
+        let p = parse(&b).unwrap();
+        let mut m = mock();
+        run(&p, &mut m);
+        assert_eq!(m.events, [(FwTarget::Phy, 0x12, 0x0001)]);
+    }
 }
