@@ -179,3 +179,184 @@ Use this file as the canonical exception log:
   New rule: before upstream-review or soak signoff, run a claim audit over docs:
   defaults, supported values, completed/deferred status, evidence paths, and
   any "no scenario/no metric" statements must match code and raw artifacts.
+
+## 2026-06-20 — PCI lifecycle, AER, runtime PM, and subsystem lessons
+
+### AER: verdict policy determines stability
+
+- **CanRecover over NeedReset for Normal-channel AER, or you get a reset storm.**
+  The RTL8125B's only reset method is secondary-bus reset; a bus reset on this
+  device generates an Uncorrectable PCIe AER (UnsupReq). Issuing NeedReset from
+  `error_detected(Normal)` caused: slot_reset → bus reset → AER → error_detected
+  → NeedReset → ad infinitum (observed live, verified with 3× resets before the
+  fix). Fix: only `Frozen` → NeedReset; `Normal` → CanRecover (matches igb
+  pattern). Implication: for any device whose only reset path is bus reset, AER
+  verdict policy must account for the chip emitting an error on every reset.
+  Commits: `8fdf38d`, `5ad27ad`.
+- **AER callbacks must be RTNL-free.** AER runs under `pci_bus_sem`; taking
+  rtnl inside an AER callback deadlocks against the runtime-PM D-state path
+  (which takes rtnl → pci_bus_sem). This ABBA lockdep violation was caught
+  early and fixed by marking all AER callbacks RTNL-free. The runtime-PM
+  `ndo_open`/`ndo_stop` entry wrappers exist specifically to avoid re-entering
+  the PM callbacks from AER context. Gate: `ci/check_aer.sh` enforces rtnl-free
+  statically.
+
+### Runtime PM: simpler model beats clever model
+
+- **Closed-interface autosuspend, not per-TX get/put.** The original sketch
+  used per-packet `pm_runtime_get/put_sync`, which adds cost and hazard.
+  Instead, `runtime_idle` vetoes (`-EBUSY`) whenever `netif_running`, so
+  runtime suspend/resume only run on a closed interface — they detach/attach
+  the netdev device (no rings, no RTNL) and let the PCI core handle D-state.
+  This eliminates per-packet overhead AND the rtnl/ring hazard in one design
+  choice. Commits: `8fdf38d`. Evidence: `docs/perf/feature_smoke/runtime_pm.txt`.
+- **ndo open/stop must use dedicated _entry wrappers.** The `bridge_ndo_open`
+  and `bridge_ndo_stop` functions are reused by PM/reset/AER resume paths.
+  Wrapping them with `pm_runtime_get/put_sync` would deadlock when called from
+  inside a runtime callback — the `get_sync` would wait on itself. Fix:
+  dedicated `r8125_bridge_ndo_open_entry` / `r8125_bridge_ndo_stop_entry`
+  that bracket the real open/stop with PM get/put. Gate:
+  `ci/check_runtime_pm.sh` pins these invariants.
+
+### WoL deep-S3: keep the PHY alive, not just armed
+
+- **The gap was never about WoL registers — it was that the PHY goes dark in
+  D3.** Mainline r8169 applies `PMCH | D3HOT|D3COLD_NO_PLL_DOWN` to keep the
+  chip PLL (hence the internal PHY) powered across D3. Without this, magic
+  packets reach a powered-down PHY that cannot detect them. The fix is a WoL-
+  aware suspend branch: light quiesce (napi_disable only — NOT ndo_stop /
+  phy_stop / free_irq), write WoL arming registers including Config1/Config2
+  PME bits, set PMCH PLL keep-alive, and resume with full stop+reopen to clear
+  D3-reset chip state. Commits: `0ffca33`. Evidence:
+  `docs/perf/feature_smoke/wol_wake_s3_external_sender.txt`.
+- **IRQ affinity hint must be cleared before free_irq.** The KASAN kernel
+  WARNed on every `ndo_stop` because `irq_update_affinity_hint` was not NULL-ed
+  before IRQ teardown. Fix: clear hint to NULL before free_irq (also fixed the
+  rtcwake path). This is a general kernel lifecycle rule irrespective of WoL.
+
+### XSK zero-copy: surgical queue swap beats link bounce
+
+- **Per-queue RX reconfigure is deterministic; full stop+open is not.**
+  The first AF_XDP bind used full ndo_stop/ndo_open: the link dropped for ~4s,
+  and 1/3 binds delivered 771k frames vs 0 — a timing-dependent race. The fix
+  (igc_xdp_enable_pool pattern) swaps just the bound queue's RX pool with the
+  chip RX engine briefly off via `rust_rx_quiesce`/`rust_rx_quiesce_restore` —
+  TX/PHY/IRQ untouched, link never drops, bootstrap is deterministic. For
+  multi-queue, a full reopen fallback remains but the single-queue path (the
+  common gateway case) is surgical. Commits: `5ad27ad`. Evidence:
+  `docs/perf/feature_smoke/afxdp_zerocopy.txt`.
+- **AF_XDP cold-start needs synchronous kick + need-wakeup.** The bind path
+  posts umem buffers via `ndo_xsk_wakeup` → `rust_xsk_kick` →
+  `napi::zc_refill_locked` (serialised by per-queue `xsk_lock`). Without this
+  deterministic bootstrap, the first NAPI poll finds an empty RX ring.
+
+### Jumbo: PCIe readrq and pause are coupled
+
+- **Jumbo frames need pcie_set_readrq(4096) to avoid PCIe completion timeout.**
+  The chip's jumbo RX writes large buffers over PCIe; the default 128B readrq
+  causes the chip to stall waiting for completion credits. Raising to 4096
+  matches mainline r8169's `rtl_jumbo_config`. Commits: `3fc9709`.
+- **IEEE 802.3x pause frames deadlock in jumbo mode.** A jumbo frame occupying
+  the RX buffer blocks pause frame processing, causing head-of-line blocking
+  for all traffic. Disabling pause in jumbo mode (matching mainline behavior)
+  avoids this. The two changes together (readrq + pause disable) are the
+  minimal `rtl_jumbo_config` equivalent.
+- **New rule: any PCIe DMA size tuning needs both direction's view.** Raising
+  readrq is not "bigger is better" — it affects completion buffer utilisation,
+  arbitration, and parity with the write request size. Check both read and
+  write request boundaries when changing either.
+
+### TX offload policy belongs in Rust
+
+- **NDO feature negotiation was inline C #ifdef chains — now it is a
+  Rust-owned `ChipLimits` struct.** Moving `bridge_ndo_fix_features` and
+  `bridge_ndo_features_check` from r8169-port C into `src/tx_offload.rs`
+  made the offload policy testable (host unit tests), auditable (single
+  source for per-chip limits), and freed the C shim of complex feature-mask
+  logic. The C side now just delegates to `rust_ndo_fix_features` /
+  `rust_ndo_features_check`. Commits: `3fc9709`.
+- **New rule: if policy logic lives in C #defines long enough to need a
+  comment explaining it, it belongs in Rust.** The Rust side has `#[cfg(test)]`,
+  compile-time `const _: assert!()`, and type safety that C preprocessor
+  macros do not.
+
+### PHY firmware: the kernel FIRMWARE API is safe to use from Rust
+
+- **`kernel::firmware::Firmware` provides a safe binding for
+  `request_firmware` — no new cshim or unsafe needed.** The firmware blob
+  (rtl8125b-2.fw, ~800 ops) is fully validated into a bounded operation list
+  before any PHY write: opcode decode, branch bounds, malformed-blob rejection,
+  max-op limits, checksum and version fields. The dual-target interpreter
+  (MAC-OCP via `mac_ocp_write` ↔ PHY MDIO via `r8168g_mdio_write` semantics)
+  is host-tested as pure Rust. Post-apply: reset page base, poll BMCR.
+  `MODULE_FIRMWARE` + `ethtool -i` exposes version. Commits: `cb4d749`.
+  Evidence: `docs/perf/feature_smoke/phy_firmware.txt`.
+- **Firmware-absent is not a fatal error.** The driver falls back to errata-
+  only operation when the firmware blob is missing (matches r8169 behavior).
+  This is not just a convenience — it means a distribution that omits the
+  firmware blobs still gets a working driver.
+
+### Capability plan as coordination mechanism
+
+- **After multiple concurrent feature streams (W1 PHY, W2 PCI, W3 LEDs/RSS,
+  W4 XDP/XSK), a single plan document tracking per-feature status + evidence
+  paths + deferred/done markers prevented cross-stream confusion.** Without
+  it, the AER and XSK streams would have made conflicting assumptions about
+  the PM quiesce contract, and the feature-inventory CI gate would have been
+  the only signal — too late. Commits: `64a2a2e`.
+- **New rule: when 2+ independent work streams touch the same subsystem
+  (PCI PM, NAPI lifecycle, ring ownership), a shared plan document must be
+  the single source of truth for the contract between them.** Each stream
+  updates the plan before merging. The plan is not documentation — it is a
+  coordination artifact.
+
+### Evidence-driven development
+
+- **Every feature in the June 11-20 period landed with:** `ci/run_checks.sh`
+  clean, host unit tests for pure-logic modules, a hardware smoke artifact in
+  `docs/perf/feature_smoke/`, and a CI gate that would fail if the feature
+  regressed. The rule "the gateway run is part of the definition of done" —
+  established June 7 after two phases were "complete" while still running old
+  binaries — became non-negotiable.
+- **Static gates expanded from 12 to ~45 scripts**, covering: AER, runtime PM,
+  WoL suspend, XSK, XDP contract, cshim LOC caps, unsafe census, TX disposition,
+  TX offload policy, LED hardware register isolation, and more. Every gate
+  tests a specific invariant that a future commit could break. If an invariant
+  is important enough to write in a commit message, it needs a gate.
+
+### AI agent collaboration patterns (this project)
+
+This section captures what worked and what did not when building the driver
+with AI agents as primary contributors.
+
+- **AI excels at pattern recognition and exhaustive CI generation.** Given one
+  working check script, the AI could generate 20 variants covering error paths,
+  edge cases, and contract guarantees that a human would stop writing after 5.
+- **AI-generated code requires a hardware run to validate — always.** Three
+  separate times the AI declared work "complete" based on code analysis + build
+  passing, while the gateway still ran stale binaries or a subtle ordering
+  defect existed that only on-wire behavior revealed. The "gateway run is done"
+  rule exists because of this pattern.
+- **The Sisyphus orchestration model (parallel explore → plan → delegate →
+  verify) scaled across 4 concurrent workstreams.** Without the
+  `explore`/`librarian`/`oracle` agent decomposition, a single monolithic AI
+  session would have been too long, lost context, and introduced more defects.
+  The key was: exploration agents discover patterns, the architect decides,
+  specialist implementers execute, and a separate verification pass validates
+  before merge.
+- **AI works best on "smallest implementation" batches that fit in a single
+  context window.** The CAPABILITY_PLAN.md batch contract ("reviewable on its
+  own") emerged from the AI's context-length limits as much as from human review
+  needs. A batch that touches PM, rings, IRQ, and docs in one commit is too
+  large for an AI to hold all the interactions correctly.
+- **AI-generated static gates are the highest-leverage artifact.** Each shell
+  gate script is ~30-100 lines of bash that prevent an entire class of
+  regression. The AI can generate these faster than a human can describe them,
+  and they collectively enforce thousands of lines of Rust/C against the
+  contract. This is the force multiplier of AI-driven kernel development.
+- **Hardware validation evidence is the only ground truth.** AI can design,
+  write, and review code, but it cannot run it on PCIe hardware. Every claim
+  in CAPABILITY_PLAN.md about "working" features is backed by a raw evidence
+  artifact captured from the gateway. Without the gateway, the AI would
+  confidently ship code that wedges the TX path in edge cases it cannot
+  simulate.
